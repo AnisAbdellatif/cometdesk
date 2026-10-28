@@ -24,8 +24,9 @@ use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
 
-use crate::input::InputMapper;
-use crate::renderer::{RenderPath, Renderer};
+use crate::renderer::Renderer;
+use glkvm_view::InputMapper;
+use glkvm_view::RenderPath;
 
 const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(500);
 

@@ -16,6 +16,7 @@ allow = [
     "Zlib",
     "Unicode-3.0",
     "CDLA-Permissive-2.0",
+    "BSL-1.0",
 ]
 confidence-threshold = 0.9
 
@@ -35,3 +36,5 @@ ignore = [
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+# egui is pinned to a main-branch commit until a release supports wgpu 30 (egui 0.38).
+allow-git = ["https://github.com/emilk/egui"]

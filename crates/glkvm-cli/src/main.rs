@@ -5,12 +5,8 @@
 //! `--totp CODE` (or `GLKVM_TOTP`), or type the code when asked.
 
 mod commands;
-mod input;
-mod keymap;
 mod renderer;
 mod viewer;
-#[cfg(target_os = "macos")]
-mod zerocopy;
 
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -26,9 +22,8 @@ use glkvm::{Credentials, Session};
 use glkvm_media::Codec;
 use glkvm_media::direct::{self, DirectOptions};
 
-use crate::input::{InputMapper, ScrollOptions};
-use crate::keymap::KeyOptions;
-use crate::renderer::RenderPath;
+use glkvm_view::keymap::{self, KeyOptions};
+use glkvm_view::{InputMapper, RenderPath, ScrollOptions};
 
 #[derive(Parser)]
 #[command(version, about)]
