@@ -6,6 +6,7 @@ mod clipsync;
 mod console;
 mod devices;
 mod gpu;
+mod setup;
 mod store;
 
 use std::sync::Arc;

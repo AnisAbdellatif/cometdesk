@@ -10,4 +10,4 @@ arboard = { version = "3.7.0", features = ["wayland-data-control"] }
 glkvm-clip = { version = "0.1.0", path = "../../crates/glkvm-clip" }
 
 [target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_System_DataExchange"] }
+windows-sys = { version = "0.61.2", features = ["Win32_System_DataExchange", "Win32_System_Console"] }

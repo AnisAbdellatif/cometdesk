@@ -33,13 +33,14 @@ link_up() {
 	kill_udhcpd others
 	ifconfig usb0 192.168.5.1 netmask 255.255.255.0 up || return 1
 
-	# The target may reach DHCP, ping and the relay port on the Comet, nothing else
-	# (no web UI, no SSH, no forwarding).
+	# The target may reach DHCP, ping, the relay (47474) and the downloads (47475) on the Comet,
+	# nothing else (no web UI, no SSH, no forwarding).
 	iptables -N $CHAIN 2>/dev/null || iptables -F $CHAIN
 	iptables -A $CHAIN -m state --state ESTABLISHED,RELATED -j ACCEPT
 	iptables -A $CHAIN -p udp --dport 67 -j ACCEPT
 	iptables -A $CHAIN -p icmp -j ACCEPT
 	iptables -A $CHAIN -p tcp --dport 47474 -j ACCEPT
+	iptables -A $CHAIN -p tcp --dport 47475 -j ACCEPT
 	iptables -A $CHAIN -j DROP
 	iptables -C INPUT -i usb0 -j $CHAIN 2>/dev/null || iptables -I INPUT 1 -i usb0 -j $CHAIN
 	iptables -C FORWARD -i usb0 -j DROP 2>/dev/null || iptables -I FORWARD 1 -i usb0 -j DROP

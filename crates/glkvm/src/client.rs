@@ -305,6 +305,7 @@ struct Inner {
 pub(crate) enum Body<'a> {
     None,
     Text(&'a str),
+    Bytes(&'a [u8]),
 }
 
 impl Session {
@@ -377,10 +378,18 @@ impl Session {
                 .request(method.clone(), url.clone())
                 .query(query)
                 .header("Cookie", format!("auth_token={token}"));
-            if let Body::Text(text) = body {
-                req = req
-                    .header("Content-Type", "text/plain; charset=utf-8")
-                    .body(text.to_owned());
+            match body {
+                Body::None => {}
+                Body::Text(text) => {
+                    req = req
+                        .header("Content-Type", "text/plain; charset=utf-8")
+                        .body(text.to_owned());
+                }
+                Body::Bytes(bytes) => {
+                    req = req
+                        .header("Content-Type", "application/octet-stream")
+                        .body(bytes.to_vec());
+                }
             }
             let resp = req.send().await.map_err(|e| self.inner.conn.transport(e))?;
             let (status, bytes) = read(resp).await?;
@@ -422,9 +431,18 @@ impl Session {
     /// Opens a WebSocket at `path_and_query` (e.g. `api/ws?stream=0`) with the session
     /// cookie and the pinned TLS config. Nagle is disabled: HID latency depends on it.
     pub async fn ws_connect(&self, path_and_query: &str) -> Result<WsStream> {
+        self.ws_connect_protocol(path_and_query, None).await
+    }
+
+    /// Like [`Self::ws_connect`], requesting a WebSocket subprotocol.
+    pub async fn ws_connect_protocol(
+        &self,
+        path_and_query: &str,
+        protocol: Option<&str>,
+    ) -> Result<WsStream> {
         for attempt in 0..2 {
             let token = self.token();
-            match self.ws_connect_once(path_and_query, &token).await {
+            match self.ws_connect_once(path_and_query, &token, protocol).await {
                 Err(Error::WebSocket(tungstenite::Error::Http(resp)))
                     if resp.status() == 401 && attempt == 0 && self.inner.relogin.is_some() =>
                 {
@@ -439,13 +457,21 @@ impl Session {
         unreachable!("loop returns on the second attempt")
     }
 
-    async fn ws_connect_once(&self, path_and_query: &str, token: &str) -> Result<WsStream> {
+    async fn ws_connect_once(
+        &self,
+        path_and_query: &str,
+        token: &str,
+        protocol: Option<&str>,
+    ) -> Result<WsStream> {
         let host = &self.inner.conn.host;
         let url = format!("wss://{host}/{}", path_and_query.trim_start_matches('/'));
         let mut req = url.into_client_request()?;
         let headers = req.headers_mut();
         headers.insert("Cookie", header(&format!("auth_token={token}"))?);
         headers.insert("Origin", header(&format!("https://{host}"))?);
+        if let Some(p) = protocol {
+            headers.insert("Sec-WebSocket-Protocol", header(p)?);
+        }
         let (ws, _resp) = tokio_tungstenite::connect_async_tls_with_config(
             req,
             None,

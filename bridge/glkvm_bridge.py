@@ -13,19 +13,33 @@ that was already paired with the previous connection is closed too (it reconnect
 bytes from the old session are discarded. That way both ends always start their
 handshake on a clean stream. Bytes sent by a side that is still waiting for its first
 partner are buffered up to --max-buffer and delivered when the partner arrives.
+
+It also serves the target's installer scripts and agent binaries on the USB link
+(http://192.168.5.1:47475, unreachable from the LAN), and reports its health (firmware,
+USB link, stored agents) at /glkvm-bridge/status for the client's setup/repair check.
+Agent binaries are uploaded by the client: PUT /glkvm-bridge/agents/<name>.
 """
 
 import argparse
 import asyncio
+import glob
+import hashlib
 import logging
 import os
+import re
 import socket
 import time
 
 from aiohttp import WSMsgType, web
 
-VERSION = "0.2.0"
+VERSION = "0.3.1"
 log = logging.getLogger("glkvm-bridge")
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+AGENTS_DIR = os.path.join(BASE_DIR, "agents")
+TARGET_DIR = os.path.join(BASE_DIR, "target")
+AGENT_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+MAX_AGENT_SIZE = 32 * 1024 * 1024
 
 
 class Side:
@@ -182,11 +196,102 @@ class Bridge:
         return web.json_response({
             "version": VERSION,
             "link": "rndis",
+            "firmware": firmware_version(),
+            "bundle": _read(os.path.join(BASE_DIR, "bundle")) or None,
+            "usb": usb_health(),
+            "agents": list_agents(),
             "agent": side(self.agent),
             "client": side(self.client),
             "bytes_agent_to_client": self.bytes_up,
             "bytes_client_to_agent": self.bytes_down,
         })
+
+
+# ----- health
+
+def _read(path: str) -> str:
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def firmware_version() -> str:
+    for line in _read("/etc/version").splitlines():
+        if line.startswith("RK_VERSION="):
+            return line.split("=", 1)[1]
+    return ""
+
+
+def usb_health() -> dict:
+    """Whether the RNDIS function is in the USB gadget, usb0 exists, and a host is attached."""
+    return {
+        "gadget": bool(glob.glob("/sys/kernel/config/usb_gadget/*/configs/*/rndis.usb0")),
+        "iface": os.path.isdir("/sys/class/net/usb0"),
+        "carrier": _read("/sys/class/net/usb0/carrier") == "1",
+    }
+
+
+# ----- agent binaries (uploaded by the client, downloaded by the target)
+
+def _agent_path(name: str) -> str:
+    if not AGENT_NAME.fullmatch(name):
+        raise web.HTTPBadRequest(text="bad agent name")
+    return os.path.join(AGENTS_DIR, name)
+
+
+_digests: dict[str, tuple[float, int, str]] = {}  # name -> (mtime, size, sha256)
+
+
+def list_agents() -> list[dict]:
+    out = []
+    for name in sorted(os.listdir(AGENTS_DIR)) if os.path.isdir(AGENTS_DIR) else []:
+        path = os.path.join(AGENTS_DIR, name)
+        if not AGENT_NAME.fullmatch(name) or not os.path.isfile(path):
+            continue
+        st = os.stat(path)
+        cached = _digests.get(name)
+        if cached is None or cached[:2] != (st.st_mtime, st.st_size):
+            with open(path, "rb") as f:
+                cached = (st.st_mtime, st.st_size, hashlib.sha256(f.read()).hexdigest())
+            _digests[name] = cached
+        out.append({"name": name, "size": st.st_size, "sha256": cached[2]})
+    return out
+
+
+async def handle_agent_upload(request: web.Request) -> web.Response:
+    path = _agent_path(request.match_info["name"])
+    os.makedirs(AGENTS_DIR, exist_ok=True)
+    tmp = path + ".part"
+    digest = hashlib.sha256()
+    size = 0
+    with open(tmp, "wb") as f:
+        async for chunk in request.content.iter_chunked(65536):
+            size += len(chunk)
+            if size > MAX_AGENT_SIZE:
+                f.close()
+                os.unlink(tmp)
+                raise web.HTTPRequestEntityTooLarge(MAX_AGENT_SIZE, size)
+            digest.update(chunk)
+            f.write(chunk)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+    log.info("agent binary %s stored (%d bytes)", os.path.basename(path), size)
+    return web.json_response({"name": os.path.basename(path), "size": size, "sha256": digest.hexdigest()})
+
+
+async def handle_agent_download(request: web.Request) -> web.StreamResponse:
+    path = _agent_path(request.match_info["name"])
+    if not os.path.isfile(path):
+        raise web.HTTPNotFound(text="no such agent binary on the Comet; set up the bridge again")
+    return web.FileResponse(path)
+
+
+def target_script(name: str):
+    async def handler(_: web.Request) -> web.StreamResponse:
+        return web.FileResponse(os.path.join(TARGET_DIR, name), headers={"Content-Type": "text/plain"})
+    return handler
 
 
 async def serve_agent(bridge: Bridge, host: str, port: int) -> None:
@@ -202,19 +307,39 @@ async def serve_agent(bridge: Bridge, host: str, port: int) -> None:
             await asyncio.sleep(5)
 
 
+async def serve_downloads(host: str, port: int) -> None:
+    """Installer scripts and agent binaries for the target, on the USB link only."""
+    app = web.Application()
+    app.router.add_get("/install.sh", target_script("install.sh"))
+    app.router.add_get("/install.ps1", target_script("install.ps1"))
+    app.router.add_get("/agents/{name}", handle_agent_download)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    while True:
+        try:
+            await web.TCPSite(runner, host, port).start()
+            log.info("target downloads on http://%s:%d", host, port)
+            return
+        except OSError as ex:
+            log.warning("cannot listen on %s:%d (%s), retrying in 5 s", host, port, ex)
+            await asyncio.sleep(5)
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--unix", default="/run/kvmd/glkvm-bridge.sock")
     parser.add_argument("--agent-host", default="192.168.5.1")
     parser.add_argument("--agent-port", type=int, default=47474)
+    parser.add_argument("--download-port", type=int, default=47475)
     parser.add_argument("--max-buffer", type=int, default=256 * 1024)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
     bridge = Bridge(args.max_buffer)
-    app = web.Application()
+    app = web.Application(client_max_size=MAX_AGENT_SIZE)
     app.router.add_get("/ws", bridge.handle_client)
     app.router.add_get("/status", bridge.handle_status)
+    app.router.add_put("/agents/{name}", handle_agent_upload)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     if os.path.exists(args.unix):
@@ -222,6 +347,7 @@ async def main() -> None:
     await web.UnixSite(runner, args.unix).start()
     os.chmod(args.unix, 0o666)  # nginx connects as its own user
     log.info("glkvm-bridge %s: client socket %s", VERSION, args.unix)
+    asyncio.ensure_future(serve_downloads(args.agent_host, args.download_port))
     await serve_agent(bridge, args.agent_host, args.agent_port)
 
 

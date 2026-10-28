@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use glkvm::api::atx::{AtxButton, PowerAction};
+use glkvm::api::bridge::Health;
 use glkvm::api::capabilities::{Capabilities, Feature};
 use glkvm::api::hid::PrintOptions;
 use glkvm::api::streamer::SnapshotOptions;
@@ -28,6 +29,7 @@ use crate::actions::{self, HostModifiers, Shortcut};
 use crate::app::UserEvent;
 use crate::clipsync::{BridgeState, ClipBridge, Settings as ClipSettings};
 use crate::gpu::Gpu;
+use crate::setup::BridgeSetup;
 use crate::store::{self, ClipDirection, SavedDevice, TargetOs};
 
 const HIDDEN_GRACE: Duration = Duration::from_secs(30);
@@ -55,9 +57,14 @@ struct Typing {
 }
 
 enum Confirm {
-    Type { text: String, reason: String },
+    Type {
+        text: String,
+        reason: String,
+    },
     Power(PowerAction),
     Click(AtxButton),
+    /// Install / update / repair the bridge on the Comet; holds the action's name.
+    BridgeSetup(String),
 }
 
 /// What the UI asks the app to do.
@@ -111,8 +118,14 @@ pub struct Console {
     /// Clipboard bridge to the agent on the target; `None` until paired.
     clip: Option<ClipBridge>,
     clip_paused: bool,
-    /// Pairing code shown in the pairing dialog while it is open.
-    pairing: Option<String>,
+    /// Pairing code shown in the target setup dialog while it is open.
+    target_setup: Option<String>,
+    /// Comet-side health and setup of the bridge.
+    setup: BridgeSetup,
+    /// A "needs repair" notice was shown for this connection.
+    repair_noticed: bool,
+    /// The target OS changed outside the toolbar (dialog, agent report): save the device.
+    target_changed: bool,
 }
 
 impl Console {
@@ -122,6 +135,12 @@ impl Console {
         let mapper = InputMapper::new(c.device.target.key_options(iso_fix), scroll);
         let _guard = rt.enter();
         let events = EventSession::spawn(c.session.clone(), EventOptions::default());
+        let setup = {
+            let proxy = proxy.clone();
+            BridgeSetup::new(rt.clone(), c.session.clone(), move || {
+                let _ = proxy.send_event(UserEvent::Refresh);
+            })
+        };
         let mut console = Console {
             hid: events.hid(),
             conn: events.conn_state(),
@@ -151,7 +170,10 @@ impl Console {
             video_area: egui::Rect::NOTHING,
             clip: None,
             clip_paused: false,
-            pairing: None,
+            target_setup: None,
+            setup,
+            repair_noticed: false,
+            target_changed: false,
         };
         console.start_stream();
         if let Some(secret) = store::clip_secret(&console.device) {
@@ -182,14 +204,46 @@ impl Console {
         ));
     }
 
-    /// New pairing code: replaces any old pairing and opens the pairing dialog.
-    fn pair_clipboard(&mut self) {
+    /// New pairing code (replacing any old pairing) and the dialog that installs the agent
+    /// on the target with it.
+    fn start_target_setup(&mut self) {
         let secret = glkvm_clip::Secret::generate();
         if let Err(e) = store::set_clip_secret(&self.device, &secret) {
             return self.notify(format!("Cannot store the pairing code: {e}"));
         }
-        self.pairing = Some(secret.to_code());
+        self.target_setup = Some(secret.to_code());
         self.start_clip(secret);
+    }
+
+    /// Changes the target OS (modifier mapping, install command) and saves it.
+    fn set_target(&mut self, os: TargetOs) {
+        if self.device.target == os {
+            return;
+        }
+        self.device.target = os;
+        let iso = self.mapper.keys.iso_fix;
+        self.mapper.keys = os.key_options(iso);
+        self.target_changed = true;
+    }
+
+    /// The agent reports the target's real OS: correct a wrong (e.g. default) setting.
+    fn adopt_agent_os(&mut self) {
+        let Some(BridgeState::Connected(hello)) = self.clip.as_ref().map(ClipBridge::state) else {
+            return;
+        };
+        let reported = match hello.os.as_str() {
+            "linux" => TargetOs::Linux,
+            "windows" => TargetOs::Windows,
+            "macos" => TargetOs::MacOs,
+            _ => return,
+        };
+        if self.device.target != reported && self.device.target != TargetOs::Bios {
+            self.set_target(reported);
+            self.notify(format!(
+                "Target set to {} (reported by the agent)",
+                reported.label()
+            ));
+        }
     }
 
     fn forget_clipboard_pairing(&mut self) {
@@ -198,25 +252,74 @@ impl Console {
         self.notify("Clipboard pairing removed".into());
     }
 
+    /// What the Comet side needs, as a button label (`None`: nothing to do).
+    fn bridge_action(&self) -> Option<&'static str> {
+        match self.setup.health()? {
+            Health::NotInstalled => Some("Set up this Comet…"),
+            Health::Outdated { .. } => Some("Update the Comet's bridge…"),
+            Health::Broken(_) => Some("Repair the Comet's bridge…"),
+            Health::Ok => None,
+        }
+    }
+
     fn clip_menu(&mut self, ui: &mut egui::Ui) -> ConsoleAction {
         let mut action = ConsoleAction::None;
+        let needs_device = self.bridge_action().is_some();
         let label = match self.clip.as_ref().map(ClipBridge::state) {
-            None => "Clipboard: off".to_string(),
+            _ if self.setup.progress().is_some() => "Clipboard: setting up…".to_string(),
+            Some(_) if needs_device => "Clipboard: needs repair".into(),
+            None => "Clipboard: off".into(),
             Some(_) if self.clip_paused => "Clipboard: paused".into(),
             Some(BridgeState::Connected(_)) => "Clipboard: synced".into(),
             Some(_) => "Clipboard: not connected".into(),
         };
         ui.menu_button(label, |ui| {
+            ui.set_min_width(260.0);
+            // The Comet side.
+            if let Some(p) = self.setup.progress() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(p);
+                });
+            } else {
+                match self.setup.health() {
+                    None => {
+                        ui.label("Checking the Comet…");
+                    }
+                    Some(Health::Ok) => {
+                        let fw = self
+                            .setup
+                            .status()
+                            .and_then(|s| s.firmware)
+                            .unwrap_or_default();
+                        ui.label(format!("Comet: bridge ready {fw}"));
+                    }
+                    Some(h) => {
+                        ui.colored_label(egui::Color32::from_rgb(230, 170, 50), health_text(&h));
+                    }
+                }
+                if let Some(label) = self.bridge_action()
+                    && ui.button(label).clicked()
+                {
+                    self.confirm = Some(Confirm::BridgeSetup(label.trim_end_matches('…').into()));
+                    ui.close();
+                }
+            }
+            ui.separator();
+
+            // The target side.
             let Some(state) = self.clip.as_ref().map(ClipBridge::state) else {
-                ui.label("Shares the clipboard with glkvm-agent on the target.");
-                if ui.button("Pair agent…").clicked() {
-                    self.pair_clipboard();
+                ui.label("Shares the clipboard with the target.");
+                if ui
+                    .add_enabled(!needs_device, egui::Button::new("Set up the target…"))
+                    .clicked()
+                {
+                    self.start_target_setup();
                     ui.close();
                 }
                 return;
             };
-            ui.label(state.label());
-            ui.separator();
+            ui.label(format!("Target: {}", state.label()));
             let before = self.device.clip_direction;
             for d in ClipDirection::ALL {
                 ui.radio_value(&mut self.device.clip_direction, d, d.label());
@@ -231,8 +334,12 @@ impl Console {
                 c.set_settings(self.clip_settings());
             }
             ui.separator();
-            if ui.button("Pair again (new code)…").clicked() {
-                self.pair_clipboard();
+            if ui
+                .button("Set up the target again…")
+                .on_hover_text("Reinstalls the agent on the target with a new pairing code")
+                .clicked()
+            {
+                self.start_target_setup();
                 ui.close();
             }
             if ui.button("Forget pairing").clicked() {
@@ -243,43 +350,112 @@ impl Console {
         action
     }
 
-    fn pairing_dialog(&mut self, ctx: &egui::Context) {
-        let Some(code) = self.pairing.clone() else {
+    /// Installs, pairs and starts the agent on the target: one command, typed for the user.
+    fn target_setup_dialog(&mut self, ctx: &egui::Context) {
+        let Some(code) = self.target_setup.clone() else {
             return;
         };
-        let command = format!("glkvm-agent pair {code}");
+        let os = self.device.target;
+        let mut chosen = os;
+        let command = install_command(os, &code);
+        let agent = agent_name(os);
+        let missing_agent = agent.is_some_and(|a| !self.setup.has_agent(a));
         let state = self.clip.as_ref().map(ClipBridge::state);
+        let connected = matches!(state, Some(BridgeState::Connected(_)));
         let mut close = false;
-        egui::Modal::new(egui::Id::unique("clip-pairing")).show(ctx, |ui| {
-            ui.heading("Pair the clipboard agent");
-            ui.label("On the target, in a terminal, run:");
+        egui::Modal::new(egui::Id::unique("target-setup")).show(ctx, |ui| {
+            ui.set_max_width(560.0);
+            ui.heading("Set up the target");
+            ui.horizontal(|ui| {
+                ui.label("The target runs:");
+                for os in [TargetOs::Linux, TargetOs::Windows, TargetOs::MacOs] {
+                    ui.selectable_value(&mut chosen, os, os.label());
+                }
+            });
+            if connected {
+                ui.colored_label(
+                    egui::Color32::from_rgb(90, 180, 110),
+                    "The agent is connected: the clipboard is shared now.",
+                );
+            }
+            let Some(command) = &command else {
+                ui.label(format!(
+                    "The clipboard agent does not run on {} targets yet. \
+                     Pick the target's OS in the toolbar if it is wrong.",
+                    os.label()
+                ));
+                ui.label("Manual pairing on a supported system:");
+                ui.monospace(format!("glkvm-agent pair {code}"));
+                if ui.button("Close").clicked() {
+                    close = true;
+                }
+                return;
+            };
+            if missing_agent {
+                ui.colored_label(
+                    egui::Color32::from_rgb(230, 170, 50),
+                    "The Comet has no agent program for this system yet: build it with \
+                     scripts/build-agents.sh, then update the Comet's bridge.",
+                );
+            }
+            ui.label(format!(
+                "1. Open a {} on the target and click into it.",
+                if os == TargetOs::Windows {
+                    "Run dialog or PowerShell"
+                } else {
+                    "terminal"
+                }
+            ));
+            let (open_label, open_keys): (&str, &[&'static str]) = match os {
+                TargetOs::Windows => ("Open the Run dialog (Win+R)", &["MetaLeft", "KeyR"]),
+                _ => (
+                    "Open a terminal (Ctrl+Alt+T)",
+                    &["ControlLeft", "AltLeft", "KeyT"],
+                ),
+            };
+            if ui.button(open_label).clicked() {
+                self.send_combo(open_keys);
+            }
+            ui.label(
+                "2. Run this command there. It downloads the agent from the Comet over the \
+                      USB cable, pairs it and starts it (also at every login). No admin rights \
+                      or internet needed.",
+            );
             ui.add(
-                egui::TextEdit::singleline(&mut command.as_str())
+                egui::TextEdit::multiline(&mut command.as_str())
                     .font(egui::TextStyle::Monospace)
+                    .desired_rows(2)
                     .desired_width(f32::INFINITY),
             );
-            ui.label("then start it with `glkvm-agent run`.");
             ui.horizontal(|ui| {
                 if ui
-                    .button("Type it on the target")
-                    .on_hover_text("Types the command (without Enter) into the focused window")
+                    .button("Run it on the target")
+                    .on_hover_text("Types the command and presses Enter in the focused window")
                     .clicked()
                 {
-                    self.start_typing(command.clone());
+                    self.start_typing(format!("{command}\n"));
                 }
                 if ui.button("Copy").clicked() {
                     ui.ctx().copy_text(command.clone());
                 }
             });
-            if let Some(s) = &state {
+            if let Some(s) = &state
+                && !connected
+            {
                 ui.label(format!("Status: {}", s.label()));
             }
-            if ui.button("Done").clicked() {
+            if ui
+                .button(if connected { "Done" } else { "Close" })
+                .clicked()
+            {
                 close = true;
             }
         });
+        if chosen != os {
+            self.set_target(chosen);
+        }
         if close {
-            self.pairing = None;
+            self.target_setup = None;
         }
     }
 
@@ -556,7 +732,7 @@ impl Console {
     }
 
     pub fn has_modal(&self) -> bool {
-        self.confirm.is_some() || self.pairing.is_some()
+        self.confirm.is_some() || self.target_setup.is_some()
     }
 
     pub fn send_combo(&mut self, keys: &[&'static str]) {
@@ -664,7 +840,7 @@ impl Console {
             let (label, r) = match confirm {
                 Confirm::Power(a) => (a.as_str(), session.atx_power(a, true).await),
                 Confirm::Click(b) => (b.as_str(), session.atx_click(b, true).await),
-                Confirm::Type { .. } => return,
+                Confirm::Type { .. } | Confirm::BridgeSetup(_) => return,
             };
             let msg = match r {
                 Ok(()) => format!("ATX {label}: done"),
@@ -706,6 +882,24 @@ impl Console {
 
     pub fn ui(&mut self, ui: &mut egui::Ui) -> ConsoleAction {
         let mut action = ConsoleAction::None;
+        match self.setup.take_outcome() {
+            Some(Ok(msg)) => self.notify(msg),
+            Some(Err(e)) => self.notify(format!("Bridge setup failed: {e}")),
+            None => {}
+        }
+        // Paired before, but the Comet side is gone or broken (e.g. after a firmware upgrade).
+        if !self.repair_noticed
+            && self.clip.is_some()
+            && let Some(h) = self.setup.health()
+        {
+            self.repair_noticed = true;
+            if h.needs_setup() {
+                self.notify(format!(
+                    "Clipboard: {}; repair it from the Clipboard menu",
+                    health_text(&h)
+                ));
+            }
+        }
         let pointer = ui.ctx().pointer_latest_pos();
         if self.toolbar_visible(pointer) {
             let resp = egui::Panel::top("toolbar").show(ui, |ui| {
@@ -725,6 +919,10 @@ impl Console {
             });
         self.video_area = central.response.rect;
         self.dialogs(ui.ctx());
+        self.adopt_agent_os();
+        if std::mem::take(&mut self.target_changed) && action == ConsoleAction::None {
+            action = ConsoleAction::TargetChanged;
+        }
         action
     }
 
@@ -934,7 +1132,7 @@ impl Console {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
-        self.pairing_dialog(ctx);
+        self.target_setup_dialog(ctx);
         let Some(confirm) = &self.confirm else { return };
         let (title, body) = match confirm {
             Confirm::Type { reason, .. } => (
@@ -948,6 +1146,13 @@ impl Console {
             Confirm::Click(b) => (
                 format!("Press the ATX {} button?", b.as_str()),
                 "This acts on the target directly.".into(),
+            ),
+            Confirm::BridgeSetup(what) => (
+                format!("{what}?"),
+                "Installs the clipboard bridge on the Comet through its web terminal and \
+                 enables its USB network link to the target. If that link has to be (re)created, \
+                 the target's keyboard and mouse disconnect for a moment. Takes about 20 seconds."
+                    .into(),
             ),
         };
         let mut decision = None;
@@ -966,11 +1171,73 @@ impl Console {
         match decision {
             Some(true) => match self.confirm.take() {
                 Some(Confirm::Type { text, .. }) => self.start_typing(text),
+                Some(Confirm::BridgeSetup(_)) => self.setup.run(),
                 Some(c) => self.atx(c),
                 None => {}
             },
             Some(false) => self.confirm = None,
             None => {}
         }
+    }
+}
+
+fn health_text(h: &Health) -> String {
+    match h {
+        Health::NotInstalled => "the Comet has no clipboard bridge".into(),
+        Health::Outdated { installed } => format!("the Comet's bridge is outdated ({installed})"),
+        Health::Broken(why) => format!("the Comet's bridge is broken: {why}"),
+        Health::Ok => "the Comet's bridge is ready".into(),
+    }
+}
+
+/// Agent binary the target installer downloads for `os`.
+fn agent_name(os: TargetOs) -> Option<&'static str> {
+    match os {
+        TargetOs::Linux => Some("linux-x86_64"),
+        TargetOs::Windows => Some("windows-x86_64.exe"),
+        TargetOs::MacOs | TargetOs::Bios => None,
+    }
+}
+
+/// The one command that installs, pairs and starts the agent (bridge/target/install.*).
+///
+/// It is typed over HID in the target's layout, so it avoids characters that need AltGr on
+/// common layouts (`|`, `[`, `]`, `{`, `}`, `\`, `@`, `~` on German, for one): those may not
+/// arrive. Hence a download to a file instead of a pipe, and `/` in Windows paths.
+fn install_command(os: TargetOs, code: &str) -> Option<String> {
+    const URL: &str = "http://192.168.5.1:47475";
+    match os {
+        TargetOs::Linux => Some(format!(
+            "curl -fsSo /tmp/glkvm-install.sh {URL}/install.sh && sh /tmp/glkvm-install.sh {code}"
+        )),
+        TargetOs::Windows => Some(format!(
+            "powershell -NoProfile -ExecutionPolicy Bypass -Command \"iwr -UseBasicParsing {URL}/install.ps1 -OutFile $env:TEMP/glkvm-install.ps1; & $env:TEMP/glkvm-install.ps1 {code}\""
+        )),
+        TargetOs::MacOs | TargetOs::Bios => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_commands_carry_the_code_and_fit_the_run_dialog() {
+        let code = glkvm_clip::Secret::generate().to_code();
+        let linux = install_command(TargetOs::Linux, &code).unwrap();
+        assert!(linux.ends_with(&format!("sh /tmp/glkvm-install.sh {code}")));
+        let win = install_command(TargetOs::Windows, &code).unwrap();
+        assert!(win.contains(&code));
+        // Typed over HID: no characters that need AltGr on common layouts.
+        for cmd in [&linux, &win] {
+            assert!(
+                !cmd.contains(['|', '[', ']', '{', '}', '\\', '@', '~']),
+                "{cmd}"
+            );
+        }
+        // Windows' Run dialog accepts at most 259 characters.
+        assert!(win.len() < 260, "{} chars", win.len());
+        assert_eq!(install_command(TargetOs::MacOs, &code), None);
+        assert_eq!(agent_name(TargetOs::Linux), Some("linux-x86_64"));
     }
 }

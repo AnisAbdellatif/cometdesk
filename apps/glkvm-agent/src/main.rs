@@ -7,9 +7,13 @@
 //!
 //! ```text
 //! glkvm-agent pair <code>     store the pairing code shown by glkvm-gui
-//! glkvm-agent [run] [--relay HOST:PORT]
-//! glkvm-agent unpair
+//! glkvm-agent [run] [--relay HOST:PORT] [--log FILE]
+//! glkvm-agent unpair          forget the pairing
+//! glkvm-agent uninstall       forget the pairing and remove autostart
 //! ```
+//!
+//! Normally installed by the installer the Comet serves on the USB link (bridge/target/),
+//! which glkvm-gui types on the target for you. Only one instance runs per user.
 
 mod clipboard;
 mod config;
@@ -34,16 +38,35 @@ const MISMATCH_BACKOFF: Duration = Duration::from_secs(30);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const READ_SLICE: Duration = Duration::from_millis(100);
 
+/// Local port held while `run` is active, so a second instance (autostart plus a manual
+/// start) refuses to run instead of fighting over the clipboard.
+const INSTANCE_PORT: u16 = 47476;
+
+/// `--log FILE`: append log lines there instead of stderr.
+static LOG_FILE: std::sync::OnceLock<std::sync::Mutex<std::fs::File>> = std::sync::OnceLock::new();
+
 macro_rules! log {
-    ($($t:tt)*) => {{
-        let t = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() % 86400)
-            .unwrap_or(0);
-        eprintln!("{:02}:{:02}:{:02} {}", t / 3600, t / 60 % 60, t % 60, format!($($t)*));
-    }};
+    ($($t:tt)*) => {
+        $crate::log_line(&format!($($t)*))
+    };
 }
 pub(crate) use log;
+
+pub(crate) fn log_line(msg: &str) {
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() % 86400)
+        .unwrap_or(0);
+    let line = format!("{:02}:{:02}:{:02} {msg}", t / 3600, t / 60 % 60, t % 60);
+    match LOG_FILE.get() {
+        Some(f) => {
+            if let Ok(mut f) = f.lock() {
+                let _ = writeln!(f, "{line}");
+            }
+        }
+        None => eprintln!("{line}"),
+    }
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -61,14 +84,45 @@ fn main() -> ExitCode {
             println!("glkvm-agent {VERSION}");
             ExitCode::SUCCESS
         }
-        [] | ["run"] => run(DEFAULT_RELAY),
-        ["run", "--relay", relay] | ["--relay", relay] => run(relay),
-        _ => {
-            eprintln!(
-                "usage: glkvm-agent pair <code> | glkvm-agent [run] [--relay HOST:PORT] | glkvm-agent unpair"
-            );
-            ExitCode::from(2)
+        ["uninstall"] => uninstall(),
+        ["run", opts @ ..] | opts => match run_options(opts) {
+            Some((relay, log)) => run(relay, log),
+            None => {
+                eprintln!(
+                    "usage: glkvm-agent pair <code> | glkvm-agent [run] [--relay HOST:PORT] [--log FILE]\n       \
+                     glkvm-agent unpair | glkvm-agent uninstall"
+                );
+                ExitCode::from(2)
+            }
+        },
+    }
+}
+
+fn run_options<'a>(mut opts: &[&'a str]) -> Option<(&'a str, Option<&'a str>)> {
+    let (mut relay, mut log) = (DEFAULT_RELAY, None);
+    loop {
+        match opts {
+            [] => return Some((relay, log)),
+            ["--relay", r, rest @ ..] => (relay, opts) = (r, rest),
+            ["--log", f, rest @ ..] => (log, opts) = (Some(*f), rest),
+            _ => return None,
         }
+    }
+}
+
+fn uninstall() -> ExitCode {
+    if let Err(e) = config::remove_secret() {
+        return fail(&format!("cannot remove the pairing: {e}"));
+    }
+    match config::remove_autostart() {
+        Ok(()) => {
+            println!("Pairing and autostart removed. A running agent stops at the next logon.");
+            if let Ok(exe) = std::env::current_exe() {
+                println!("Delete the program itself with: rm {}", exe.display());
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&format!("cannot remove autostart: {e}")),
     }
 }
 
@@ -91,7 +145,27 @@ fn pair(code: &str) -> ExitCode {
     }
 }
 
-fn run(relay: &str) -> ExitCode {
+fn run(relay: &str, log_file: Option<&str>) -> ExitCode {
+    if let Some(path) = log_file {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            Ok(f) => {
+                let _ = LOG_FILE.set(std::sync::Mutex::new(f));
+            }
+            Err(e) => return fail(&format!("cannot open the log file {path}: {e}")),
+        }
+        detach_console();
+    }
+    let _instance = match std::net::TcpListener::bind(("127.0.0.1", INSTANCE_PORT)) {
+        Ok(l) => l,
+        Err(_) => {
+            log!("another glkvm-agent is already running for this user; exiting");
+            return ExitCode::SUCCESS;
+        }
+    };
     let secret = match config::load_secret() {
         Ok(Some(s)) => s,
         Ok(None) => return fail("not paired: run `glkvm-agent pair <code>` first"),
@@ -128,6 +202,14 @@ fn run(relay: &str) -> ExitCode {
             Err(SessionEnd::ClipboardGone) => return fail("clipboard thread stopped"),
         };
         std::thread::sleep(wait);
+    }
+}
+
+/// Started hidden with a log file (Windows autostart): drop the console window.
+fn detach_console() {
+    #[cfg(windows)]
+    unsafe {
+        windows_sys::Win32::System::Console::FreeConsole();
     }
 }
 

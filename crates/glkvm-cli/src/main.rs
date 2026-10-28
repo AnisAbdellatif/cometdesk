@@ -110,6 +110,29 @@ enum Cmd {
     },
     /// Record scrubbed read-only API responses as test fixtures.
     RecordFixtures { dir: PathBuf },
+    /// Clipboard bridge on the device (docs/clipboard-bridge.md).
+    Bridge {
+        #[command(subcommand)]
+        cmd: BridgeCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum BridgeCmd {
+    /// Show whether the bridge is installed and healthy.
+    Status,
+    /// Install, update or repair the bridge, then upload the agent binaries.
+    /// May restart the device's USB functions (the target's keyboard drops for a moment).
+    Setup {
+        /// Directory with agent binaries (scripts/build-agents.sh).
+        #[arg(long, default_value = "dist/agents")]
+        agents: PathBuf,
+    },
+    /// Remove the bridge and its USB network function from the device.
+    Remove {
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -263,6 +286,11 @@ async fn one_shot(session: &Session, cmd: Cmd) -> Result<()> {
             commands::type_text(session, text, keymap.as_deref(), slow).await
         }
         Cmd::RecordFixtures { dir } => commands::record_fixtures(session, &dir).await,
+        Cmd::Bridge { cmd } => match cmd {
+            BridgeCmd::Status => commands::bridge_status(session).await,
+            BridgeCmd::Setup { agents } => commands::bridge_setup(session, &agents).await,
+            BridgeCmd::Remove { yes } => commands::bridge_remove(session, yes).await,
+        },
         Cmd::View { .. } | Cmd::Probe { .. } => unreachable!("handled in main"),
     }
 }

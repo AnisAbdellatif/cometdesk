@@ -56,6 +56,36 @@ pub fn remove_secret() -> io::Result<()> {
     }
 }
 
+/// Removes the autostart entry the installer created (bridge/target/install.*).
+pub fn remove_autostart() -> io::Result<()> {
+    if cfg!(windows) {
+        // A non-zero exit also means "no such value": nothing to remove.
+        std::process::Command::new("reg")
+            .args([
+                "delete",
+                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                "/v",
+                "glkvm-agent",
+                "/f",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        return Ok(());
+    }
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
+    if let Some(base) = base {
+        match std::fs::remove_file(base.join("autostart/glkvm-agent.desktop")) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 pub fn host_name() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
