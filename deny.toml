@@ -1,0 +1,37 @@
+# cargo-deny: run `cargo deny check` (CI does).
+# The project is MIT OR Apache-2.0 and clean-room (PLAN.md §0): no GPL/AGPL/LGPL code may
+# enter the dependency tree.
+
+[graph]
+all-features = true
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[advisories]
+yanked = "warn"
+ignore = [
+    # ttf-parser is unmaintained (not a vulnerability). It only enters through winit's
+    # Wayland client-side decorations (sctk-adwaita), which the macOS build doesn't use.
+    { id = "RUSTSEC-2026-0192", reason = "Linux/Wayland-only transitive dep of winit" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

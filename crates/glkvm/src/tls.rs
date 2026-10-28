@@ -33,12 +33,10 @@ impl PinStore {
         }
     }
 
-    /// Store persisted at `<config dir>/glkvm/known_hosts`.
+    /// Store persisted at `<config dir>/glkvm/known_hosts` (see [`config_dir`]).
     pub fn load_default() -> io::Result<Self> {
-        let dir = dirs::config_dir()
-            .ok_or_else(|| io::Error::other("no config directory"))?
-            .join("glkvm");
-        Self::load(dir.join("known_hosts"))
+        let dir = config_dir().ok_or_else(|| io::Error::other("no config directory"))?;
+        Self::load(dir.join("glkvm").join("known_hosts"))
     }
 
     pub fn load(path: impl Into<PathBuf>) -> io::Result<Self> {
@@ -69,6 +67,23 @@ impl PinStore {
 
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
+    }
+}
+
+/// Per-user configuration directory: `~/Library/Application Support` on macOS,
+/// `%APPDATA%` on Windows, `$XDG_CONFIG_HOME` or `~/.config` elsewhere.
+pub fn config_dir() -> Option<PathBuf> {
+    let env = |k: &str| {
+        std::env::var_os(k)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    if cfg!(target_os = "macos") {
+        env("HOME").map(|h| h.join("Library/Application Support"))
+    } else if cfg!(windows) {
+        env("APPDATA")
+    } else {
+        env("XDG_CONFIG_HOME").or_else(|| env("HOME").map(|h| h.join(".config")))
     }
 }
 

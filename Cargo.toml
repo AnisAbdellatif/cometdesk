@@ -5,7 +5,7 @@ members = ["crates/glkvm", "crates/glkvm-media", "crates/glkvm-cli"]
 [workspace.package]
 edition = "2024"
 license = "MIT OR Apache-2.0"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [profile.release]
 lto = "thin"

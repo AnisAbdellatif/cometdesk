@@ -11,6 +11,33 @@ Verified 2026-10-28 with `glkvm-cli probe` and the ignored device tests
 - Response: `{"ok": true, "result": {"token": "…", "failed_since_last_success": N}}` plus an
   `auth_token` cookie. Failed attempts are counted per client and rate-limited (429).
 - Passwords may contain `$`; `.env` values must be read literally (`glkvm::env`).
+- **2FA**: no separate endpoint. The 6-digit TOTP code is appended to `passwd`;
+  `GET /api/2fa/is_enabled` (no auth) tells whether it is needed.
+- **Two-step approval**: login answers `{"two_step_required": true, "two_step_token": …,
+  "expires_in": N}`; poll `POST /api/auth/two_step_complete` (form `two_step_token`) until it
+  returns a token (`{"status": "pending"}` meanwhile, 403 when rejected or expired).
+- An expired token gives HTTP 401; the SDK logs in again once (not for TOTP logins).
+
+## Identity and capabilities
+
+- `GET /api/upgrade/version` → `{"model": "RM1", "version": "V1.10.1 release3"}`. `/api/info`
+  has kvmd/ustreamer versions and the SoC but not the GL model or firmware.
+- `GET /api/system/capability` → string flags (`cpu_model`, `mipi`, `usb_version`, …).
+- `GET /api/system/clients` answers **403** to normal sessions (reserved for the device GUI),
+  so a "viewers connected" count is not available to us.
+- This RM1 has no ATX board (`atx.enabled = false`); power actions would fail.
+
+## Dangerous GETs
+
+`GET /api/upgrade/reboot`, `upgrade/reset_default`, `2fa/create`, `2fa/delete` and
+`msd/partition_*` change state. Never call routes speculatively; the fixture recorder uses a
+fixed read-only allowlist.
+
+## Events are diffs
+
+Each subsystem's first event is its full state; later events carry only the top-level keys that
+changed (e.g. `{"streamer": {...}}` without `features`/`params`). Merge per top-level key.
+`hid` events are always full.
 
 ## U1: HID frames on `/api/ws`
 
