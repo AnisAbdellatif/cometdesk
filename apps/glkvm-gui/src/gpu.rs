@@ -19,6 +19,9 @@ pub struct Gpu {
     paint_jobs: Vec<egui::ClippedPrimitive>,
     pixels_per_point: f32,
     free_after_render: Vec<egui::TextureId>,
+    /// egui's vertex/index/uniform buffers need uploading (output or size changed). Video
+    /// frames re-draw the same egui output many times; uploading it each time cost CPU.
+    egui_buffers_dirty: bool,
 }
 
 impl Gpu {
@@ -83,6 +86,7 @@ impl Gpu {
             paint_jobs: Vec::new(),
             pixels_per_point: 1.0,
             free_after_render: Vec::new(),
+            egui_buffers_dirty: true,
         })
     }
 
@@ -90,6 +94,7 @@ impl Gpu {
         self.config.width = width.max(1);
         self.config.height = height.max(1);
         self.surface.configure(&self.device, &self.config);
+        self.egui_buffers_dirty = true;
     }
 
     pub fn max_texture_side(&self) -> usize {
@@ -108,6 +113,7 @@ impl Gpu {
         self.free_after_render
             .extend(std::mem::take(&mut delta.free));
         self.pixels_per_point = output.pixels_per_point;
+        self.egui_buffers_dirty = true;
         self.paint_jobs =
             ctx.tessellate(std::mem::take(&mut output.shapes), output.pixels_per_point);
     }
@@ -134,13 +140,17 @@ impl Gpu {
             pixels_per_point: self.pixels_per_point,
         };
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        let mut extra = self.egui.update_buffers(
-            &self.device,
-            &self.queue,
-            &mut encoder,
-            &self.paint_jobs,
-            &screen,
-        );
+        let mut extra = Vec::new();
+        if self.egui_buffers_dirty {
+            self.egui_buffers_dirty = false;
+            extra = self.egui.update_buffers(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                &self.paint_jobs,
+                &screen,
+            );
+        }
         {
             let mut pass = encoder
                 .begin_render_pass(&wgpu::RenderPassDescriptor {

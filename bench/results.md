@@ -55,3 +55,23 @@ Impact; M1 still needs the camera measurement before Phase 0 is formally closed.
   single tab.
 - To get watts:
   `sudo powermetrics --samplers cpu_power,gpu_power -i 1000 -n 20` while each client runs.
+
+## Phase 2 console app (glkvm-gui)
+
+Same method, 2026-10-28, window visible, mostly static target screen.
+
+| Client | Run | App CPU | Decoder CPU | **Total CPU** | **Total energy** |
+|---|---|---|---|---|---|
+| glkvm-gui, windowed (toolbar shown), before buffer fix | 1 | 11.5 % | 5.2 % | **16.7 %** | **16.9** |
+| | 2 | 12.1 % | 5.3 % | **17.4 %** | **17.4** |
+| glkvm-gui, windowed, egui buffers uploaded only on change | 1 | 8.7 % | 4.7 % | **13.4 %** | **13.4** |
+| | 2 | 9.9 % | 5.4 % | **15.3 %** | **15.4** |
+| glkvm-gui, fullscreen, toolbar hidden | 1 | 7.4 % | 3.6 % | **11.0 %** | **11.4** |
+| | 2 | 7.5 % | 3.8 % | **11.3 %** | **11.5** |
+
+- The egui toolbar adds ~1–2 % over the bare CLI viewer (13–14 %) once its vertex buffers
+  are only uploaded when the UI changed; before that, re-uploading them for every video frame
+  cost ~3–4 %. Fullscreen without the toolbar is the cheapest mode.
+- Still ~1/5 of the web app (67–69 % Direct, ~54 % WebRTC).
+- A hidden window stops decoding immediately and drops the stream after 30 s (seen in the
+  logs during these runs: covered windows measured ~0–2 %).
