@@ -1,0 +1,17 @@
+{
+  "ok": true,
+  "result": {
+    "capability": {
+      "cpu_model": "rv1126",
+      "factory_partition": "/dev/mmcblk0p9",
+      "hdmi_spliter": "",
+      "media": "/dev/mmcblk0p10",
+      "mipi": "lt6911c",
+      "otg_version": "2",
+      "reset_gpio": "96",
+      "usb_epin": "9",
+      "usb_version": "2"
+    },
+    "success": true
+  }
+}

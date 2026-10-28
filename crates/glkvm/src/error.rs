@@ -18,8 +18,14 @@ pub enum Error {
     Forbidden,
     #[error("login rate-limited by the device: {0}")]
     RateLimited(String),
-    #[error("the device requires two-step login approval, which is not supported yet")]
-    TwoStepRequired,
+    #[error("the device has 2FA enabled: a TOTP code is required")]
+    TotpRequired,
+    #[error("two-step login was rejected or expired")]
+    TwoStepRejected,
+    #[error("not logged in (token rejected and no way to log in again)")]
+    Unauthorized,
+    #[error("{0} is not supported by this device")]
+    Unsupported(&'static str),
     #[error("device returned HTTP {status}: {message}")]
     Api { status: u16, message: String },
     #[error(

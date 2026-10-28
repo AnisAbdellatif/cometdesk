@@ -1,0 +1,70 @@
+{
+  "ok": true,
+  "result": {
+    "config": {
+      "fingerbot_strength": 1,
+      "got_muted_panel_tip": false,
+      "is_absolute_mouse": true,
+      "keyboard_control": true,
+      "keymap": "en-us",
+      "mouse_control": true,
+      "mouse_jiggle": false,
+      "mouse_polling": 10,
+      "orientation": 0,
+      "relative_sense": 10,
+      "reverse_scrolling": "STANDARD",
+      "scroll_rate": 5,
+      "shortcuts": [
+        {
+          "keys": [
+            "ControlLeft",
+            "AltLeft",
+            "Delete"
+          ],
+          "label": "Ctrl + Alt + Del"
+        },
+        {
+          "keys": [
+            "AltLeft",
+            "ShiftLeft"
+          ],
+          "label": "Alt + Shift"
+        },
+        {
+          "keys": [
+            "AltLeft",
+            "Tab"
+          ],
+          "label": "Alt + Tab"
+        },
+        {
+          "keys": [
+            "AltLeft",
+            "F4"
+          ],
+          "label": "Alt + F4"
+        },
+        {
+          "keys": [
+            "MetaLeft",
+            "KeyP"
+          ],
+          "label": "Win + P"
+        },
+        {
+          "keys": [
+            "ControlLeft",
+            "KeyW"
+          ],
+          "label": "Ctrl + W"
+        }
+      ],
+      "show_cursor": false,
+      "stream_quality": 3,
+      "theme_mode": "0",
+      "video_mode": "webrtc",
+      "video_processing": "quality_first"
+    },
+    "success": true
+  }
+}

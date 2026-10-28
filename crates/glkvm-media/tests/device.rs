@@ -19,10 +19,10 @@ use glkvm_media::vt::VtDecoder;
 async fn login() -> Session {
     glkvm::env::load_dotenv();
     let host = std::env::var("GLKVM_HOST").expect("GLKVM_HOST");
-    let creds = Credentials {
-        user: std::env::var("GLKVM_USER").unwrap_or_else(|_| "admin".into()),
-        password: std::env::var("GLKVM_PASSWORD").expect("GLKVM_PASSWORD"),
-    };
+    let creds = Credentials::new(
+        std::env::var("GLKVM_USER").unwrap_or_else(|_| "admin".into()),
+        std::env::var("GLKVM_PASSWORD").expect("GLKVM_PASSWORD"),
+    );
     let pins = Arc::new(PinStore::load_default().unwrap());
     Session::login(&host, &creds, pins).await.expect("login")
 }

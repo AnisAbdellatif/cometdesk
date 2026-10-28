@@ -226,7 +226,7 @@ mod tests {
         queue.submit([enc.finish()]);
         buf.slice(..).map_async(wgpu::MapMode::Read, |r| r.unwrap());
         device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-        
+
         buf.slice(..).get_mapped_range().unwrap()[..bpp as usize].to_vec()
     }
 

@@ -1,8 +1,10 @@
 //! `glkvm`: command-line client for GLKVM devices.
 //!
-//! Credentials come from the environment or a `.env` file (values taken literally): `GLKVM_HOST`, `GLKVM_USER`
-//! (default `admin`) and `GLKVM_PASSWORD`.
+//! Credentials come from the environment or a `.env` file (values taken literally):
+//! `GLKVM_HOST`, `GLKVM_USER` (default `admin`) and `GLKVM_PASSWORD`. With 2FA enabled, pass
+//! `--totp CODE` (or `GLKVM_TOTP`), or type the code when asked.
 
+mod commands;
 mod input;
 mod keymap;
 mod renderer;
@@ -10,11 +12,14 @@ mod viewer;
 #[cfg(target_os = "macos")]
 mod zerocopy;
 
+use std::io::{IsTerminal, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
+use glkvm::api::atx::{AtxButton, PowerAction};
 use glkvm::events::{EventOptions, EventSession};
 use glkvm::tls::PinStore;
 use glkvm::{Credentials, Session};
@@ -34,6 +39,9 @@ struct Cli {
     /// User name. Defaults to $GLKVM_USER, then "admin".
     #[arg(long, global = true)]
     user: Option<String>,
+    /// Current 2FA (TOTP) code. Defaults to $GLKVM_TOTP; asked for when needed.
+    #[arg(long, global = true)]
+    totp: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -66,6 +74,70 @@ enum Cmd {
         #[arg(long, default_value_t = 10)]
         frames: usize,
     },
+    /// Model, firmware, features and target status.
+    Info,
+    /// Save a JPEG snapshot of the target's screen.
+    Snapshot {
+        #[arg(default_value = "snapshot.jpg")]
+        out: PathBuf,
+        /// Scale down to fit WIDTHxHEIGHT.
+        #[arg(long, value_parser = parse_size)]
+        preview: Option<(u32, u32)>,
+    },
+    /// ATX power action on the target (asks for confirmation).
+    Power {
+        #[arg(value_enum)]
+        action: PowerArg,
+        /// Don't ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Press an ATX button (asks for confirmation).
+    Click {
+        #[arg(value_enum)]
+        button: ButtonArg,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Send a Wake-on-LAN packet to a MAC address or a saved target name.
+    Wake { target: String },
+    /// List saved Wake-on-LAN targets.
+    WolList,
+    /// Type text on the target (from the argument or stdin).
+    Type {
+        text: Option<String>,
+        /// Target keyboard layout (see the device's keymaps); device default if omitted.
+        #[arg(long)]
+        keymap: Option<String>,
+        /// Type slowly (BIOS/UEFI).
+        #[arg(long)]
+        slow: bool,
+    },
+    /// Record scrubbed read-only API responses as test fixtures.
+    RecordFixtures { dir: PathBuf },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum PowerArg {
+    On,
+    Off,
+    OffHard,
+    ResetHard,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ButtonArg {
+    Power,
+    PowerLong,
+    Reset,
+}
+
+fn parse_size(s: &str) -> Result<(u32, u32), String> {
+    let (w, h) = s.split_once(['x', 'X']).ok_or("expected WIDTHxHEIGHT")?;
+    Ok((
+        w.parse().map_err(|_| "bad width")?,
+        h.parse().map_err(|_| "bad height")?,
+    ))
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -109,7 +181,8 @@ fn main() -> Result<()> {
         .or_else(|| std::env::var("GLKVM_USER").ok())
         .unwrap_or_else(|| "admin".into());
     let password = std::env::var("GLKVM_PASSWORD").context("set GLKVM_PASSWORD (e.g. in .env)")?;
-    let creds = Credentials { user, password };
+    let mut creds = Credentials::new(user, password);
+    creds.totp = cli.totp.or_else(|| std::env::var("GLKVM_TOTP").ok());
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -117,9 +190,7 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
     let pins = Arc::new(PinStore::load_default()?);
-    let session = rt
-        .block_on(Session::login(&host, &creds, pins))
-        .context("login")?;
+    let session = rt.block_on(login(&host, creds, pins)).context("login")?;
     tracing::info!(host = %session.host(), "logged in");
 
     match cli.cmd {
@@ -147,6 +218,57 @@ fn main() -> Result<()> {
             )
         }
         Cmd::Probe { frames } => rt.block_on(probe(session, frames)),
+        cmd => rt.block_on(async {
+            let result = one_shot(&session, cmd).await;
+            let _ = session.logout().await;
+            result
+        }),
+    }
+}
+
+/// Logs in, asking for a TOTP code on the terminal if the device needs one.
+async fn login(host: &str, mut creds: Credentials, pins: Arc<PinStore>) -> Result<Session> {
+    match Session::login(host, &creds, pins.clone()).await {
+        Err(glkvm::Error::TotpRequired) if std::io::stdin().is_terminal() => {
+            print!("2FA code: ");
+            std::io::stdout().flush()?;
+            let mut code = String::new();
+            std::io::stdin().read_line(&mut code)?;
+            creds.totp = Some(code.trim().to_owned());
+            Ok(Session::login(host, &creds, pins).await?)
+        }
+        other => Ok(other?),
+    }
+}
+
+async fn one_shot(session: &Session, cmd: Cmd) -> Result<()> {
+    match cmd {
+        Cmd::Info => commands::info(session).await,
+        Cmd::Snapshot { out, preview } => commands::snapshot(session, &out, preview).await,
+        Cmd::Power { action, yes } => {
+            let action = match action {
+                PowerArg::On => PowerAction::On,
+                PowerArg::Off => PowerAction::Off,
+                PowerArg::OffHard => PowerAction::OffHard,
+                PowerArg::ResetHard => PowerAction::ResetHard,
+            };
+            commands::power(session, action, yes).await
+        }
+        Cmd::Click { button, yes } => {
+            let button = match button {
+                ButtonArg::Power => AtxButton::Power,
+                ButtonArg::PowerLong => AtxButton::PowerLong,
+                ButtonArg::Reset => AtxButton::Reset,
+            };
+            commands::click(session, button, yes).await
+        }
+        Cmd::Wake { target } => commands::wake(session, &target).await,
+        Cmd::WolList => commands::wol_list(session).await,
+        Cmd::Type { text, keymap, slow } => {
+            commands::type_text(session, text, keymap.as_deref(), slow).await
+        }
+        Cmd::RecordFixtures { dir } => commands::record_fixtures(session, &dir).await,
+        Cmd::View { .. } | Cmd::Probe { .. } => unreachable!("handled in main"),
     }
 }
 
@@ -209,12 +331,7 @@ async fn probe(session: Session, frames: usize) -> Result<()> {
     let config = session.system_config().await?;
     println!("system config: {config:?}");
     let streamer = session.streamer_state().await?;
-    println!(
-        "streamer (before /api/ws): {}",
-        streamer
-            .get("streamer")
-            .map_or("?".into(), |s| s.to_string())
-    );
+    println!("streamer (before /api/ws): {:?}", streamer.streamer);
 
     let events = EventSession::spawn(session.clone(), EventOptions::default());
     let mut sub = events.subscribe();
@@ -228,11 +345,15 @@ async fn probe(session: Session, frames: usize) -> Result<()> {
     println!("event socket connected");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     while let Ok(Ok(ev)) = tokio::time::timeout_at(deadline, sub.recv()).await {
+        // `turn` carries relay credentials: never print it.
+        if ev.kind == "turn" {
+            continue;
+        }
         let text = ev.data.to_string();
         println!("event {:<12} {}", ev.kind, &text[..text.len().min(300)]);
     }
     let streamer = session.streamer_state().await?;
-    println!("streamer (after /api/ws, 3 s): {streamer}");
+    println!("streamer (after /api/ws, 3 s): {:?}", streamer.streamer);
 
     let mut media = direct::start(session.clone(), DirectOptions::default());
     let mut prev = None;
@@ -256,7 +377,7 @@ async fn probe(session: Session, frames: usize) -> Result<()> {
     }
     println!("media state: {:?}", *media.state.borrow());
     let streamer = session.streamer_state().await?;
-    println!("streamer (while viewing): {streamer}");
+    println!("streamer (while viewing): {:?}", streamer.streamer);
     drop(media);
     events.close().await;
     Ok(())
