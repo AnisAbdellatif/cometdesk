@@ -19,6 +19,11 @@ allow = [
     "BSL-1.0",
 ]
 confidence-threshold = 0.9
+exceptions = [
+    # egui's bundled fonts (Ubuntu, Hack, Noto Emoji): font licenses that allow bundling and
+    # don't apply to our code.
+    { crate = "epaint_default_fonts", allow = ["OFL-1.1", "Ubuntu-font-1.0"] },
+]
 
 [bans]
 multiple-versions = "allow"
@@ -31,6 +36,11 @@ ignore = [
     # ttf-parser is unmaintained (not a vulnerability). It only enters through winit's
     # Wayland client-side decorations (sctk-adwaita), which the macOS build doesn't use.
     { id = "RUSTSEC-2026-0192", reason = "Linux/Wayland-only transitive dep of winit" },
+    # zbus family flagged unmaintained (not vulnerable). Only keyring's Linux Secret Service
+    # backend uses it; the macOS build stores passwords in the Keychain.
+    { id = "RUSTSEC-2026-0370", reason = "Linux-only keyring backend (zbus)" },
+    { id = "RUSTSEC-2026-0371", reason = "Linux-only keyring backend (zbus)" },
+    { id = "RUSTSEC-2026-0372", reason = "Linux-only keyring backend (zbus)" },
 ]
 
 [sources]

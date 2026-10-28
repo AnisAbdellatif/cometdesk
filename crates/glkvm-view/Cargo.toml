@@ -9,6 +9,7 @@ rust-version.workspace = true
 glkvm = { version = "0.1.0", path = "../glkvm" }
 glkvm-media = { version = "0.1.0", path = "../glkvm-media" }
 thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["sync"] }
 tracing = "0.1.44"
 wgpu = "30.0.1"
 winit = "0.30.13"

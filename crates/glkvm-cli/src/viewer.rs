@@ -3,51 +3,31 @@
 //! Threads:
 //! - main: winit event loop, input mapping, upload + render (only when a frame arrives);
 //! - tokio runtime: event socket (HID) and media socket;
-//! - `decode`: VideoToolbox, synchronous. It stores the newest frame in a one-slot mailbox and
-//!   wakes the event loop once; if rendering falls behind, older frames are replaced, never
-//!   queued.
+//! - `decode`: see `glkvm_view::pipeline` (newest frame wins, nothing queues up).
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use glkvm::events::{ConnState, HidSender};
 use glkvm::hid::{HidCommand, MouseButton};
-use glkvm_media::direct::{MediaControl, MediaSession, MediaStats, SourceState};
-use glkvm_media::vt::{DecodeError, VideoFrame, VtDecoder};
+use glkvm_media::direct::{MediaSession, MediaStats, SourceState};
 use tokio::sync::watch;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
 
 use crate::renderer::Renderer;
 use glkvm_view::InputMapper;
 use glkvm_view::RenderPath;
-
-const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(500);
+use glkvm_view::pipeline::FramePipeline;
 
 #[derive(Debug)]
 pub enum UserEvent {
     Frame,
-}
-
-struct Decoded {
-    frame: VideoFrame,
-    received_at: Instant,
-    decoded_at: Instant,
-}
-
-/// State shared between the decode thread and the UI thread.
-struct Shared {
-    slot: Mutex<Option<Decoded>>,
-    wake_pending: AtomicBool,
-    /// While false (window hidden/minimized) frames are not decoded at all.
-    visible: AtomicBool,
-    replaced: AtomicU64,
 }
 
 pub struct ViewerParts {
@@ -64,16 +44,10 @@ pub struct ViewerParts {
 pub fn run(parts: ViewerParts) -> Result<()> {
     let event_loop = build_event_loop()?;
     let proxy = event_loop.create_proxy();
-    let shared = Arc::new(Shared {
-        slot: Mutex::new(None),
-        wake_pending: AtomicBool::new(false),
-        visible: AtomicBool::new(true),
-        replaced: AtomicU64::new(0),
-    });
-
     let (video, media) = parts.media.take_video();
-    let control = media.control.clone();
-    spawn_decoder(video, control.clone(), shared.clone(), proxy)?;
+    let pipeline = FramePipeline::spawn(video, media.control.clone(), move || {
+        let _ = proxy.send_event(UserEvent::Frame);
+    })?;
 
     let mut app = App {
         window: None,
@@ -81,8 +55,7 @@ pub fn run(parts: ViewerParts) -> Result<()> {
         hid: parts.hid,
         conn: parts.conn,
         mapper: parts.mapper,
-        shared,
-        control,
+        pipeline,
         media_stats: media.stats.clone(),
         media_state: media.state.clone(),
         _media: media,
@@ -106,71 +79,6 @@ fn build_event_loop() -> Result<EventLoop<UserEvent>> {
         builder.with_default_menu(false);
     }
     Ok(builder.build()?)
-}
-
-fn spawn_decoder(
-    mut video: tokio::sync::mpsc::Receiver<glkvm_media::EncodedFrame>,
-    control: MediaControl,
-    shared: Arc<Shared>,
-    proxy: EventLoopProxy<UserEvent>,
-) -> Result<()> {
-    std::thread::Builder::new()
-        .name("decode".into())
-        .spawn(move || {
-            let current: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
-            let mut last_key_request = Instant::now() - KEYFRAME_REQUEST_MIN_INTERVAL;
-            let mut request_key = |ctl: &MediaControl| {
-                if last_key_request.elapsed() >= KEYFRAME_REQUEST_MIN_INTERVAL {
-                    last_key_request = Instant::now();
-                    ctl.request_keyframe();
-                }
-            };
-
-            let sink_shared = shared.clone();
-            let sink_current = current.clone();
-            let mut decoder = VtDecoder::new(move |result| match result {
-                Ok(frame) => {
-                    let received_at = *sink_current.lock().unwrap();
-                    let decoded = Decoded {
-                        frame,
-                        received_at,
-                        decoded_at: Instant::now(),
-                    };
-                    if sink_shared.slot.lock().unwrap().replace(decoded).is_some() {
-                        sink_shared.replaced.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if !sink_shared.wake_pending.swap(true, Ordering::AcqRel) {
-                        let _ = proxy.send_event(UserEvent::Frame);
-                    }
-                }
-                Err(status) => tracing::debug!(status, "frame decode failed"),
-            });
-
-            let mut need_key = false;
-            while let Some(frame) = video.blocking_recv() {
-                if !shared.visible.load(Ordering::Acquire) {
-                    // Hidden: skip decoding entirely; resume from the next keyframe.
-                    need_key = true;
-                    continue;
-                }
-                if need_key && !frame.keyframe {
-                    continue;
-                }
-                need_key = false;
-                *current.lock().unwrap() = frame.received_at;
-                match decoder.decode(&frame) {
-                    Ok(()) => {}
-                    Err(DecodeError::NeedKeyframe) => request_key(&control),
-                    Err(e) => {
-                        tracing::warn!(%e, "decode error, requesting keyframe");
-                        need_key = true;
-                        request_key(&control);
-                    }
-                }
-            }
-            tracing::info!("decode thread ended");
-        })?;
-    Ok(())
 }
 
 struct ViewStats {
@@ -197,8 +105,7 @@ struct App {
     hid: HidSender,
     conn: watch::Receiver<ConnState>,
     mapper: InputMapper,
-    shared: Arc<Shared>,
-    control: MediaControl,
+    pipeline: FramePipeline,
     media_stats: watch::Receiver<MediaStats>,
     media_state: watch::Receiver<SourceState>,
     /// Keeps the media task alive (it is aborted on drop).
@@ -295,10 +202,7 @@ impl App {
         if !visible && let Some(b) = self.bench.as_mut() {
             b.restart();
         }
-        let was = self.shared.visible.swap(visible, Ordering::AcqRel);
-        if visible && !was {
-            self.control.request_keyframe();
-        }
+        self.pipeline.set_visible(visible);
     }
 
     fn draw(&mut self) {
@@ -312,8 +216,7 @@ impl App {
 
     /// Returns a benchmark report when `--bench` has finished.
     fn on_frame(&mut self) -> Option<String> {
-        self.shared.wake_pending.store(false, Ordering::Release);
-        let decoded = self.shared.slot.lock().unwrap().take()?;
+        let decoded = self.pipeline.take()?;
         let renderer = self.renderer.as_mut()?;
         let work_start = Instant::now();
         if !renderer.set_frame(&decoded.frame) {
@@ -352,7 +255,7 @@ impl App {
             media.kbps / 1000.0,
             s.net_to_screen.as_secs_f64() * 1000.0 / f64::from(n),
             s.decode.as_secs_f64() * 1000.0 / f64::from(n),
-            media.dropped_total + self.shared.replaced.load(Ordering::Relaxed),
+            media.dropped_total + self.pipeline.replaced(),
         );
         if let Some(w) = &self.window {
             w.set_title(&title);

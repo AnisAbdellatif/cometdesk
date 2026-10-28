@@ -3,10 +3,12 @@
 
 pub mod input;
 pub mod keymap;
+#[cfg(target_os = "macos")]
+pub mod pipeline;
 pub mod video;
 #[cfg(target_os = "macos")]
 pub mod zerocopy;
 
-pub use input::{InputMapper, Rect, ScrollOptions, letterbox};
+pub use input::{InputMapper, Rect, ScrollOptions, letterbox, letterbox_in};
 pub use keymap::KeyOptions;
 pub use video::{RenderError, RenderPath, VideoRenderer};

@@ -28,6 +28,20 @@ pub fn letterbox(window: (u32, u32), video: (u32, u32)) -> Rect {
     }
 }
 
+/// Largest rectangle with the video's aspect ratio, centered in `area`.
+pub fn letterbox_in(area: Rect, video: (u32, u32)) -> Rect {
+    let size = (
+        area.w.max(0.0).round() as u32,
+        area.h.max(0.0).round() as u32,
+    );
+    let r = letterbox(size, video);
+    Rect {
+        x: area.x + r.x,
+        y: area.y + r.y,
+        ..r
+    }
+}
+
 /// Normalized (0..=1) position inside `rect`, or `None` outside it.
 pub fn normalize(pos: (f64, f64), rect: Rect) -> Option<(f32, f32)> {
     if rect.w <= 0.0 || rect.h <= 0.0 {
@@ -104,8 +118,18 @@ impl InputMapper {
         self.rect = letterbox(window, video);
     }
 
+    /// Uses an explicit video rectangle (e.g. letterboxed below a toolbar).
+    pub fn set_rect(&mut self, rect: Rect) {
+        self.rect = rect;
+    }
+
     pub fn rect(&self) -> Rect {
         self.rect
+    }
+
+    /// Whether the last cursor position was inside the video.
+    pub fn cursor_inside(&self) -> bool {
+        self.inside
     }
 
     pub fn key(&mut self, code: KeyCode, pressed: bool, repeat: bool, out: &mut Vec<HidCommand>) {
@@ -262,6 +286,19 @@ mod tests {
         assert_eq!((r.w, r.x), (1000.0, 0.0));
         assert!((r.h - 562.5).abs() < 1e-9);
         assert!((r.y - 218.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn letterbox_in_offsets_by_area() {
+        let area = Rect {
+            x: 0.0,
+            y: 40.0,
+            w: 1000.0,
+            h: 1000.0,
+        };
+        let r = letterbox_in(area, (1600, 900));
+        assert_eq!((r.x, r.w), (0.0, 1000.0));
+        assert!((r.y - (40.0 + 218.75)).abs() < 1e-9);
     }
 
     #[test]
