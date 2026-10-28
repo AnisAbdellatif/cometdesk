@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = ["crates/glkvm", "crates/glkvm-media", "crates/glkvm-cli"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2
