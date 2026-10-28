@@ -47,6 +47,41 @@ impl TargetOs {
     }
 }
 
+/// Which way the clipboard bridge syncs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClipDirection {
+    #[default]
+    Both,
+    /// This Mac's clipboard goes to the target; the target's never comes back.
+    ToTarget,
+    /// The target's clipboard comes to this Mac; ours is never sent.
+    FromTarget,
+}
+
+impl ClipDirection {
+    pub const ALL: [ClipDirection; 3] = [
+        ClipDirection::Both,
+        ClipDirection::ToTarget,
+        ClipDirection::FromTarget,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ClipDirection::Both => "Both ways",
+            ClipDirection::ToTarget => "Only to the target",
+            ClipDirection::FromTarget => "Only from the target",
+        }
+    }
+
+    pub fn sends(self) -> bool {
+        self != ClipDirection::FromTarget
+    }
+
+    pub fn receives(self) -> bool {
+        self != ClipDirection::ToTarget
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SavedDevice {
@@ -58,11 +93,17 @@ pub struct SavedDevice {
     /// Keyboard layout of the target (device keymap name, e.g. `de`), used to type text.
     /// `None`: the device's default.
     pub keymap: Option<String>,
+    /// Clipboard bridge direction. The pairing secret itself is in the keychain.
+    pub clip_direction: ClipDirection,
 }
 
 impl SavedDevice {
     fn keychain_account(&self) -> String {
         format!("{}@{}", self.user, self.host)
+    }
+
+    fn clip_keychain_account(&self) -> String {
+        format!("clipboard-bridge:{}@{}", self.user, self.host)
     }
 
     pub fn display_name(&self) -> &str {
@@ -167,6 +208,25 @@ pub fn delete_password(device: &SavedDevice) {
     if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, &device.keychain_account()) {
         let _ = entry.delete_credential();
     }
+    delete_clip_secret(device);
+}
+
+/// Pairing secret of the clipboard agent on this device's target.
+pub fn clip_secret(device: &SavedDevice) -> Option<glkvm_clip::Secret> {
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &device.clip_keychain_account()).ok()?;
+    glkvm_clip::Secret::from_code(&entry.get_password().ok()?)
+}
+
+pub fn set_clip_secret(device: &SavedDevice, secret: &glkvm_clip::Secret) -> Result<(), String> {
+    keyring::Entry::new(KEYCHAIN_SERVICE, &device.clip_keychain_account())
+        .and_then(|e| e.set_password(&secret.to_code()))
+        .map_err(|e| e.to_string())
+}
+
+pub fn delete_clip_secret(device: &SavedDevice) {
+    if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, &device.clip_keychain_account()) {
+        let _ = entry.delete_credential();
+    }
 }
 
 #[cfg(test)]
@@ -180,6 +240,7 @@ mod tests {
             user: "admin".into(),
             target: TargetOs::Linux,
             keymap: Some("de".into()),
+            clip_direction: ClipDirection::ToTarget,
         }
     }
 

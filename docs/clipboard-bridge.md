@@ -180,8 +180,41 @@ Installed with `bridge/install.sh` (removed by `bridge/uninstall.sh`):
   foreign `udhcpd` (TERM then KILL) and runs its own in the foreground under its own
   pidfile, because `start-stop-daemon --exec` can't tell BusyBox applets apart.
 
-Not yet done: remote paths (checklist above), surviving a Comet reboot, a real agent,
-Noise E2E, a Rust relay.
+### Implemented: agent, protocol and GUI (2026-10-28)
+
+What exists:
+
+| Piece | Where | Notes |
+|---|---|---|
+| Protocol | `crates/glkvm-clip` | Sans-IO. Framing: `u32` BE length + one Noise message. Noise `NNpsk0_25519_ChaChaPoly_BLAKE2s`, prologue `glkvm-clip v1`, PSK = 32-byte pairing secret; GUI is the initiator. Messages (postcard): `Hello{protocol, os, name, version}`, `Policy{agent_may_send}` (GUI → agent), `Start{id, kind, len, sha256}` + `Chunk`s (60 KiB) for text or PNG up to 16 MiB, `Ping`/`Pong`. `Dedup` suppresses echoes by a content key (text with normalized line endings; image pixels, not PNG bytes). Pairing code: 52 lowercase base32 chars. 12 unit tests. |
+| Relay v0.2 | `bridge/glkvm_bridge.py` | Session rule: when either side connects or drops, a counterpart paired with the old connection is closed and stale bytes are dropped; a side still waiting for its first partner keeps its buffer (the GUI's handshake). `bridge/selftest.py` checks 4 scenarios on the device. |
+| Agent | `apps/glkvm-agent` | `pair <code>` (secret in `~/.config/glkvm-agent/pairing`, mode 0600; `%APPDATA%` on Windows), `run [--relay HOST:PORT]`, `unpair`. Blocking std, one clipboard thread owning `arboard` (X11/Wayland selection owners must stay alive). Polls: text every 0.5 s, images every 2 s when there is no text; on Windows only when `GetClipboardSequenceNumber` changes. Sends only what changes while connected, and only if the GUI's policy allows. Reconnects with backoff; drops a session silent for 45 s. |
+| SDK | `crates/glkvm/src/api/bridge.rs` | `Session::bridge_status()` (`None` = not installed), `BRIDGE_WS`. |
+| GUI | `apps/glkvm-gui/src/clipsync.rs`, toolbar in `console.rs` | "Clipboard" menu: status, *Pair agent…* (dialog shows `glkvm-agent pair <code>` and can type it on the target), direction (both / only to target / only from target, saved per device), Pause, *Pair again*, *Forget pairing*. Secret in the Keychain (`clipboard-bridge:<user>@<host>`). Watches `NSPasteboard.changeCount`; never sends content flagged `org.nspasteboard.ConcealedType`/`TransientType`. Uses `/glkvm-bridge/status` to tell "no agent" from "agent not answering" (resets after 15 s). "Type clipboard" stays as the no-agent fallback. |
+
+Building the Linux agent on a Mac with no C toolchain:
+`CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld CARGO_PROFILE_RELEASE_STRIP=symbols cargo build --release -p glkvm-agent --target x86_64-unknown-linux-musl`
+gives a static 1.8 MB binary. This needs snow without its `std` feature: in snow 0.10.0, `std`
+enables `ring/std` unconditionally, which pulls in ring's C code.
+
+**End-to-end test** (Mac GUI ↔ Comet relay ↔ agent on the Linux laptop `asus-tuf`, LAN):
+- pairing via the dialog's "Type it on the target";
+- handshake;
+- Mac → laptop text (45 chars), pasted on the laptop;
+- laptop → Mac text (24 chars), arrived on the Mac clipboard;
+- Mac → laptop image (320×200 PNG, ~68 KB) in the same session;
+- no echo in either direction (including the image read back by the agent).
+
+Not verified yet:
+- the Windows agent: it compiles for `x86_64-pc-windows-msvc` but hasn't been linked or run;
+- which session type the laptop ran (X11 or Wayland); GNOME on Wayland lacks data-control and
+  falls back to XWayland;
+- concealed-content detection on the agent side (Linux `x-kde-passwordManagerHint`,
+  Windows `ExcludeClipboardContentFromMonitorProcessing`): only the Mac side checks today;
+- remote paths (checklist above);
+- surviving a Comet reboot;
+- agent autostart and distribution (virtual-drive delivery);
+- a Rust relay.
 
 **Upstream asks** (would remove the SSH install step): ship the kernel with
 `CONFIG_USB_CONFIGFS_ACM`/`NCM`, add serial/ethernet to `_OTG_FUNC_MAP`, and allow

@@ -26,8 +26,9 @@ use winit::keyboard::KeyCode;
 
 use crate::actions::{self, HostModifiers, Shortcut};
 use crate::app::UserEvent;
+use crate::clipsync::{BridgeState, ClipBridge, Settings as ClipSettings};
 use crate::gpu::Gpu;
-use crate::store::{SavedDevice, TargetOs};
+use crate::store::{self, ClipDirection, SavedDevice, TargetOs};
 
 const HIDDEN_GRACE: Duration = Duration::from_secs(30);
 const NOTICE_TIME: Duration = Duration::from_secs(4);
@@ -107,6 +108,11 @@ pub struct Console {
     hidden_since: Option<Instant>,
     /// Area for the video, in logical points (below the toolbar).
     video_area: egui::Rect,
+    /// Clipboard bridge to the agent on the target; `None` until paired.
+    clip: Option<ClipBridge>,
+    clip_paused: bool,
+    /// Pairing code shown in the pairing dialog while it is open.
+    pairing: Option<String>,
 }
 
 impl Console {
@@ -143,9 +149,138 @@ impl Console {
             stats: FrameStats::default(),
             hidden_since: None,
             video_area: egui::Rect::NOTHING,
+            clip: None,
+            clip_paused: false,
+            pairing: None,
         };
         console.start_stream();
+        if let Some(secret) = store::clip_secret(&console.device) {
+            console.start_clip(secret);
+        }
         console
+    }
+
+    // ----- clipboard bridge ----------------------------------------------------------------
+
+    fn clip_settings(&self) -> ClipSettings {
+        ClipSettings {
+            direction: self.device.clip_direction,
+            paused: self.clip_paused,
+        }
+    }
+
+    fn start_clip(&mut self, secret: glkvm_clip::Secret) {
+        let proxy = self.proxy.clone();
+        self.clip = Some(ClipBridge::spawn(
+            &self.rt,
+            self.session.clone(),
+            secret,
+            self.clip_settings(),
+            move || {
+                let _ = proxy.send_event(UserEvent::Refresh);
+            },
+        ));
+    }
+
+    /// New pairing code: replaces any old pairing and opens the pairing dialog.
+    fn pair_clipboard(&mut self) {
+        let secret = glkvm_clip::Secret::generate();
+        if let Err(e) = store::set_clip_secret(&self.device, &secret) {
+            return self.notify(format!("Cannot store the pairing code: {e}"));
+        }
+        self.pairing = Some(secret.to_code());
+        self.start_clip(secret);
+    }
+
+    fn forget_clipboard_pairing(&mut self) {
+        store::delete_clip_secret(&self.device);
+        self.clip = None;
+        self.notify("Clipboard pairing removed".into());
+    }
+
+    fn clip_menu(&mut self, ui: &mut egui::Ui) -> ConsoleAction {
+        let mut action = ConsoleAction::None;
+        let label = match self.clip.as_ref().map(ClipBridge::state) {
+            None => "Clipboard: off".to_string(),
+            Some(_) if self.clip_paused => "Clipboard: paused".into(),
+            Some(BridgeState::Connected(_)) => "Clipboard: synced".into(),
+            Some(_) => "Clipboard: not connected".into(),
+        };
+        ui.menu_button(label, |ui| {
+            let Some(state) = self.clip.as_ref().map(ClipBridge::state) else {
+                ui.label("Shares the clipboard with glkvm-agent on the target.");
+                if ui.button("Pair agent…").clicked() {
+                    self.pair_clipboard();
+                    ui.close();
+                }
+                return;
+            };
+            ui.label(state.label());
+            ui.separator();
+            let before = self.device.clip_direction;
+            for d in ClipDirection::ALL {
+                ui.radio_value(&mut self.device.clip_direction, d, d.label());
+            }
+            if self.device.clip_direction != before {
+                action = ConsoleAction::TargetChanged;
+            }
+            ui.checkbox(&mut self.clip_paused, "Pause");
+            if let Some(c) = &self.clip
+                && c.settings() != self.clip_settings()
+            {
+                c.set_settings(self.clip_settings());
+            }
+            ui.separator();
+            if ui.button("Pair again (new code)…").clicked() {
+                self.pair_clipboard();
+                ui.close();
+            }
+            if ui.button("Forget pairing").clicked() {
+                self.forget_clipboard_pairing();
+                ui.close();
+            }
+        });
+        action
+    }
+
+    fn pairing_dialog(&mut self, ctx: &egui::Context) {
+        let Some(code) = self.pairing.clone() else {
+            return;
+        };
+        let command = format!("glkvm-agent pair {code}");
+        let state = self.clip.as_ref().map(ClipBridge::state);
+        let mut close = false;
+        egui::Modal::new(egui::Id::unique("clip-pairing")).show(ctx, |ui| {
+            ui.heading("Pair the clipboard agent");
+            ui.label("On the target, in a terminal, run:");
+            ui.add(
+                egui::TextEdit::singleline(&mut command.as_str())
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(f32::INFINITY),
+            );
+            ui.label("then start it with `glkvm-agent run`.");
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Type it on the target")
+                    .on_hover_text("Types the command (without Enter) into the focused window")
+                    .clicked()
+                {
+                    self.start_typing(command.clone());
+                }
+                if ui.button("Copy").clicked() {
+                    ui.ctx().copy_text(command.clone());
+                }
+            });
+            if let Some(s) = &state {
+                ui.label(format!("Status: {}", s.label()));
+            }
+            if ui.button("Done").clicked() {
+                close = true;
+            }
+        });
+        if close {
+            self.pairing = None;
+        }
     }
 
     fn start_stream(&mut self) {
@@ -421,7 +556,7 @@ impl Console {
     }
 
     pub fn has_modal(&self) -> bool {
-        self.confirm.is_some()
+        self.confirm.is_some() || self.pairing.is_some()
     }
 
     pub fn send_combo(&mut self, keys: &[&'static str]) {
@@ -545,6 +680,7 @@ impl Console {
             w.abort();
         }
         self.stream = None;
+        self.clip = None;
         if let Some(t) = self.typing.take() {
             t.task.abort();
         }
@@ -648,6 +784,9 @@ impl Console {
             .clicked()
         {
             self.request_type_clipboard();
+        }
+        if self.clip_menu(ui) != ConsoleAction::None {
+            action = ConsoleAction::TargetChanged;
         }
         if ui
             .button("Snapshot")
@@ -795,6 +934,7 @@ impl Console {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
+        self.pairing_dialog(ctx);
         let Some(confirm) = &self.confirm else { return };
         let (title, body) = match confirm {
             Confirm::Type { reason, .. } => (

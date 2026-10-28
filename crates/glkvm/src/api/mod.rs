@@ -9,6 +9,7 @@
 //! `msd/partition_*`). Never call routes speculatively.
 
 pub mod atx;
+pub mod bridge;
 pub mod capabilities;
 pub mod hid;
 pub mod info;

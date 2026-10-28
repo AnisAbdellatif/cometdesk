@@ -2,6 +2,7 @@
 
 mod actions;
 mod app;
+mod clipsync;
 mod console;
 mod devices;
 mod gpu;

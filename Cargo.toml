@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/glkvm", "crates/glkvm-media", "crates/glkvm-cli", "apps/glkvm-gui", "crates/glkvm-view"]
+members = ["crates/glkvm", "crates/glkvm-media", "crates/glkvm-cli", "apps/glkvm-gui", "crates/glkvm-view", "crates/glkvm-clip", "apps/glkvm-agent"]
 
 [workspace.package]
 edition = "2024"
