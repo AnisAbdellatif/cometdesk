@@ -12,12 +12,14 @@ use glkvm::api::atx::{AtxButton, PowerAction};
 use glkvm::api::bridge::Health;
 use glkvm::api::capabilities::{Capabilities, Feature};
 use glkvm::api::hid::PrintOptions;
-use glkvm::api::streamer::SnapshotOptions;
+use glkvm::api::streamer::{QualityPreset, SnapshotOptions, StreamerLimits, StreamerParams};
+use glkvm::api::system::VideoMode;
 use glkvm::events::{ConnState, DeviceState, EventOptions, EventSession, HidSender};
 use glkvm::hid::{HidCommand, MouseButton};
 use glkvm::{Session, SystemConfig};
 use glkvm_clip::PastePref;
-use glkvm_media::direct::{self, DirectOptions, MediaSession, SourceState};
+use glkvm_media::direct::{MediaSession, SourceState};
+use glkvm_media::{SourceOptions, Transport};
 use glkvm_view::pipeline::FramePipeline;
 use glkvm_view::{InputMapper, Rect, ScrollOptions, letterbox_in};
 use tokio::runtime::Handle;
@@ -68,6 +70,16 @@ enum Confirm {
     Click(AtxButton),
     /// Install / update / repair the bridge on the Comet; holds the action's name.
     BridgeSetup(String),
+    VideoMode(VideoMode),
+    Quality(QualityPreset),
+}
+
+/// Device-wide video settings as last read from the device.
+#[derive(Default)]
+struct VideoInfo {
+    mode: Option<VideoMode>,
+    params: StreamerParams,
+    limits: StreamerLimits,
 }
 
 /// What the UI asks the app to do.
@@ -131,6 +143,9 @@ pub struct Console {
     repair_noticed: bool,
     /// The target OS changed outside the toolbar (dialog, agent report): save the device.
     target_changed: bool,
+    transport: Transport,
+    video_info: VideoInfo,
+    video_info_rx: Option<tokio::sync::oneshot::Receiver<VideoInfo>>,
 }
 
 impl Console {
@@ -180,7 +195,16 @@ impl Console {
             setup,
             repair_noticed: false,
             target_changed: false,
+            transport: Transport::default(),
+            video_info: VideoInfo::default(),
+            video_info_rx: None,
         };
+        console.transport = std::env::var("GLKVM_TRANSPORT")
+            .ok()
+            .and_then(|t| t.parse().ok())
+            .or_else(|| console.device.transport.parse().ok())
+            .unwrap_or_default();
+        console.refresh_video_info();
         console.start_stream();
         if let Some(secret) = store::clip_secret(&console.device) {
             console.start_clip(secret);
@@ -482,7 +506,13 @@ impl Console {
 
     fn start_stream(&mut self) {
         let _guard = self.rt.enter();
-        let media = direct::start(self.session.clone(), DirectOptions::default());
+        let media = glkvm_media::start(
+            self.session.clone(),
+            SourceOptions {
+                transport: self.transport,
+                ..Default::default()
+            },
+        );
         let (video, media) = media.take_video();
         let proxy = self.proxy.clone();
         match FramePipeline::spawn(video, media.control.clone(), move || {
@@ -492,6 +522,102 @@ impl Console {
             Err(e) => self.notify(format!("cannot start decoder: {e}")),
         }
         self.restart_watcher();
+    }
+
+    fn set_transport(&mut self, transport: Transport) {
+        if transport == self.transport {
+            return;
+        }
+        self.transport = transport;
+        self.device.transport = transport.name().into();
+        self.target_changed = true;
+        self.stream = None;
+        self.start_stream();
+        self.notify(format!("Video source: {}", transport.name()));
+    }
+
+    /// Reads the device-wide video mode and encoder settings in the background.
+    fn refresh_video_info(&mut self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.video_info_rx = Some(rx);
+        let session = self.session.clone();
+        let proxy = self.proxy.clone();
+        self.rt.spawn(async move {
+            let mode = session.video_mode().await.ok().flatten();
+            let st = session.streamer_state().await.unwrap_or_default();
+            let _ = tx.send(VideoInfo {
+                mode,
+                params: st.params,
+                limits: st.limits,
+            });
+            let _ = proxy.send_event(UserEvent::Refresh);
+        });
+    }
+
+    /// Writes a device-wide video setting, then re-reads the state.
+    fn apply_video(&mut self, confirm: Confirm) {
+        let session = self.session.clone();
+        let proxy = self.proxy.clone();
+        let limits = self.video_info.limits;
+        self.rt.spawn(async move {
+            let msg = match confirm {
+                Confirm::VideoMode(m) => match session.set_video_mode(m).await {
+                    Ok(()) => format!("Video mode: {}", m.wire_name()),
+                    Err(e) => format!("Cannot set video mode: {e}"),
+                },
+                Confirm::Quality(p) => match session.set_streamer_params(p.update(&limits)).await {
+                    Ok(_) => "Encoder quality changed".to_string(),
+                    Err(e) => format!("Cannot set quality: {e}"),
+                },
+                _ => return,
+            };
+            let _ = proxy.send_event(UserEvent::Notice(msg));
+        });
+        // The write is quick; the read is queued behind it on the same session.
+        self.refresh_video_info();
+    }
+
+    fn video_menu(&mut self, ui: &mut egui::Ui) {
+        ui.label("Video source (this app)");
+        for t in Transport::ALL {
+            let label = match t {
+                Transport::Direct => "Direct",
+                Transport::Pion => "WebRTC (FEC)",
+                Transport::Janus => "WebRTC (Janus)",
+            };
+            if ui.radio(self.transport == t, label).clicked() {
+                self.set_transport(t);
+                ui.close();
+            }
+        }
+        ui.separator();
+        ui.label("Device-wide (affects every viewer)");
+        ui.label("Video mode");
+        for m in VideoMode::ALL {
+            let on = self.video_info.mode == Some(m);
+            if ui.radio(on, m.wire_name()).clicked() && !on {
+                self.confirm = Some(Confirm::VideoMode(m));
+                ui.close();
+            }
+        }
+        ui.separator();
+        let p = &self.video_info.params;
+        ui.label(format!(
+            "Encoder: {} fps, {} kbit/s",
+            p.desired_fps.map_or("?".into(), |v| v.to_string()),
+            p.h264_bitrate.map_or("?".into(), |v| v.to_string()),
+        ));
+        for (label, preset) in [
+            ("Low", QualityPreset::Low),
+            ("Medium", QualityPreset::Medium),
+            ("High", QualityPreset::High),
+            ("Max", QualityPreset::Max),
+        ] {
+            if ui.button(label).clicked() {
+                self.confirm = Some(Confirm::Quality(preset));
+                ui.close();
+            }
+        }
     }
 
     /// Wakes the UI when something shown in the toolbar changes (not on every event).
@@ -922,7 +1048,7 @@ impl Console {
             let (label, r) = match confirm {
                 Confirm::Power(a) => (a.as_str(), session.atx_power(a, true).await),
                 Confirm::Click(b) => (b.as_str(), session.atx_click(b, true).await),
-                Confirm::Type { .. } | Confirm::BridgeSetup(_) => return,
+                _ => return,
             };
             let msg = match r {
                 Ok(()) => format!("ATX {label}: done"),
@@ -978,6 +1104,16 @@ impl Console {
                     self.inserting = None;
                     self.notify("Insert failed: connection to the agent lost".into());
                 }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(rx) = self.video_info_rx.as_mut() {
+            match rx.try_recv() {
+                Ok(info) => {
+                    self.video_info = info;
+                    self.video_info_rx = None;
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => self.video_info_rx = None,
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
             }
         }
@@ -1144,6 +1280,7 @@ impl Console {
         if self.device.keymap != before {
             action = ConsoleAction::TargetChanged;
         }
+        ui.menu_button("Video", |ui| self.video_menu(ui));
         ui.toggle_value(&mut self.show_stats, "Stats")
             .on_hover_text("Right Cmd + S");
         if ui
@@ -1260,6 +1397,17 @@ impl Console {
                  the target's keyboard and mouse disconnect for a moment. Takes about 20 seconds."
                     .into(),
             ),
+            Confirm::VideoMode(m) => (
+                format!("Switch the video mode to {}?", m.wire_name()),
+                "This is saved on the device and affects every viewer, including the web \
+                 interface. Other viewers may need to reconnect."
+                    .into(),
+            ),
+            Confirm::Quality(p) => (
+                format!("Change the encoder quality to {p:?}?"),
+                "This is saved on the device and affects every viewer's bitrate and frame rate."
+                    .into(),
+            ),
         };
         let mut decision = None;
         egui::Modal::new(egui::Id::unique("confirm")).show(ctx, |ui| {
@@ -1278,6 +1426,7 @@ impl Console {
             Some(true) => match self.confirm.take() {
                 Some(Confirm::Type { text, .. }) => self.deliver_text(text),
                 Some(Confirm::BridgeSetup(_)) => self.setup.run(),
+                Some(c @ (Confirm::VideoMode(_) | Confirm::Quality(_))) => self.apply_video(c),
                 Some(c) => self.atx(c),
                 None => {}
             },

@@ -124,7 +124,79 @@ pub struct SnapshotOptions {
     pub preview: Option<(u32, u32)>,
 }
 
+/// Encoder settings to change. `None` leaves a value alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StreamerUpdate {
+    pub desired_fps: Option<i64>,
+    /// kbit/s.
+    pub h264_bitrate: Option<i64>,
+    pub h264_gop: Option<i64>,
+    pub quality: Option<i64>,
+}
+
+/// Named quality levels. They are ours, not GL's: bitrate is placed inside the device's
+/// reported `h264_bitrate` limits, so they fit any firmware.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QualityPreset {
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
+impl QualityPreset {
+    pub fn update(self, limits: &StreamerLimits) -> StreamerUpdate {
+        let (bitrate_pct, fps) = match self {
+            QualityPreset::Low => (15, 30),
+            QualityPreset::Medium => (40, 30),
+            QualityPreset::High => (70, limits.desired_fps.max),
+            QualityPreset::Max => (100, limits.desired_fps.max),
+        };
+        let b = limits.h264_bitrate;
+        StreamerUpdate {
+            h264_bitrate: Some(b.min + (b.max - b.min) * bitrate_pct / 100),
+            desired_fps: Some(fps),
+            ..Default::default()
+        }
+    }
+}
+
+impl StreamerUpdate {
+    /// Clamps values to the device's limits.
+    pub fn clamped(mut self, l: &StreamerLimits) -> Self {
+        let clamp = |v: Option<i64>, r: Range| v.map(|v| v.clamp(r.min, r.max.max(r.min)));
+        self.desired_fps = clamp(self.desired_fps, l.desired_fps);
+        self.h264_bitrate = clamp(self.h264_bitrate, l.h264_bitrate);
+        self.h264_gop = clamp(self.h264_gop, l.h264_gop);
+        self.quality = self.quality.map(|q| q.clamp(1, 100));
+        self
+    }
+
+    fn query(&self) -> Vec<(&'static str, String)> {
+        [
+            ("desired_fps", self.desired_fps),
+            ("h264_bitrate", self.h264_bitrate),
+            ("h264_gop", self.h264_gop),
+            ("quality", self.quality),
+        ]
+        .into_iter()
+        .filter_map(|(k, v)| Some((k, v?.to_string())))
+        .collect()
+    }
+}
+
 impl Session {
+    /// Changes encoder settings. **Device-wide and persisted**: every viewer is affected.
+    /// Values are clamped to the device's limits; returns the state re-read afterwards.
+    pub async fn set_streamer_params(&self, update: StreamerUpdate) -> Result<StreamerState> {
+        let limits = self.streamer_state().await?.limits;
+        let query = update.clamped(&limits).query();
+        let query: Vec<(&str, &str)> = query.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        self.post::<serde_json::Value>("streamer/set_params", &query)
+            .await?;
+        self.streamer_state().await
+    }
+
     pub async fn streamer_state(&self) -> Result<StreamerState> {
         self.get("streamer", &[]).await
     }
@@ -194,5 +266,58 @@ mod tests {
     fn jpeg_detection() {
         assert!(is_jpeg(&[0xff, 0xd8, 0xff, 0xe0]));
         assert!(!is_jpeg(br#"{"ok":false}"#));
+    }
+}
+
+#[cfg(test)]
+mod quality_tests {
+    use super::*;
+
+    fn limits() -> StreamerLimits {
+        StreamerLimits {
+            desired_fps: Range { min: 5, max: 60 },
+            h264_bitrate: Range {
+                min: 1000,
+                max: 21000,
+            },
+            h264_gop: Range { min: 1, max: 120 },
+        }
+    }
+
+    #[test]
+    fn presets_stay_inside_limits() {
+        for p in [
+            QualityPreset::Low,
+            QualityPreset::Medium,
+            QualityPreset::High,
+            QualityPreset::Max,
+        ] {
+            let u = p.update(&limits());
+            assert_eq!(u, u.clamped(&limits()), "{p:?}");
+        }
+        assert_eq!(
+            QualityPreset::Max.update(&limits()).h264_bitrate,
+            Some(21000)
+        );
+        assert_eq!(QualityPreset::Low.update(&limits()).desired_fps, Some(30));
+    }
+
+    #[test]
+    fn clamps_and_builds_query() {
+        let u = StreamerUpdate {
+            desired_fps: Some(500),
+            h264_bitrate: Some(1),
+            quality: Some(0),
+            ..Default::default()
+        }
+        .clamped(&limits());
+        assert_eq!(
+            u.query(),
+            vec![
+                ("desired_fps", "60".to_string()),
+                ("h264_bitrate", "1000".to_string()),
+                ("quality", "1".to_string())
+            ]
+        );
     }
 }

@@ -97,6 +97,8 @@ pub struct SavedDevice {
     pub clip_direction: ClipDirection,
     /// Paste keystroke for "Insert clipboard" on Linux targets.
     pub insert_paste: glkvm_clip::PastePref,
+    /// Video source (`direct`, `webrtc-fec`, `webrtc`); empty: Direct.
+    pub transport: String,
 }
 
 impl SavedDevice {
@@ -244,6 +246,7 @@ mod tests {
             keymap: Some("de".into()),
             clip_direction: ClipDirection::ToTarget,
             insert_paste: glkvm_clip::PastePref::CtrlShiftV,
+            transport: String::new(),
         }
     }
 

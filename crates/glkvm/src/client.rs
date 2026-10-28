@@ -305,6 +305,7 @@ struct Inner {
 pub(crate) enum Body<'a> {
     None,
     Text(&'a str),
+    Json(&'a str),
     Bytes(&'a [u8]),
 }
 
@@ -384,6 +385,11 @@ impl Session {
                     req = req
                         .header("Content-Type", "text/plain; charset=utf-8")
                         .body(text.to_owned());
+                }
+                Body::Json(json) => {
+                    req = req
+                        .header("Content-Type", "application/json")
+                        .body(json.to_owned());
                 }
                 Body::Bytes(bytes) => {
                     req = req

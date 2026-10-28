@@ -16,11 +16,13 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use glkvm::api::atx::{AtxButton, PowerAction};
+use glkvm::api::streamer::{QualityPreset, StreamerUpdate};
+use glkvm::api::system::VideoMode;
 use glkvm::events::{EventOptions, EventSession};
 use glkvm::tls::PinStore;
 use glkvm::{Credentials, Session};
-use glkvm_media::Codec;
 use glkvm_media::direct::{self, DirectOptions};
+use glkvm_media::{Codec, SourceOptions, Transport};
 
 use glkvm_view::keymap::{self, KeyOptions};
 use glkvm_view::{InputMapper, RenderPath, ScrollOptions};
@@ -57,6 +59,9 @@ enum Cmd {
         /// Preferred codec when the device offers both.
         #[arg(long, value_enum, default_value_t = CodecArg::H264)]
         codec: CodecArg,
+        /// How video reaches us: direct (`/api/media/ws`), pion (WebRTC FEC), janus (WebRTC).
+        #[arg(long, value_enum, default_value_t = TransportArg::Direct)]
+        transport: TransportArg,
         /// How decoded frames reach the GPU.
         #[arg(long, value_enum, default_value_t = RenderArg::Auto)]
         render: RenderArg,
@@ -91,6 +96,33 @@ enum Cmd {
     Click {
         #[arg(value_enum)]
         button: ButtonArg,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Show the device's saved video mode, or change it (device-wide, asks for confirmation).
+    VideoMode {
+        #[arg(value_enum)]
+        mode: Option<VideoModeArg>,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Show or change encoder quality (device-wide, asks for confirmation).
+    Quality {
+        /// Named level; sets bitrate (inside the device limits) and fps.
+        #[arg(value_enum)]
+        preset: Option<PresetArg>,
+        /// Frames per second.
+        #[arg(long)]
+        fps: Option<i64>,
+        /// H.264 bitrate in kbit/s.
+        #[arg(long)]
+        bitrate: Option<i64>,
+        /// Keyframe interval in frames.
+        #[arg(long)]
+        gop: Option<i64>,
+        /// JPEG quality (1-100).
+        #[arg(long)]
+        jpeg_quality: Option<i64>,
         #[arg(long)]
         yes: bool,
     },
@@ -176,6 +208,34 @@ enum RenderArg {
 }
 
 #[derive(Clone, Copy, ValueEnum)]
+enum PresetArg {
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum VideoModeArg {
+    /// WebRTC with FlexFEC (Pion).
+    FlexFec,
+    /// Classic WebRTC (Janus).
+    Webrtc,
+    /// GL native adaptive mode (disables Janus).
+    GlWebrtc,
+    DirectH264,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum TransportArg {
+    Direct,
+    /// WebRTC (FEC): GL's Pion server.
+    Pion,
+    /// WebRTC: Janus + uStreamer (needs `gl_webrtc` off).
+    Janus,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
 enum CodecArg {
     H264,
     H265,
@@ -217,6 +277,7 @@ fn main() -> Result<()> {
             iso_fix,
             scroll_rate,
             codec,
+            transport,
             render,
             bench,
         } => {
@@ -230,7 +291,7 @@ fn main() -> Result<()> {
                 &rt,
                 session,
                 input,
-                codec,
+                (codec, transport),
                 render,
                 bench.map(Duration::from_secs),
             )
@@ -280,6 +341,37 @@ async fn one_shot(session: &Session, cmd: Cmd) -> Result<()> {
             };
             commands::click(session, button, yes).await
         }
+        Cmd::Quality {
+            preset,
+            fps,
+            bitrate,
+            gop,
+            jpeg_quality,
+            yes,
+        } => {
+            let preset = preset.map(|p| match p {
+                PresetArg::Low => QualityPreset::Low,
+                PresetArg::Medium => QualityPreset::Medium,
+                PresetArg::High => QualityPreset::High,
+                PresetArg::Max => QualityPreset::Max,
+            });
+            let manual = StreamerUpdate {
+                desired_fps: fps,
+                h264_bitrate: bitrate,
+                h264_gop: gop,
+                quality: jpeg_quality,
+            };
+            commands::quality(session, preset, manual, yes).await
+        }
+        Cmd::VideoMode { mode, yes } => {
+            let mode = mode.map(|m| match m {
+                VideoModeArg::FlexFec => VideoMode::FlexFec,
+                VideoModeArg::Webrtc => VideoMode::Webrtc,
+                VideoModeArg::GlWebrtc => VideoMode::GlWebrtc,
+                VideoModeArg::DirectH264 => VideoMode::DirectH264,
+            });
+            commands::video_mode(session, mode, yes).await
+        }
         Cmd::Wake { target } => commands::wake(session, &target).await,
         Cmd::WolList => commands::wol_list(session).await,
         Cmd::Type { text, keymap, slow } => {
@@ -299,7 +391,7 @@ fn view(
     rt: &tokio::runtime::Runtime,
     session: Session,
     (swap_cmd_ctrl, iso_fix, scroll_rate): (bool, Toggle, Option<u32>),
-    codec: CodecArg,
+    (codec, transport): (CodecArg, TransportArg),
     render: RenderPath,
     bench: Option<Duration>,
 ) -> Result<()> {
@@ -307,6 +399,20 @@ fn view(
         tracing::warn!(%e, "cannot read device config, using defaults");
         Default::default()
     });
+    let mode = config.video_mode.as_deref().unwrap_or("unknown");
+    let fits = match transport {
+        TransportArg::Direct => true,
+        TransportArg::Pion => matches!(mode, "flex_fec" | "webrtc" | "unknown"),
+        TransportArg::Janus => matches!(mode, "webrtc" | "unknown"),
+    };
+    if fits {
+        tracing::info!(video_mode = mode, "device video mode");
+    } else {
+        tracing::warn!(
+            video_mode = mode,
+            "device video mode may not serve this transport; `glkvm-cli video-mode <mode>` changes it (device-wide)"
+        );
+    }
     let iso = match iso_fix {
         Toggle::On => true,
         Toggle::Off => false,
@@ -330,7 +436,12 @@ fn view(
         CodecArg::H264 => Codec::H264,
         CodecArg::H265 => Codec::H265,
     };
-    let media = direct::start(session.clone(), DirectOptions { prefer });
+    let transport = match transport {
+        TransportArg::Direct => Transport::Direct,
+        TransportArg::Pion => Transport::Pion,
+        TransportArg::Janus => Transport::Janus,
+    };
+    let media = glkvm_media::start(session.clone(), SourceOptions { transport, prefer });
 
     let parts = viewer::ViewerParts {
         media,

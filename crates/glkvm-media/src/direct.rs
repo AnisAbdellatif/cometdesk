@@ -20,10 +20,11 @@ use futures_util::{SinkExt, StreamExt};
 use glkvm::Session;
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
-use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior, sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::source::Control;
+pub use crate::source::{MediaControl, MediaSession, MediaStats, SourceState};
 use crate::{Codec, EncodedFrame};
 
 const OP_PING: u8 = 0;
@@ -40,11 +41,6 @@ const STALL_KEY_REQUEST: Duration = Duration::from_secs(3);
 const STALL_RECONNECT: Duration = Duration::from_secs(5);
 const BACKOFF_MIN: Duration = Duration::from_millis(250);
 const BACKOFF_MAX: Duration = Duration::from_secs(10);
-/// Frames buffered towards the decoder. In steady state the queue is empty (decode takes
-/// ~2 ms per frame), so depth adds no latency; it only absorbs hiccups such as creating the
-/// first VideoToolbox session (~70 ms), which with a shallow queue cost up to a whole GOP of
-/// frozen video while waiting for the next keyframe.
-const QUEUE_DEPTH: usize = 16;
 
 #[derive(Debug, Clone, Copy)]
 pub struct DirectOptions {
@@ -59,82 +55,9 @@ impl Default for DirectOptions {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SourceState {
-    Connecting,
-    Streaming {
-        codec: Codec,
-        profile: Option<String>,
-    },
-    Stalled,
-    Disconnected(String),
-    Closed,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct MediaStats {
-    pub fps: f32,
-    pub kbps: f32,
-    pub frames_total: u64,
-    pub dropped_total: u64,
-}
-
-enum Control {
-    KeyFrame,
-}
-
-#[derive(Clone)]
-pub struct MediaControl {
-    tx: mpsc::UnboundedSender<Control>,
-}
-
-impl MediaControl {
-    /// Ask the device for a keyframe (after a decode error or a dropped frame).
-    pub fn request_keyframe(&self) {
-        let _ = self.tx.send(Control::KeyFrame);
-    }
-}
-
-pub struct MediaSession {
-    /// Encoded frames. Replaced by a closed channel after [`MediaSession::take_video`].
-    pub video: mpsc::Receiver<EncodedFrame>,
-    pub control: MediaControl,
-    pub stats: watch::Receiver<MediaStats>,
-    pub state: watch::Receiver<SourceState>,
-    task: JoinHandle<()>,
-}
-
-impl MediaSession {
-    /// Moves the frame receiver out (e.g. to a decode thread), keeping the session alive.
-    pub fn take_video(mut self) -> (mpsc::Receiver<EncodedFrame>, MediaSession) {
-        let (_, closed) = mpsc::channel(1);
-        let video = std::mem::replace(&mut self.video, closed);
-        (video, self)
-    }
-}
-
-impl Drop for MediaSession {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
 /// Starts the Direct source on the current tokio runtime.
 pub fn start(session: Session, opts: DirectOptions) -> MediaSession {
-    let (frame_tx, video) = mpsc::channel(QUEUE_DEPTH);
-    let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
-    let (stats_tx, stats) = watch::channel(MediaStats::default());
-    let (state_tx, state) = watch::channel(SourceState::Connecting);
-    let task = tokio::spawn(supervise(
-        session, opts, frame_tx, ctl_rx, stats_tx, state_tx,
-    ));
-    MediaSession {
-        video,
-        control: MediaControl { tx: ctl_tx },
-        stats,
-        state,
-        task,
-    }
+    MediaSession::spawn(|e| supervise(session, opts, e.frames, e.ctl, e.stats, e.state))
 }
 
 /// A parsed binary message from the media socket.

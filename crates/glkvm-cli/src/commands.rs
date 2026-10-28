@@ -10,7 +10,7 @@ use glkvm::api::atx::{AtxButton, PowerAction};
 use glkvm::api::bridge;
 use glkvm::api::capabilities::Feature;
 use glkvm::api::hid::PrintOptions;
-use glkvm::api::streamer::SnapshotOptions;
+use glkvm::api::streamer::{QualityPreset, SnapshotOptions, StreamerUpdate};
 use glkvm::api::wol::Mac;
 use glkvm::events::{ConnState, EventOptions, EventSession};
 use serde_json::{Value, json};
@@ -143,6 +143,78 @@ pub async fn power(session: &Session, action: PowerAction, yes: bool) -> Result<
     )?;
     session.atx_power(action, true).await?;
     println!("done; power LED: {:?}", session.atx_state().await?.power);
+    Ok(())
+}
+
+pub async fn video_mode(
+    session: &Session,
+    mode: Option<glkvm::api::system::VideoMode>,
+    yes: bool,
+) -> Result<()> {
+    let current = session.system_config().await?.video_mode;
+    println!("video_mode: {}", current.as_deref().unwrap_or("unknown"));
+    let Some(mode) = mode else { return Ok(()) };
+    if current.as_deref() == Some(mode.wire_name()) {
+        println!("already {}", mode.wire_name());
+        return Ok(());
+    }
+    confirm(
+        &format!(
+            "Switch the device's video mode to \"{}\"? This is device-wide and persisted: \
+             other viewers (web UI, other apps) are affected.",
+            mode.wire_name()
+        ),
+        yes,
+    )?;
+    session.set_video_mode(mode).await?;
+    println!("video_mode: {} (confirmed)", mode.wire_name());
+    Ok(())
+}
+
+pub async fn quality(
+    session: &Session,
+    preset: Option<QualityPreset>,
+    manual: StreamerUpdate,
+    yes: bool,
+) -> Result<()> {
+    let st = session.streamer_state().await?;
+    let show = |st: &glkvm::api::streamer::StreamerState| {
+        let (p, l) = (&st.params, &st.limits);
+        println!(
+            "fps {:?} ({}-{}), bitrate {:?} kbit/s ({}-{}), gop {:?} ({}-{}), quality {:?}",
+            p.desired_fps,
+            l.desired_fps.min,
+            l.desired_fps.max,
+            p.h264_bitrate,
+            l.h264_bitrate.min,
+            l.h264_bitrate.max,
+            p.h264_gop,
+            l.h264_gop.min,
+            l.h264_gop.max,
+            p.quality
+        );
+    };
+    show(&st);
+    let mut update = preset.map(|p| p.update(&st.limits)).unwrap_or_default();
+    for (dst, src) in [
+        (&mut update.desired_fps, manual.desired_fps),
+        (&mut update.h264_bitrate, manual.h264_bitrate),
+        (&mut update.h264_gop, manual.h264_gop),
+        (&mut update.quality, manual.quality),
+    ] {
+        *dst = src.or(*dst);
+    }
+    if update == StreamerUpdate::default() {
+        return Ok(());
+    }
+    let update = update.clamped(&st.limits);
+    confirm(
+        &format!(
+            "Change the encoder to {update:?}? This is device-wide and persisted: every viewer is affected."
+        ),
+        yes,
+    )?;
+    show(&session.set_streamer_params(update).await?);
     Ok(())
 }
 

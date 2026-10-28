@@ -200,6 +200,16 @@ Rules for every source:
 
 `/lws/ws` (Native) is out of scope: proprietary, and it disables Janus.
 
+**Status (branch `phase3-webrtc`)**: all three sources exist behind one switch,
+`glkvm_media::start(session, SourceOptions { transport, .. })` with `Transport::{Direct,
+Pion, Janus}` (CLI: `view --transport direct|pion|janus`; GUI: `GLKVM_TRANSPORT`). Pion and
+Janus share a str0m engine (`rtc.rs`): H.264 only, host candidates only (str0m has no
+STUN/TURN, so the device must be reachable over UDP: LAN or VPN), NACK/RTX but no FlexFEC,
+PLI for keyframes. The Pion and Janus handshakes follow the notes above and are covered by
+parser unit tests only; they are **not yet verified against a device** (ignored tests
+`pion_delivers_a_keyframe` / `janus_delivers_a_keyframe` in `glkvm-media/tests/device.rs`).
+No audio yet.
+
 ### 2.4 Decode
 
 ```rust

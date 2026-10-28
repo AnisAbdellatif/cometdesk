@@ -9,6 +9,7 @@ bytes = "1.12.1"
 futures-util = "0.3.34"
 glkvm = { version = "0.1.0", path = "../glkvm" }
 serde_json = "1.0.154"
+str0m = { version = "0.24.1", default-features = false, features = ["rust-crypto"] }
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["rt", "sync", "time", "macros"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false }

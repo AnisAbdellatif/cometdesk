@@ -99,3 +99,40 @@ async fn direct_video_decodes_in_hardware() {
     drop(media);
     events.close().await;
 }
+
+async fn first_keyframe(transport: glkvm_media::Transport) {
+    let session = login().await;
+    // Keeps the streamer running.
+    let events = EventSession::spawn(session.clone(), EventOptions::default());
+    let mut media = glkvm_media::start(
+        session,
+        glkvm_media::SourceOptions {
+            transport,
+            ..Default::default()
+        },
+    );
+    let frame = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let f = media.video.recv().await.expect("source ended");
+            if f.keyframe {
+                return f;
+            }
+        }
+    })
+    .await
+    .expect("no keyframe in 15 s");
+    assert!(!frame.data.is_empty());
+    events.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a device"]
+async fn pion_delivers_a_keyframe() {
+    first_keyframe(glkvm_media::Transport::Pion).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a device with gl_webrtc off"]
+async fn janus_delivers_a_keyframe() {
+    first_keyframe(glkvm_media::Transport::Janus).await;
+}
