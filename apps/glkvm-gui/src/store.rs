@@ -95,6 +95,8 @@ pub struct SavedDevice {
     pub keymap: Option<String>,
     /// Clipboard bridge direction. The pairing secret itself is in the keychain.
     pub clip_direction: ClipDirection,
+    /// Paste keystroke for "Insert clipboard" on Linux targets.
+    pub insert_paste: glkvm_clip::PastePref,
 }
 
 impl SavedDevice {
@@ -241,6 +243,7 @@ mod tests {
             target: TargetOs::Linux,
             keymap: Some("de".into()),
             clip_direction: ClipDirection::ToTarget,
+            insert_paste: glkvm_clip::PastePref::CtrlShiftV,
         }
     }
 

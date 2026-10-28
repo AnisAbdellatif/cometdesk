@@ -5,18 +5,27 @@
 //! encrypted session (the relay resets both sides when either reconnects). Only changes made
 //! while connected are sent, never what was on the clipboard before, and content marked
 //! concealed or transient by password managers is never sent.
+//!
+//! It also inserts text on the target through the agent ([`ClipBridge::insert`]): in one
+//! step instead of a stream of key presses that a window switch could misdirect. When the
+//! agent asks for a paste keystroke, this task sends it over the KVM's keyboard.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use glkvm::Session;
 use glkvm::api::bridge::BRIDGE_WS;
 use glkvm::client::WsStream;
-use glkvm_clip::{Content, Dedup, Endpoint, Error, Event, Hello, Policy, Role, Secret};
+use glkvm::events::HidSender;
+use glkvm_clip::{
+    Content, Dedup, Endpoint, Error, Event, Hello, InsertReply, PasteKey, PastePref, Policy, Role,
+    Secret,
+};
 use tokio::runtime::Handle;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, MissedTickBehavior, interval, sleep};
+use tokio::time::{Instant, MissedTickBehavior, interval};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::store::ClipDirection;
@@ -30,6 +39,27 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(15);
 const RETRY_SLOW: Duration = Duration::from_secs(30);
+const INSERT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Outcome of an insert: a short description, or why it failed.
+pub type InsertResult = Result<String, String>;
+
+struct InsertRequest {
+    text: String,
+    paste: PastePref,
+    /// The console's current keyboard path (it is replaced when the console reconnects).
+    hid: HidSender,
+    reply: oneshot::Sender<InsertResult>,
+}
+
+/// Keys for the paste keystroke the agent asks for.
+fn paste_keys(key: PasteKey) -> &'static [&'static str] {
+    match key {
+        PasteKey::CtrlV => &["ControlLeft", "KeyV"],
+        PasteKey::CtrlShiftV => &["ControlLeft", "ShiftLeft", "KeyV"],
+        PasteKey::CmdV => &["MetaLeft", "KeyV"],
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BridgeState {
@@ -40,6 +70,8 @@ pub enum BridgeState {
     WaitingForAgent,
     /// The agent answered with a different pairing code.
     Mismatch,
+    /// The agent speaks another protocol version: set up the target again.
+    AgentOutdated(u16),
     Connected(Hello),
     Error(String),
 }
@@ -51,6 +83,9 @@ impl BridgeState {
             BridgeState::NotInstalled => "bridge not installed on this device".into(),
             BridgeState::WaitingForAgent => "waiting for the agent on the target".into(),
             BridgeState::Mismatch => "agent has a different pairing code".into(),
+            BridgeState::AgentOutdated(_) => {
+                "the agent on the target is outdated: set up the target again".into()
+            }
             BridgeState::Connected(h) => format!("connected to {} ({})", h.name, h.os),
             BridgeState::Error(e) => format!("error: {e}"),
         }
@@ -80,6 +115,7 @@ impl Settings {
 pub struct ClipBridge {
     state: watch::Receiver<BridgeState>,
     settings: watch::Sender<Settings>,
+    inserts: mpsc::UnboundedSender<InsertRequest>,
     task: JoinHandle<()>,
 }
 
@@ -94,10 +130,19 @@ impl ClipBridge {
     ) -> ClipBridge {
         let (state_tx, state) = watch::channel(BridgeState::Connecting);
         let (settings, settings_rx) = watch::channel(settings);
-        let task = rt.spawn(supervise(session, secret, settings_rx, state_tx, wake));
+        let (inserts, inserts_rx) = mpsc::unbounded_channel();
+        let task = rt.spawn(supervise(
+            session,
+            secret,
+            settings_rx,
+            inserts_rx,
+            state_tx,
+            wake,
+        ));
         ClipBridge {
             state,
             settings,
+            inserts,
             task,
         }
     }
@@ -113,6 +158,29 @@ impl ClipBridge {
     pub fn set_settings(&self, s: Settings) {
         self.settings.send_replace(s);
     }
+
+    /// Whether text can be inserted through the agent right now.
+    pub fn can_insert(&self) -> bool {
+        matches!(*self.state.borrow(), BridgeState::Connected(_))
+    }
+
+    /// Inserts `text` at the target's focus through the agent. The receiver gets the
+    /// outcome (an error if the connection drops first).
+    pub fn insert(
+        &self,
+        text: String,
+        paste: PastePref,
+        hid: HidSender,
+    ) -> oneshot::Receiver<InsertResult> {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.inserts.send(InsertRequest {
+            text,
+            paste,
+            hid,
+            reply,
+        });
+        rx
+    }
 }
 
 impl Drop for ClipBridge {
@@ -124,6 +192,7 @@ impl Drop for ClipBridge {
 enum End {
     Mismatch,
     NotInstalled,
+    AgentOutdated(u16),
     /// Reason, and whether a session had been established.
     Lost(String, bool),
 }
@@ -132,6 +201,7 @@ async fn supervise(
     session: Session,
     secret: Secret,
     mut settings: watch::Receiver<Settings>,
+    mut inserts: mpsc::UnboundedReceiver<InsertRequest>,
     state: watch::Sender<BridgeState>,
     wake: impl Fn() + Send + Sync + 'static,
 ) {
@@ -152,7 +222,19 @@ async fn supervise(
             Ok(None) => End::NotInstalled,
             Err(e) => End::Lost(e.to_string(), false),
             Ok(Some(_)) => match session.ws_connect(BRIDGE_WS).await {
-                Ok(ws) => run(ws, &session, &secret, &mut settings, &mut local, &set).await,
+                Ok(ws) => {
+                    run(
+                        ws,
+                        &session,
+                        &secret,
+                        &mut settings,
+                        &mut inserts,
+                        &mut local,
+                        &set,
+                        &wake,
+                    )
+                    .await
+                }
                 Err(e) => End::Lost(e.to_string(), false),
             },
         };
@@ -163,6 +245,10 @@ async fn supervise(
             }
             End::Mismatch => {
                 set(BridgeState::Mismatch);
+                RETRY_SLOW
+            }
+            End::AgentOutdated(v) => {
+                set(BridgeState::AgentOutdated(v));
                 RETRY_SLOW
             }
             End::Lost(reason, was_up) => {
@@ -176,17 +262,29 @@ async fn supervise(
                 w
             }
         };
-        sleep(wait).await;
+        // Inserts asked for while disconnected fail now rather than after the wait.
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break,
+                Some(req) = inserts.recv() => {
+                    let _ = req.reply.send(Err("the agent is not connected".into()));
+                }
+            }
+        }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     ws: WsStream,
     session: &Session,
     secret: &Secret,
     settings: &mut watch::Receiver<Settings>,
+    inserts: &mut mpsc::UnboundedReceiver<InsertRequest>,
     local: &mut LocalClipboard,
     set: &impl Fn(BridgeState),
+    wake: &(impl Fn() + Send + Sync),
 ) -> End {
     let (mut sink, mut stream) = ws.split();
     let hello = Hello::local(env!("CARGO_PKG_VERSION"), host_name());
@@ -197,6 +295,9 @@ async fn run(
     set(BridgeState::WaitingForAgent);
     let connected_at = Instant::now();
     let mut agent_paired_since: Option<Instant> = None;
+    // Inserts waiting for the agent's reply: id -> (reply, keyboard, asked at).
+    let mut pending: HashMap<u32, (oneshot::Sender<InsertResult>, HidSender, Instant)> =
+        HashMap::new();
     let mut poll = interval(POLL);
     let mut ping = interval(PING);
     let mut status = interval(STATUS_EVERY);
@@ -223,6 +324,7 @@ async fn run(
                 let events = match ep.receive(&data) {
                     Ok(ev) => ev,
                     Err(Error::Handshake) => return End::Mismatch,
+                    Err(Error::Version(v)) => return End::AgentOutdated(v),
                     Err(e) => return End::Lost(e.to_string(), up),
                 };
                 for ev in events {
@@ -240,11 +342,54 @@ async fn run(
                                 local.apply(content).await;
                             }
                         }
-                        Event::Policy(_) => {}
+                        Event::InsertReply { id, reply } => {
+                            let Some((tx, hid, _)) = pending.remove(&id) else { continue };
+                            let outcome = match reply {
+                                InsertReply::Inserted => Ok("Inserted on the target".into()),
+                                InsertReply::PasteNow(key) => {
+                                    for cmd in crate::actions::combo(paste_keys(key)) {
+                                        hid.send(cmd);
+                                    }
+                                    if let Err(e) = ep.send_insert_pasted(id) {
+                                        return End::Lost(e.to_string(), true);
+                                    }
+                                    Ok("Pasted on the target".into())
+                                }
+                                InsertReply::Failed(e) => Err(e),
+                            };
+                            let _ = tx.send(outcome);
+                            wake();
+                        }
+                        Event::Policy(_) | Event::Insert { .. } | Event::InsertPasted { .. } => {}
+                    }
+                }
+            }
+            Some(req) = inserts.recv() => {
+                if !up {
+                    let _ = req.reply.send(Err("the agent is not connected".into()));
+                    continue;
+                }
+                match ep.send_insert(&req.text, req.paste) {
+                    Ok(id) => {
+                        pending.insert(id, (req.reply, req.hid, Instant::now()));
+                    }
+                    Err(e) => {
+                        let _ = req.reply.send(Err(e.to_string()));
                     }
                 }
             }
             _ = poll.tick() => {
+                let expired: Vec<u32> = pending
+                    .iter()
+                    .filter(|(_, (_, _, at))| at.elapsed() > INSERT_TIMEOUT)
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in expired {
+                    if let Some((tx, _, _)) = pending.remove(&id) {
+                        let _ = tx.send(Err("the agent did not answer".into()));
+                        wake();
+                    }
+                }
                 if let Some(content) = local.poll().await
                     && up
                     && settings.borrow().sends()

@@ -220,6 +220,34 @@ Not verified yet:
 `CONFIG_USB_CONFIGFS_ACM`/`NCM`, add serial/ethernet to `_OTG_FUNC_MAP`, and allow
 user extras that survive upgrades.
 
+### Inserting text instead of typing it (protocol v2, 2026-10-28)
+
+Typing a clipboard key by key goes wherever the focus is: if the user switches windows
+mid-way, the rest lands in the wrong place. With an agent connected, "Insert clipboard"
+hands the whole text over in one step (`Msg::Insert{id, text, paste}`, up to `MAX_INSERT`
+= 60 KiB):
+
+- **Windows**: one `SendInput` call with `KEYEVENTF_UNICODE` events (Enter/Tab as keys).
+  The input queue takes it at once; layout and AltGr don't matter; the clipboard is untouched.
+- **Linux / macOS** (and Windows if `SendInput` is refused, e.g. elevated window): the agent
+  puts the text on the clipboard and replies `PasteNow(key)`; the GUI sends that single
+  keystroke over the KVM (Ctrl+V, Ctrl+Shift+V for terminals, Cmd+V on macOS) and answers
+  `InsertPasted`; 1 s later the agent restores the previous clipboard if it still holds
+  the inserted text. A real keyboard may paste on Wayland, where programs can't fake input.
+  Terminal detection reads the active window's `WM_CLASS` (X11/XWayland); per device the
+  user can force Ctrl+V or Ctrl+Shift+V instead of Auto.
+
+Without an agent (or for longer text) the GUI still types, but with its own engine:
+
+**Why AltGr characters got lost**: the firmware (`kvmd/keyboard/printer.py`) sends AltGr
+as Left Ctrl + Right Alt. Windows reads that as AltGr; Linux and macOS read a Ctrl
+shortcut, so `| @ \ [ ] { } ~ €` on German and similar layouts never arrive.
+`glkvm::layout` types from Unicode CLDR release-43 keyboard tables (`scripts/gen-layouts.py`
+generates `layout/data.rs`; Unicode License v3): AltGr is Right Alt alone (Option on macOS
+targets), dead-key characters get a following Space, composed ones (`â`) both strokes.
+Windows tables serve Linux too; BIOS always gets US. Characters the layout can't type are
+skipped and reported. Keymaps we have no table for fall back to `hid/print`.
+
 ### Fallback for macOS targets / no network: FunctionFS
 
 A userspace daemon on the Comet could present either a vendor bulk interface (WinUSB

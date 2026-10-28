@@ -8,7 +8,9 @@
 //!   GUI is the initiator and sends the first handshake message as soon as it connects; the
 //!   agent answers. A wrong secret fails the handshake.
 //! - **Messages** (postcard, inside the transport): `Hello` both ways, then `Policy` from
-//!   the GUI, clipboard items as `Start` + `Chunk`s, `Ping`/`Pong`.
+//!   the GUI, clipboard items as `Start` + `Chunk`s, `Ping`/`Pong`, and text insertion:
+//!   `Insert` (GUI) → `InsertReply` (agent) → `InsertPasted` (GUI, when the agent asked for
+//!   a paste keystroke).
 //!
 //! Sans-IO: feed received bytes to [`Endpoint::receive`], write [`Endpoint::take_outgoing`].
 
@@ -22,7 +24,9 @@ pub use content::{Content, ContentKey, Dedup};
 pub use pairing::Secret;
 
 /// Bumped on incompatible protocol changes; both ends refuse a different major.
-pub const PROTOCOL: u16 = 1;
+pub const PROTOCOL: u16 = 2;
+/// Longest text for one [`Endpoint::send_insert`] (one Noise message).
+pub const MAX_INSERT: usize = 60 * 1024;
 /// Largest clipboard item (encoded: UTF-8 text or PNG).
 pub const MAX_ITEM: usize = 16 * 1024 * 1024;
 
@@ -91,6 +95,35 @@ pub struct Policy {
     pub agent_may_send: bool,
 }
 
+/// Which keystroke pastes on the target, as the GUI prefers it for Linux targets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PastePref {
+    /// The agent decides (terminals get Ctrl+Shift+V where it can tell).
+    #[default]
+    Auto,
+    CtrlV,
+    CtrlShiftV,
+}
+
+/// A paste keystroke the GUI sends over the KVM's keyboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PasteKey {
+    CtrlV,
+    CtrlShiftV,
+    CmdV,
+}
+
+/// The agent's answer to an insert request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InsertReply {
+    /// Inserted directly (Windows: one `SendInput` with Unicode characters).
+    Inserted,
+    /// The text is on the target's clipboard: send this keystroke, then
+    /// [`Endpoint::send_insert_pasted`] so the agent restores the previous clipboard.
+    PasteNow(PasteKey),
+    Failed(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum Kind {
     Text,
@@ -113,6 +146,18 @@ enum Msg {
     },
     Ping,
     Pong,
+    Insert {
+        id: u32,
+        text: String,
+        paste: PastePref,
+    },
+    InsertReply {
+        id: u32,
+        reply: InsertReply,
+    },
+    InsertPasted {
+        id: u32,
+    },
 }
 
 /// Something the caller must act on.
@@ -124,6 +169,16 @@ pub enum Event {
     Clip(Content),
     /// New policy from the GUI (agent only).
     Policy(Policy),
+    /// Insert `text` where the target's focus is (agent only).
+    Insert {
+        id: u32,
+        text: String,
+        paste: PastePref,
+    },
+    /// The agent's answer to an insert (GUI only).
+    InsertReply { id: u32, reply: InsertReply },
+    /// The GUI sent the paste keystroke (agent only).
+    InsertPasted { id: u32 },
 }
 
 enum Noise {
@@ -222,6 +277,32 @@ impl Endpoint {
 
     pub fn set_policy(&mut self, policy: Policy) -> Result<()> {
         self.send(&Msg::Policy(policy))
+    }
+
+    /// Asks the agent to insert `text` at the target's focus. Returns the request id.
+    pub fn send_insert(&mut self, text: &str, paste: PastePref) -> Result<u32> {
+        if !self.is_ready() {
+            return Err(Error::NotReady);
+        }
+        if text.len() > MAX_INSERT {
+            return Err(Error::TooLarge(text.len()));
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.send(&Msg::Insert {
+            id,
+            text: text.to_owned(),
+            paste,
+        })?;
+        Ok(id)
+    }
+
+    pub fn send_insert_reply(&mut self, id: u32, reply: InsertReply) -> Result<()> {
+        self.send(&Msg::InsertReply { id, reply })
+    }
+
+    pub fn send_insert_pasted(&mut self, id: u32) -> Result<()> {
+        self.send(&Msg::InsertPasted { id })
     }
 
     pub fn ping(&mut self) -> Result<()> {
@@ -359,6 +440,18 @@ impl Endpoint {
             }
             Msg::Ping => self.send(&Msg::Pong)?,
             Msg::Pong => {}
+            Msg::Insert { id, text, paste } if self.role == Role::Agent => {
+                events.push(Event::Insert { id, text, paste });
+            }
+            Msg::InsertReply { id, reply } if self.role == Role::Client => {
+                events.push(Event::InsertReply { id, reply });
+            }
+            Msg::InsertPasted { id } if self.role == Role::Agent => {
+                events.push(Event::InsertPasted { id });
+            }
+            Msg::Insert { .. } | Msg::InsertReply { .. } | Msg::InsertPasted { .. } => {
+                return Err(Error::Message("insert message for the wrong role".into()));
+            }
         }
         Ok(())
     }
@@ -453,6 +546,48 @@ mod tests {
             ]
         );
         assert_eq!(ce, vec![Event::Clip(img)]);
+    }
+
+    #[test]
+    fn insert_round_trip() {
+        let s = Secret::generate();
+        let (mut c, mut a) = pair(&s, &s);
+        pump(&mut c, &mut a).unwrap();
+        let id = c.send_insert("a|b@c\n€", PastePref::CtrlShiftV).unwrap();
+        let (_, ae) = pump(&mut c, &mut a).unwrap();
+        assert_eq!(
+            ae,
+            vec![Event::Insert {
+                id,
+                text: "a|b@c\n€".into(),
+                paste: PastePref::CtrlShiftV
+            }]
+        );
+        a.send_insert_reply(id, InsertReply::PasteNow(PasteKey::CtrlV))
+            .unwrap();
+        let (ce, _) = pump(&mut c, &mut a).unwrap();
+        assert_eq!(
+            ce,
+            vec![Event::InsertReply {
+                id,
+                reply: InsertReply::PasteNow(PasteKey::CtrlV)
+            }]
+        );
+        c.send_insert_pasted(id).unwrap();
+        let (_, ae) = pump(&mut c, &mut a).unwrap();
+        assert_eq!(ae, vec![Event::InsertPasted { id }]);
+        assert!(matches!(
+            c.send_insert(&"x".repeat(MAX_INSERT + 1), PastePref::Auto),
+            Err(Error::TooLarge(_))
+        ));
+        // The agent cannot ask the GUI to insert.
+        a.send(&Msg::Insert {
+            id: 9,
+            text: "x".into(),
+            paste: PastePref::Auto,
+        })
+        .unwrap();
+        assert!(pump(&mut c, &mut a).is_err());
     }
 
     #[test]

@@ -17,6 +17,7 @@
 
 mod clipboard;
 mod config;
+mod insert;
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -271,6 +272,18 @@ fn session(
                             }
                             policy = p;
                         }
+                        Event::Insert { id, text, paste } => {
+                            let reply = insert::insert(&text, paste, cmd_tx);
+                            log!("insert of {} chars: {reply:?}", text.chars().count());
+                            ep.send_insert_reply(id, reply)
+                                .map_err(|e| SessionEnd::Lost(e.to_string(), true))?;
+                        }
+                        Event::InsertPasted { .. } => {
+                            cmd_tx
+                                .send(ClipCommand::RestoreSoon)
+                                .map_err(|_| SessionEnd::ClipboardGone)?;
+                        }
+                        Event::InsertReply { .. } => {}
                         Event::Clip(content) => {
                             log!("received {content:?}");
                             cmd_tx

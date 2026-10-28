@@ -43,10 +43,26 @@ impl BridgeSetup {
     }
 
     /// Refreshes the status in the background.
+    /// Refreshes the status in the background. When the bridge is healthy but holds older
+    /// agent programs than this app bundles, uploads them quietly (no USB restart, so no
+    /// need to ask): targets then get the current agent when they (re)install it.
     pub fn check(&self) {
         let this = self.clone();
         self.rt.spawn(async move {
-            let status = this.session.bridge_status().await;
+            let mut status = this.session.bridge_status().await;
+            if let Ok(Some(st)) = &status
+                && bridge::health(Some(st)) == Health::Ok
+                && let Some(dir) = agents_dir()
+            {
+                match bridge::sync_agents(&this.session, &dir, st).await {
+                    Ok(up) if !up.is_empty() => {
+                        tracing::info!(agents = ?up, "updated the agent programs on the Comet");
+                        status = this.session.bridge_status().await;
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(%e, "cannot update the agent programs on the Comet"),
+                }
+            }
             {
                 let mut i = this.inner.lock().unwrap();
                 i.checked = true;

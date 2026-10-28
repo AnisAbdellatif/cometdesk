@@ -16,6 +16,7 @@ use glkvm::api::streamer::SnapshotOptions;
 use glkvm::events::{ConnState, DeviceState, EventOptions, EventSession, HidSender};
 use glkvm::hid::{HidCommand, MouseButton};
 use glkvm::{Session, SystemConfig};
+use glkvm_clip::PastePref;
 use glkvm_media::direct::{self, DirectOptions, MediaSession, SourceState};
 use glkvm_view::pipeline::FramePipeline;
 use glkvm_view::{InputMapper, Rect, ScrollOptions, letterbox_in};
@@ -27,13 +28,15 @@ use winit::keyboard::KeyCode;
 
 use crate::actions::{self, HostModifiers, Shortcut};
 use crate::app::UserEvent;
-use crate::clipsync::{BridgeState, ClipBridge, Settings as ClipSettings};
+use crate::clipsync::{BridgeState, ClipBridge, InsertResult, Settings as ClipSettings};
 use crate::gpu::Gpu;
 use crate::setup::BridgeSetup;
 use crate::store::{self, ClipDirection, SavedDevice, TargetOs};
 
 const HIDDEN_GRACE: Duration = Duration::from_secs(30);
 const NOTICE_TIME: Duration = Duration::from_secs(4);
+/// Pause after each key event we type ourselves, so the device's HID queue keeps up.
+const KEY_GAP: Duration = Duration::from_millis(5);
 
 /// Everything the connect task produces.
 pub struct Connected {
@@ -109,6 +112,8 @@ pub struct Console {
     /// Toolbar rectangle in points while it is shown.
     toolbar_rect: Option<egui::Rect>,
     typing: Option<Typing>,
+    /// Outcome of an insert through the agent, while one is in flight.
+    inserting: Option<tokio::sync::oneshot::Receiver<InsertResult>>,
     confirm: Option<Confirm>,
     notice: Option<(String, Instant)>,
     stats: FrameStats,
@@ -163,6 +168,7 @@ impl Console {
             toolbar_hover: false,
             toolbar_rect: None,
             typing: None,
+            inserting: None,
             confirm: None,
             notice: None,
             stats: FrameStats::default(),
@@ -328,6 +334,21 @@ impl Console {
                 action = ConsoleAction::TargetChanged;
             }
             ui.checkbox(&mut self.clip_paused, "Pause");
+            if self.device.target == TargetOs::Linux {
+                ui.separator();
+                ui.label("Insert clipboard pastes with:");
+                let before = self.device.insert_paste;
+                for (p, l) in [
+                    (PastePref::Auto, "Auto (Ctrl+Shift+V in terminals)"),
+                    (PastePref::CtrlV, "Ctrl+V"),
+                    (PastePref::CtrlShiftV, "Ctrl+Shift+V"),
+                ] {
+                    ui.radio_value(&mut self.device.insert_paste, p, l);
+                }
+                if self.device.insert_paste != before {
+                    action = ConsoleAction::TargetChanged;
+                }
+            }
             if let Some(c) = &self.clip
                 && c.settings() != self.clip_settings()
             {
@@ -754,42 +775,101 @@ impl Console {
         self.release_all();
         match actions::confirm_reason(&text) {
             Some(reason) => self.confirm = Some(Confirm::Type { text, reason }),
-            None => self.start_typing(text),
+            None => self.deliver_text(text),
         }
     }
 
+    /// Text for the target: inserted in one step through the agent when it is connected,
+    /// otherwise typed key by key over the KVM.
+    fn deliver_text(&mut self, text: String) {
+        let insert = self.clip.as_ref().is_some_and(ClipBridge::can_insert)
+            && text.len() <= glkvm_clip::MAX_INSERT;
+        if !insert {
+            return self.start_typing(text);
+        }
+        let paste = self.device.insert_paste;
+        let rx = self
+            .clip
+            .as_ref()
+            .unwrap()
+            .insert(text, paste, self.hid.clone());
+        self.inserting = Some(rx);
+    }
+
+    /// Whether the clipboard button inserts through the agent (vs typing).
+    fn inserts_via_agent(&self) -> bool {
+        self.clip.as_ref().is_some_and(ClipBridge::can_insert)
+    }
+
+    /// Types `text` key by key. With a layout table for the target (`glkvm::layout`) we send
+    /// the keys ourselves, AltGr as Right Alt alone (Option on macOS); otherwise the device
+    /// types it (`hid/print`), whose AltGr Linux and macOS misread.
     fn start_typing(&mut self, text: String) {
         if let Some(t) = self.typing.take() {
             t.task.abort();
         }
-        let chunks: Vec<String> = actions::chunks(&text, actions::CHUNK_CHARS)
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
         let total = text.chars().count();
         let done = Arc::new(AtomicUsize::new(0));
-        let (session, keymap, proxy, progress) = (
-            self.session.clone(),
-            self.keymap(),
-            self.proxy.clone(),
-            done.clone(),
-        );
-        let task = self.rt.spawn(async move {
-            for chunk in chunks {
-                let opts = PrintOptions {
-                    keymap: keymap.as_deref(),
-                    slow: false,
-                };
-                session
-                    .hid_print(&chunk, opts)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                progress.fetch_add(chunk.chars().count(), Ordering::Relaxed);
-                let _ = proxy.send_event(UserEvent::Refresh);
+        let (proxy, progress) = (self.proxy.clone(), done.clone());
+        let task = if let Some(layout) = self.typing_layout() {
+            let missing = layout.missing(&text);
+            if !missing.is_empty() {
+                let shown: String = missing.iter().take(10).collect();
+                self.notify(format!(
+                    "Skipping {} characters the {} layout cannot type: {shown}",
+                    missing.len(),
+                    layout.name
+                ));
             }
-            Ok(())
-        });
+            let hid = self.hid.clone();
+            self.rt.spawn(async move {
+                for (i, ch) in text.chars().enumerate() {
+                    for cmd in layout.keys(ch).unwrap_or_default() {
+                        hid.send(cmd);
+                        tokio::time::sleep(KEY_GAP).await;
+                    }
+                    if i % 20 == 19 {
+                        progress.store(i + 1, Ordering::Relaxed);
+                        let _ = proxy.send_event(UserEvent::Refresh);
+                    }
+                }
+                progress.store(total, Ordering::Relaxed);
+                Ok(())
+            })
+        } else {
+            let chunks: Vec<String> = actions::chunks(&text, actions::CHUNK_CHARS)
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            let (session, keymap) = (self.session.clone(), self.keymap());
+            self.rt.spawn(async move {
+                for chunk in chunks {
+                    let opts = PrintOptions {
+                        keymap: keymap.as_deref(),
+                        slow: false,
+                    };
+                    session
+                        .hid_print(&chunk, opts)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    progress.fetch_add(chunk.chars().count(), Ordering::Relaxed);
+                    let _ = proxy.send_event(UserEvent::Refresh);
+                }
+                Ok(())
+            })
+        };
         self.typing = Some(Typing { total, done, task });
+    }
+
+    /// Our layout table for typing on this target, if we have one. Firmware screens read
+    /// raw US scancodes.
+    fn typing_layout(&self) -> Option<glkvm::layout::Layout> {
+        use glkvm::layout::{Platform, layout};
+        match self.device.target {
+            TargetOs::Bios => layout("en-us", Platform::Windows),
+            TargetOs::MacOs => layout(&self.keymap()?, Platform::Mac),
+            TargetOs::Windows | TargetOs::Linux => layout(&self.keymap()?, Platform::Windows),
+        }
     }
 
     /// Layout used to type text: the device's saved choice, else the device default.
@@ -800,10 +880,12 @@ impl Console {
             .or_else(|| self.default_keymap.clone())
     }
 
-    /// Stops typing: dropping the request makes the device cancel and clear queued keys.
+    /// Stops typing: dropping the request makes the device cancel and clear queued keys;
+    /// keys we send ourselves may be held mid-character, so release them.
     fn cancel_typing(&mut self) {
         if let Some(t) = self.typing.take() {
             t.task.abort();
+            self.hid.release_all();
             self.notify("Typing cancelled".into());
         }
     }
@@ -882,6 +964,23 @@ impl Console {
 
     pub fn ui(&mut self, ui: &mut egui::Ui) -> ConsoleAction {
         let mut action = ConsoleAction::None;
+        if let Some(rx) = self.inserting.as_mut() {
+            match rx.try_recv() {
+                Ok(Ok(msg)) => {
+                    self.inserting = None;
+                    self.notify(msg);
+                }
+                Ok(Err(e)) => {
+                    self.inserting = None;
+                    self.notify(format!("Insert failed: {e}"));
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    self.inserting = None;
+                    self.notify("Insert failed: connection to the agent lost".into());
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+            }
+        }
         match self.setup.take_outcome() {
             Some(Ok(msg)) => self.notify(msg),
             Some(Err(e)) => self.notify(format!("Bridge setup failed: {e}")),
@@ -976,11 +1075,18 @@ impl Console {
                 }
             });
         });
-        if ui
-            .button("Type clipboard")
-            .on_hover_text("Right Cmd + V")
-            .clicked()
-        {
+        let (label, hint) = if self.inserts_via_agent() {
+            (
+                "Insert clipboard",
+                "Right Cmd + V. Inserted in one step through the agent on the target.",
+            )
+        } else {
+            (
+                "Type clipboard",
+                "Right Cmd + V. Typed key by key (no agent connected on the target).",
+            )
+        };
+        if ui.button(label).on_hover_text(hint).clicked() {
             self.request_type_clipboard();
         }
         if self.clip_menu(ui) != ConsoleAction::None {
@@ -1170,7 +1276,7 @@ impl Console {
         });
         match decision {
             Some(true) => match self.confirm.take() {
-                Some(Confirm::Type { text, .. }) => self.start_typing(text),
+                Some(Confirm::Type { text, .. }) => self.deliver_text(text),
                 Some(Confirm::BridgeSetup(_)) => self.setup.run(),
                 Some(c) => self.atx(c),
                 None => {}

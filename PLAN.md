@@ -267,7 +267,9 @@ Input (v1):
   and back/forward if the device accepts them.
 - **Input capture pauses** while any overlay (stats drawer, dialogs, menus) has focus,
   and resumes with its previous state when the overlay closes.
-- **Type clipboard**: `POST /api/hid/print` with the target's keymap, on `Cmd/Ctrl+Shift+V`
+- **Type clipboard** (superseded where possible: with the clipboard agent the text is
+  inserted in one step, and typing uses our own CLDR layout tables to avoid the firmware's
+  AltGr bug; see `docs/clipboard-bridge.md`, "Inserting text"): `POST /api/hid/print` with the target's keymap, on `Cmd/Ctrl+Shift+V`
   (plain paste is forwarded as keys). Confirm before typing multi-line text (newlines
   become Enter, which runs commands in terminals) or text over 1,000 characters; show
   progress and allow cancel. Details:

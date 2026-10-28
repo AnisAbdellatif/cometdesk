@@ -4,20 +4,42 @@
 //!
 //! Change detection is polling. Windows has a cheap sequence number; elsewhere text is read
 //! every tick, and images (expensive to read) only every few ticks when there is no text.
+//!
+//! Text insertion (`crate::insert`) borrows the clipboard: the text goes on it for one paste
+//! keystroke, then the previous content comes back, unless the user copied something else
+//! in between.
 
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arboard::{Clipboard, ImageData};
-use glkvm_clip::{Content, Dedup};
+use glkvm_clip::{Content, ContentKey, Dedup};
 
 use crate::log;
 
 const TICK: Duration = Duration::from_millis(500);
 const IMAGE_EVERY: u32 = 4;
 
+/// After the paste keystroke: time for the focused app to read the clipboard.
+const RESTORE_AFTER_PASTE: Duration = Duration::from_millis(1000);
+/// If the GUI never confirms the paste, restore anyway.
+const RESTORE_AT_LATEST: Duration = Duration::from_secs(10);
+
 pub enum ClipCommand {
     Set(Content),
+    /// Put text on the clipboard for one paste; answer when it is there.
+    SetForInsert {
+        text: String,
+        done: mpsc::Sender<Result<(), String>>,
+    },
+    /// The paste keystroke was sent: restore the previous clipboard soon.
+    RestoreSoon,
+}
+
+struct Restore {
+    previous: Option<Content>,
+    inserted: ContentKey,
+    due: Instant,
 }
 
 /// New content on the local clipboard.
@@ -44,8 +66,12 @@ fn run(mut clip: Clipboard, cmds: mpsc::Receiver<ClipCommand>, local: mpsc::Send
     if let Some(c) = read(&mut clip, true) {
         dedup.observe_local(c.key());
     }
+    let mut restore: Option<Restore> = None;
     loop {
-        match cmds.recv_timeout(TICK) {
+        let timeout = restore.as_ref().map_or(TICK, |r| {
+            r.due.saturating_duration_since(Instant::now()).min(TICK)
+        });
+        match cmds.recv_timeout(timeout) {
             Ok(ClipCommand::Set(content)) => {
                 dedup.applied(content.key());
                 if let Err(e) = write(&mut clip, content) {
@@ -54,8 +80,47 @@ fn run(mut clip: Clipboard, cmds: mpsc::Receiver<ClipCommand>, local: mpsc::Send
                 seq.mark_seen();
                 continue;
             }
+            Ok(ClipCommand::SetForInsert { text, done }) => {
+                let content = Content::Text(text);
+                let inserted = content.key();
+                // Keep the oldest saved content if inserts follow each other quickly.
+                let previous = match restore.take() {
+                    Some(r) => r.previous,
+                    None => read(&mut clip, true),
+                };
+                dedup.applied(inserted);
+                let r = write(&mut clip, content).map_err(|e| e.to_string());
+                seq.mark_seen();
+                restore = Some(Restore {
+                    previous,
+                    inserted,
+                    due: Instant::now() + RESTORE_AT_LATEST,
+                });
+                let _ = done.send(r);
+                continue;
+            }
+            Ok(ClipCommand::RestoreSoon) => {
+                if let Some(r) = restore.as_mut() {
+                    r.due = Instant::now() + RESTORE_AFTER_PASTE;
+                }
+                continue;
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+        if restore.as_ref().is_some_and(|r| Instant::now() >= r.due) {
+            let r = restore.take().unwrap();
+            // Only if the inserted text is still there: the user may have copied since.
+            if read(&mut clip, false).map(|c| c.key()) == Some(r.inserted)
+                && let Some(prev) = r.previous
+            {
+                dedup.applied(prev.key());
+                if let Err(e) = write(&mut clip, prev) {
+                    log!("cannot restore the clipboard: {e}");
+                }
+                seq.mark_seen();
+            }
+            continue;
         }
         if !seq.changed() {
             continue;

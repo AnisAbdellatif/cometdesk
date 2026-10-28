@@ -12,6 +12,7 @@ pub mod env;
 pub mod error;
 pub mod events;
 pub mod hid;
+pub mod layout;
 pub mod shell;
 pub mod tls;
 
