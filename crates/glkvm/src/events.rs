@@ -15,6 +15,9 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior, sleep, sleep_until};
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::api::atx::AtxState;
+use crate::api::hid::HidState;
+use crate::api::streamer::StreamerState;
 use crate::client::{Session, WsStream};
 use crate::hid::{Coalescer, HidCommand, MouseButton};
 
@@ -44,8 +47,64 @@ pub struct Event {
     pub data: serde_json::Value,
 }
 
-/// Latest payload per event type (`streamer`, `hid`, `atx`, ...).
-pub type DeviceState = HashMap<String, serde_json::Value>;
+/// Latest device state, built from events.
+///
+/// kvmd sends the full state of a subsystem first, then only the top-level keys that changed
+/// (a `streamer` event may carry just `{"streamer": {...}}` without `features`/`params`), so
+/// payloads are merged key by key, not replaced.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DeviceState {
+    raw: HashMap<String, serde_json::Value>,
+}
+
+impl DeviceState {
+    /// Merged payload of one event type (`streamer`, `hid`, `atx`, `info`, ...).
+    pub fn raw(&self, kind: &str) -> Option<&serde_json::Value> {
+        self.raw.get(kind)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.raw.is_empty()
+    }
+
+    pub fn hid(&self) -> Option<HidState> {
+        self.typed("hid")
+    }
+
+    pub fn atx(&self) -> Option<AtxState> {
+        self.typed("atx")
+    }
+
+    pub fn streamer(&self) -> Option<StreamerState> {
+        self.typed("streamer")
+    }
+
+    /// `Some(false)` when the streamer runs but the target sends no picture (off/asleep).
+    pub fn video_signal(&self) -> Option<bool> {
+        self.streamer()?.streamer.map(|rt| rt.hdmi.signal)
+    }
+
+    fn typed<T: serde::de::DeserializeOwned>(&self, kind: &str) -> Option<T> {
+        let v = self.raw.get(kind)?;
+        T::deserialize(v)
+            .inspect_err(|e| tracing::debug!(kind, %e, "unexpected event shape"))
+            .ok()
+    }
+
+    fn apply(&mut self, kind: &str, data: &serde_json::Value) {
+        use serde_json::Value;
+        match (self.raw.get_mut(kind), data) {
+            (Some(Value::Object(current)), Value::Object(update)) => {
+                for (k, v) in update {
+                    current.insert(k.clone(), v.clone());
+                }
+            }
+            _ => {
+                self.raw.insert(kind.to_owned(), data.clone());
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct EventOptions {
@@ -104,7 +163,7 @@ impl EventSession {
     pub fn spawn(session: Session, opts: EventOptions) -> EventSession {
         let (tx, rx) = mpsc::unbounded_channel();
         let (conn_tx, conn) = watch::channel(ConnState::Connecting);
-        let (state_tx, state) = watch::channel(DeviceState::new());
+        let (state_tx, state) = watch::channel(DeviceState::default());
         let (events, _) = broadcast::channel(256);
         let (close_tx, close_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(supervise(
@@ -333,9 +392,7 @@ fn handle_text(
         "kickout" => return Incoming::Kickout,
         _ => {}
     }
-    state_tx.send_modify(|s| {
-        s.insert(event.kind.clone(), event.data.clone());
-    });
+    state_tx.send_modify(|s| s.apply(&event.kind, &event.data));
     let _ = events.send(event);
     Incoming::Other
 }
@@ -346,7 +403,7 @@ mod tests {
 
     #[test]
     fn events_update_state_and_broadcast() {
-        let (state_tx, state_rx) = watch::channel(DeviceState::new());
+        let (state_tx, state_rx) = watch::channel(DeviceState::default());
         let (events, mut sub) = broadcast::channel(4);
         let r = handle_text(
             r#"{"event_type":"streamer","event":{"source":{"online":true}}}"#,
@@ -354,13 +411,16 @@ mod tests {
             &events,
         );
         assert_eq!(r, Incoming::Other);
-        assert_eq!(state_rx.borrow()["streamer"]["source"]["online"], true);
+        assert_eq!(
+            state_rx.borrow().raw("streamer").unwrap()["source"]["online"],
+            true
+        );
         assert_eq!(sub.try_recv().unwrap().kind, "streamer");
     }
 
     #[test]
     fn pong_and_kickout_are_control_events() {
-        let (state_tx, state_rx) = watch::channel(DeviceState::new());
+        let (state_tx, state_rx) = watch::channel(DeviceState::default());
         let (events, _) = broadcast::channel(4);
         assert_eq!(
             handle_text(r#"{"event_type":"pong","event":{}}"#, &state_tx, &events),
@@ -373,9 +433,54 @@ mod tests {
         assert!(state_rx.borrow().is_empty());
     }
 
+    fn feed(state_tx: &watch::Sender<DeviceState>, kind: &str, data: serde_json::Value) {
+        let (events, _) = broadcast::channel(4);
+        let text = serde_json::json!({"event_type": kind, "event": data}).to_string();
+        handle_text(&text, state_tx, &events);
+    }
+
+    #[test]
+    fn partial_updates_are_merged_per_top_level_key() {
+        let (tx, rx) = watch::channel(DeviceState::default());
+        // Full state first (as recorded from the device), then a diff with only `streamer`.
+        let full = crate::api::fixtures::load::<serde_json::Value>("streamer_idle");
+        feed(&tx, "streamer", full);
+        let running = crate::api::fixtures::load::<serde_json::Value>("streamer_running");
+        feed(
+            &tx,
+            "streamer",
+            serde_json::json!({"streamer": running["streamer"]}),
+        );
+
+        let s = rx.borrow().streamer().expect("typed streamer");
+        assert!(s.features.h264, "features kept from the first event");
+        assert_eq!(s.params.venc_mode.as_deref(), Some("smart"));
+        assert!(s.streamer.expect("runtime from the diff").h264.online);
+        assert_eq!(rx.borrow().video_signal(), Some(true));
+    }
+
+    #[test]
+    fn typed_hid_and_atx() {
+        let (tx, rx) = watch::channel(DeviceState::default());
+        feed(&tx, "hid", crate::api::fixtures::load("hid"));
+        feed(&tx, "atx", crate::api::fixtures::load("atx"));
+        let state = rx.borrow();
+        assert!(state.hid().unwrap().keyboard.online);
+        assert!(!state.atx().unwrap().enabled);
+        assert_eq!(state.video_signal(), None, "no streamer event yet");
+    }
+
+    #[test]
+    fn non_object_payload_replaces() {
+        let (tx, rx) = watch::channel(DeviceState::default());
+        feed(&tx, "x", serde_json::json!({"a": 1}));
+        feed(&tx, "x", serde_json::json!([1, 2]));
+        assert_eq!(rx.borrow().raw("x"), Some(&serde_json::json!([1, 2])));
+    }
+
     #[test]
     fn garbage_is_ignored() {
-        let (state_tx, _) = watch::channel(DeviceState::new());
+        let (state_tx, _) = watch::channel(DeviceState::default());
         let (events, _) = broadcast::channel(4);
         assert_eq!(handle_text("not json", &state_tx, &events), Incoming::Other);
         assert_eq!(
