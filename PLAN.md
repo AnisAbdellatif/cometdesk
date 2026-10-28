@@ -270,7 +270,18 @@ Input (v1):
 - **Type clipboard**: `POST /api/hid/print` with the target's keymap, on `Cmd/Ctrl+Shift+V`
   (plain paste is forwarded as keys). Confirm before typing multi-line text (newlines
   become Enter, which runs commands in terminals) or text over 1,000 characters; show
-  progress and allow cancel.
+  progress and allow cancel. Details:
+  - Send **release-all-modifiers** before typing; the user is still holding Cmd+Shift,
+    and the typed text would otherwise arrive as shortcuts.
+  - Pass `limit=0`: the firmware's default `limit` is 1024 and **silently truncates**
+    (`kvmd/apps/kvmd/api/hid.py`). Chunk long text (~500 chars per request) for progress.
+  - Cancel = close the in-flight request: the firmware cancels the typing task and clears
+    queued HID events when the client disconnects.
+  - Check characters against the target keymap first; untypeable ones (emoji, CJK) are
+    reported, not silently dropped.
+  - Shortcut conflict: with Cmd→Ctrl mapping, `⌘⇧V` is how a Mac user sends Ctrl+Shift+V,
+    which is **paste in Linux terminals**. For the Linux profile, default the binding to
+    host-key+V (Right-Cmd+V) instead, and make it configurable everywhere.
 
 Screens (v1):
 1. **Device list**: saved devices (the password goes in the OS keychain via `keyring`; the
@@ -382,7 +393,7 @@ Each item lists what triggers it. Nothing here is planned until it's pulled.
 | Item | Trigger / notes |
 |---|---|
 | Drag-and-drop file → MSD flash (`msd/write`, streamed with progress) | First time a file needs to reach the target |
-| OCR copy (Apple Vision, or device `/api/streamer/ocr`) | Remote → local text need. Shape proven by Overlook: drag a rectangle (or click → ~800 px square around the point), Vision `.accurate` with language correction on that crop, result in a selectable sheet with Copy. Live text-region boxes (`.fast`, every ~650 ms) are optional and off by default. Copy frames out only while OCR mode is on. Mind Vision's bottom-left origin. |
+| OCR copy (Apple Vision; fallback device Tesseract via `GET /api/streamer/snapshot?ocr=1&ocr_langs=…&ocr_left/top/right/bottom=…`. `/api/streamer/ocr` only reports availability and languages) | Remote → local text need. Also offer "copy region as image" (exact). Shape proven by Overlook: drag a rectangle (or click → ~800 px square around the point), Vision `.accurate` with language correction on that crop, result in a selectable sheet with Copy. Live text-region boxes (`.fast`, every ~650 ms) are optional and off by default. Copy frames out only while OCR mode is on. Mind Vision's bottom-left origin. |
 | Network scan | Manual add proves tedious. Sweep each private /24 plus `192.168.200.0/24` on 443/8443/80/8080 with bounded concurrency, and accept a host only via the §3 fingerprint. mDNS is unproven: Overlook browses `_comet._tcp` and `_kvm._tcp`, but whether the firmware advertises them is unverified (and it ignores the SRV port). |
 | Tailscale discovery | Remote devices on a tailnet. Read peers from `tailscale status --json` (CLI found via PATH or config), then apply the §3 fingerprint. No guessing from hostname, tags or OS; never install anything. |
 | Menu bar item (quick connect, device status) | App used many times a day. No global keyboard monitor (needs Input Monitoring permission and fails silently without it). |
@@ -401,7 +412,7 @@ Each item lists what triggers it. Nothing here is planned until it's pulled.
 | Windows (Media Foundation) / Linux (VA-API) | A user on that platform |
 | Packaging: `cargo-dist`, macOS signing/notarization | Someone other than the author uses it |
 | GL cloud remote connect (`api.glkvm.com`, reverse-engineered) | VPN options prove insufficient |
-| Companion agent on the target for clipboard sync over the USB network gadget (`/api/rndis/*`) | Speculative |
+| Companion agent on the target for real two-way clipboard sync, carried through the Comet. The serial gadget is absent from the RM1 kernel, so the transport is USB Ethernet (RNDIS) + the Comet's existing NAT, with the agent connecting out to the host. Windows/Linux targets only. Findings and design in `docs/clipboard-bridge.md` §0 | RNDIS enable + target test in §0 pass |
 
 ## 9. Prior art (read for behavior; respect licenses)
 

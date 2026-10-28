@@ -1,0 +1,5 @@
+name: glkvm-bridge
+description: Clipboard bridge relay between the target agent and glkvm-gui
+path: /usr/local/lib/glkvm-bridge/glkvm_bridge.py
+daemon: glkvm-bridge
+place: -1
