@@ -62,7 +62,7 @@ enum Cmd {
         /// How video reaches us: direct (`/api/media/ws`), pion (WebRTC FEC), janus (WebRTC).
         #[arg(long, value_enum, default_value_t = TransportArg::Direct)]
         transport: TransportArg,
-        /// Play the target's audio (pion transport only; opens a second WebRTC connection).
+        /// Play the target's audio (device in webrtc or flex_fec mode; opens a second WebRTC connection).
         #[arg(long)]
         audio: bool,
         /// How decoded frames reach the GPU.
@@ -447,21 +447,25 @@ fn view(
     };
     let media = glkvm_media::start(session.clone(), SourceOptions { transport, prefer });
     // Kept alive until the viewer closes.
-    let _audio = if !audio {
-        None
-    } else if transport != Transport::Pion {
-        tracing::warn!("audio needs --transport pion; continuing without it");
-        None
-    } else {
-        let (packets, session) = glkvm_media::pion::start_audio(session.clone()).take_packets();
-        match glkvm_media::audio::Player::start(packets, None) {
-            Ok(player) => Some((player, session)),
-            Err(e) => {
-                tracing::warn!(%e, "audio disabled");
-                None
+    let _audio = audio
+        .then(|| {
+            let Some(source) = glkvm_media::audio::start(session.clone(), mode) else {
+                tracing::warn!(
+                    mode,
+                    "no audio in this video mode (needs webrtc or flex_fec)"
+                );
+                return None;
+            };
+            let (packets, source) = source.take_packets();
+            match glkvm_media::audio::Player::start(packets, None) {
+                Ok(player) => Some((player, source)),
+                Err(e) => {
+                    tracing::warn!(%e, "audio disabled");
+                    None
+                }
             }
-        }
-    };
+        })
+        .flatten();
 
     let parts = viewer::ViewerParts {
         media,

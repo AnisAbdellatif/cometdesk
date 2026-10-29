@@ -73,6 +73,17 @@ impl Drop for AudioSession {
     }
 }
 
+/// Starts the audio source the device offers in its current `video_mode`, the way the web
+/// app picks it: Janus in `webrtc`, Pion in `flex_fec`. `None` for the other modes (Direct
+/// carries no audio, and `gl_webrtc` is not supported). Needs a tokio runtime context.
+pub fn start(session: glkvm::Session, video_mode: &str) -> Option<AudioSession> {
+    match video_mode {
+        "webrtc" => Some(crate::janus::start_audio(session)),
+        "flex_fec" => Some(crate::pion::start_audio(session)),
+        _ => None,
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PlayError {
     #[error("no audio output device")]

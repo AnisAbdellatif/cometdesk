@@ -140,9 +140,19 @@ async fn janus_delivers_a_keyframe() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs a device and an audio source on the target"]
 async fn pion_delivers_audio() {
+    audio_arrives(glkvm_media::pion::start_audio).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a device in webrtc mode and an audio source on the target"]
+async fn janus_delivers_audio() {
+    audio_arrives(glkvm_media::janus::start_audio).await;
+}
+
+async fn audio_arrives(start: fn(Session) -> glkvm_media::audio::AudioSession) {
     let session = login().await;
     let _events = EventSession::spawn(session.clone(), EventOptions::default());
-    let audio = glkvm_media::pion::start_audio(session);
+    let audio = start(session);
     let (mut packets, audio) = audio.take_packets();
     let first = tokio::time::timeout(Duration::from_secs(10), packets.recv())
         .await

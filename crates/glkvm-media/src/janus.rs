@@ -13,10 +13,12 @@ use futures_util::{SinkExt, StreamExt};
 use glkvm::{Error, Result, Session};
 use serde_json::{Value, json};
 use str0m::change::SdpOffer;
+use str0m::media::MediaKind;
 use tokio::sync::mpsc;
 use tokio::time::{MissedTickBehavior, interval, timeout};
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::audio::AudioSession;
 use crate::rtc::{self, AbortOnDrop, Negotiated, Peer, proto};
 use crate::source::MediaSession;
 
@@ -27,7 +29,21 @@ const KEEPALIVE: Duration = Duration::from_secs(25);
 
 /// Starts the Janus source on the current tokio runtime.
 pub fn start(session: Session) -> MediaSession {
-    MediaSession::spawn(|ends| rtc::supervise("janus", ends, move || negotiate(session.clone())))
+    MediaSession::spawn(|ends| {
+        rtc::supervise("janus", ends, move || {
+            negotiate(session.clone(), MediaKind::Video)
+        })
+    })
+}
+
+/// Starts the audio-only source: its own Janus handle and peer connection, as the web app
+/// does in this mode.
+pub fn start_audio(session: Session) -> AudioSession {
+    AudioSession::spawn(|packets, state| {
+        rtc::supervise_audio("janus", packets, state, move || {
+            negotiate(session.clone(), MediaKind::Audio)
+        })
+    })
 }
 
 /// A Janus message we care about.
@@ -117,7 +133,8 @@ async fn wait_for<T>(
     .map_err(|_| Error::Protocol(format!("janus: no {what} (is gl_webrtc enabled?)")))?
 }
 
-async fn negotiate(session: Session) -> Result<Negotiated> {
+async fn negotiate(session: Session, kind: MediaKind) -> Result<Negotiated> {
+    let video = kind == MediaKind::Video;
     let mut ws = session
         .ws_connect_protocol("janus/ws", Some(PROTOCOL))
         .await?;
@@ -145,7 +162,7 @@ async fn negotiate(session: Session) -> Result<Negotiated> {
         "janus": "message", "session_id": session_id, "handle_id": handle_id,
         "transaction": tx.next(),
         "body": {"request": "watch", "params": {
-            "orientation": 0, "audio": false, "video": true, "mic": false, "camera": false,
+            "orientation": 0, "audio": !video, "video": video, "mic": false, "camera": false,
         }},
     })))
     .await?;
@@ -192,6 +209,7 @@ async fn negotiate(session: Session) -> Result<Negotiated> {
                 }
                 m = ws.next() => match m {
                     Some(Ok(Message::Text(text))) => {
+                        tracing::debug!(%text, "janus message");
                         if let Reply::Candidate(c) = parse_reply(&text)
                             && let Some(c) = rtc::parse_candidate(&c) {
                                 let _ = cand_tx.send(c);

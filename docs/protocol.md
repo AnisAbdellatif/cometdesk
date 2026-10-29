@@ -109,6 +109,11 @@ Device in `video_mode = webrtc`, Mac and Comet on a tailnet (direct path, ~25 ms
   video-only config fields. Tried with a client that was told sound was playing; whether the
   Comet captures HDMI audio at all is not known yet (`/api/info` and `system/capability` list
   no audio field; `get_param` lists `mic_name`, the device's USB microphone).
+  The web app picks the audio transport by `video_mode`, like video: **Janus** in `webrtc`
+  (our device), Pion in `flex_fec`; none in Direct. Janus audio is a second handle with
+  `watch {audio: true, video: false, mic: false, camera: false}` (after a `features` request),
+  the offer is answered recvonly. It also reaches `status: started`, `webrtcup`, ICE and DTLS,
+  and **also delivers zero RTP** (2026-10-29, web-app audio toggle on at the time).
 
 ## U8 (partial)
 

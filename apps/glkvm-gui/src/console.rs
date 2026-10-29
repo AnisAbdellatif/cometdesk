@@ -605,14 +605,21 @@ impl Console {
         self.restart_watcher();
     }
 
-    /// Audio runs on the Pion source only, and only while the user has it switched on.
+    /// Audio comes from the source matching the device's video mode (Janus in `webrtc`, Pion
+    /// in `flex_fec`), independent of how video reaches us, and only while it is switched on.
     fn start_audio(&mut self) -> Option<Audio> {
-        if !self.audio_on || self.transport != Transport::Pion {
+        if !self.audio_on {
             return None;
         }
         let _guard = self.rt.enter();
-        let (packets, session) =
-            glkvm_media::pion::start_audio(self.session.clone()).take_packets();
+        // Unknown until the first read of the device state; see where `video_info` arrives.
+        let mode = self.video_info.mode?.wire_name();
+        let Some(source) = glkvm_media::audio::start(self.session.clone(), mode) else {
+            self.audio_on = false;
+            self.notify("Audio needs the device in webrtc or flex_fec video mode".into());
+            return None;
+        };
+        let (packets, session) = source.take_packets();
         let output = Some(self.device.audio_output.as_str()).filter(|n| !n.is_empty());
         match Player::start(packets, output) {
             Ok(player) => Some(Audio {
@@ -704,10 +711,13 @@ impl Console {
             }
         }
         let mut audio = self.audio_on;
-        let enabled = self.transport == Transport::Pion;
+        let enabled = matches!(
+            self.video_info.mode,
+            Some(VideoMode::Webrtc | VideoMode::FlexFec)
+        );
         if ui
             .add_enabled(enabled, egui::Checkbox::new(&mut audio, "Play audio"))
-            .on_disabled_hover_text("Audio needs the WebRTC (FEC) source")
+            .on_disabled_hover_text("Audio needs the device in webrtc or flex_fec video mode")
             .changed()
         {
             self.set_audio(audio);
@@ -1429,6 +1439,10 @@ impl Console {
                 Ok(info) => {
                     self.video_info = info;
                     self.video_info_rx = None;
+                    // The mode picks the audio source, so a saved "on" waits for it.
+                    if self.audio_on && self.stream.as_ref().is_some_and(|s| s.audio.is_none()) {
+                        self.set_audio(true);
+                    }
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Closed) => self.video_info_rx = None,
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
