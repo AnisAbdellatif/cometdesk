@@ -18,7 +18,7 @@ use glkvm::events::{ConnState, DeviceState, EventOptions, EventSession, HidSende
 use glkvm::hid::{HidCommand, MouseButton};
 use glkvm::{Session, SystemConfig};
 use glkvm_clip::{Hello, Info, PastePref, SessionState};
-use glkvm_media::direct::{self, DirectOptions, MediaSession, SourceState};
+use glkvm_media::direct::{MediaSession, SourceState};
 use glkvm_media::{SourceOptions, Transport};
 use glkvm_view::pipeline::FramePipeline;
 use glkvm_view::{InputMapper, Rect, ScrollOptions, letterbox_in};
