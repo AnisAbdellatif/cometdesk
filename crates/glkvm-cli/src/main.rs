@@ -454,7 +454,7 @@ fn view(
         None
     } else {
         let (packets, session) = glkvm_media::pion::start_audio(session.clone()).take_packets();
-        match glkvm_media::audio::Player::start(packets) {
+        match glkvm_media::audio::Player::start(packets, None) {
             Ok(player) => Some((player, session)),
             Err(e) => {
                 tracing::warn!(%e, "audio disabled");

@@ -101,6 +101,10 @@ pub struct SavedDevice {
     pub insert_paste: glkvm_clip::PastePref,
     /// Video source (`direct`, `webrtc-fec`, `webrtc`); empty: Direct.
     pub transport: String,
+    /// Play the target's audio (WebRTC FEC source only).
+    pub audio: bool,
+    /// Output device name for the target's audio; empty: the system default.
+    pub audio_output: String,
 }
 
 impl SavedDevice {
@@ -340,6 +344,8 @@ mod tests {
             clip_direction: ClipDirection::ToTarget,
             insert_paste: glkvm_clip::PastePref::CtrlShiftV,
             transport: String::new(),
+            audio: false,
+            audio_output: String::new(),
         }
     }
 

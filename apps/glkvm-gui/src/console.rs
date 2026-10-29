@@ -226,6 +226,7 @@ impl Console {
             .and_then(|t| t.parse().ok())
             .or_else(|| console.device.transport.parse().ok())
             .unwrap_or_default();
+        console.audio_on = console.device.audio;
         console.refresh_video_info();
         console.start_stream();
         if let Some(secret) = store::clip_secret(&console.device) {
@@ -612,7 +613,8 @@ impl Console {
         let _guard = self.rt.enter();
         let (packets, session) =
             glkvm_media::pion::start_audio(self.session.clone()).take_packets();
-        match Player::start(packets) {
+        let output = Some(self.device.audio_output.as_str()).filter(|n| !n.is_empty());
+        match Player::start(packets, output) {
             Ok(player) => Some(Audio {
                 _player: player,
                 _session: session,
@@ -627,6 +629,8 @@ impl Console {
 
     fn set_audio(&mut self, on: bool) {
         self.audio_on = on;
+        self.device.audio = on;
+        self.target_changed = true;
         let audio = if on { self.start_audio() } else { None };
         if let Some(s) = &mut self.stream {
             s.audio = audio;
@@ -707,6 +711,25 @@ impl Console {
             .changed()
         {
             self.set_audio(audio);
+        }
+        if self.audio_on {
+            let mut chosen = None;
+            ui.menu_button("Audio output", |ui| {
+                let current = &self.device.audio_output;
+                if ui.radio(current.is_empty(), "System default").clicked() {
+                    chosen = Some(String::new());
+                }
+                for name in glkvm_media::audio::output_devices() {
+                    if ui.radio(*current == name, &name).clicked() {
+                        chosen = Some(name);
+                    }
+                }
+            });
+            if let Some(name) = chosen {
+                self.device.audio_output = name;
+                self.set_audio(true);
+                ui.close();
+            }
         }
         ui.separator();
         ui.label("Device-wide (affects every viewer)");

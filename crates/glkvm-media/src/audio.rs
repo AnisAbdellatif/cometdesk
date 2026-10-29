@@ -119,6 +119,18 @@ impl Ring {
     }
 }
 
+fn device_name(d: &cpal::Device) -> Option<String> {
+    Some(d.description().ok()?.name().to_owned())
+}
+
+/// Names of the available output devices.
+pub fn output_devices() -> Vec<String> {
+    cpal::default_host()
+        .output_devices()
+        .map(|d| d.filter_map(|d| device_name(&d)).collect())
+        .unwrap_or_default()
+}
+
 /// Decodes Opus packets and plays them. Dropping the player stops both.
 pub struct Player {
     _stream: cpal::Stream,
@@ -127,11 +139,21 @@ pub struct Player {
 }
 
 impl Player {
-    /// Starts playback of `packets` on the default output device. Needs a tokio runtime
-    /// context for the decode task.
-    pub fn start(mut packets: mpsc::Receiver<Bytes>) -> Result<Player, PlayError> {
-        let device = cpal::default_host()
-            .default_output_device()
+    /// Starts playback of `packets` on the output device called `device` (see
+    /// [`output_devices`]), or the system default if `None` or no longer present. Needs a
+    /// tokio runtime context for the decode task.
+    pub fn start(
+        mut packets: mpsc::Receiver<Bytes>,
+        device: Option<&str>,
+    ) -> Result<Player, PlayError> {
+        let host = cpal::default_host();
+        let device = device
+            .and_then(|name| {
+                host.output_devices()
+                    .ok()?
+                    .find(|d| device_name(d).is_some_and(|n| n == name))
+            })
+            .or_else(|| host.default_output_device())
             .ok_or(PlayError::NoDevice)?;
         let config = device
             .default_output_config()

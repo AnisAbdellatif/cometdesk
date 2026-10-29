@@ -415,7 +415,7 @@ Each item lists what triggers it. Nothing here is planned until it's pulled.
 | Tailscale discovery | Remote devices on a tailnet. Read peers from `tailscale status --json` (CLI found via PATH or config), then apply the §3 fingerprint. No guessing from hostname, tags or OS; never install anything. |
 | Menu bar item (quick connect, device status) | App used many times a day. No global keyboard monitor (needs Input Monitoring permission and fails silently without it). |
 | Quality presets UI | Changing quality from the app instead of the web UI. Device-wide (§4). Use `streamer.features` to gate controls and `streamer.limits` to clamp them, and re-read the streamer state after writing. |
-| Audio device picker | Audio in use (Phase 3). |
+| ~~Audio device picker~~ | Done: Video menu → Play audio → Audio output; the choice and the on/off state are saved per device. |
 | Full keyboard grab via [`rdev`](https://github.com/rustdesk-org/rdev) (MIT) `grab`, host-key toggle (Right-Cmd), needs Accessibility permission | Special keys menu proves insufficient |
 | Translate keyboard mode | Layout mismatch hurts in practice. Target layouts from Unicode CLDR keyboard data or xkeyboard-config (permissive), never `keymap.csv`. Dead keys and AltGr need care. |
 | Relative mouse + pointer lock | Depends on U6; needed for games or some BIOSes |
