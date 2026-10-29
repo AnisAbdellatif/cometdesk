@@ -7,7 +7,7 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -172,6 +172,12 @@ impl Player {
         if config.sample_format() != cpal::SampleFormat::F32 {
             return Err(PlayError::Format(config.sample_format()));
         }
+        tracing::info!(
+            device = device_name(&device).as_deref().unwrap_or("?"),
+            rate = config.sample_rate(),
+            channels = config.channels(),
+            "audio output"
+        );
         let out_channels = config.channels() as usize;
         let step = RATE as f32 / config.sample_rate() as f32;
 
@@ -180,6 +186,8 @@ impl Player {
 
         let cb_ring = ring.clone();
         let cb_muted = muted.clone();
+        let played = Arc::new(AtomicU64::new(0));
+        let cb_played = played.clone();
         // Linear resampler state: position between `prev` and `next` source frames.
         let (mut prev, mut next, mut pos) = ([0f32; 2], [0f32; 2], 1.0f32);
         let stream = device
@@ -188,12 +196,16 @@ impl Player {
                 move |out: &mut [f32], _| {
                     let silent = cb_muted.load(Ordering::Relaxed);
                     let mut ring = cb_ring.lock().unwrap();
+                    let mut got = 0u64;
                     for frame in out.chunks_mut(out_channels) {
                         while pos >= 1.0 {
                             pos -= 1.0;
                             prev = next;
                             match ring.pop_frame() {
-                                Some(f) => next = f,
+                                Some(f) => {
+                                    next = f;
+                                    got += 1;
+                                }
                                 None => {
                                     next = [0.0; 2];
                                     pos = 1.0;
@@ -214,6 +226,7 @@ impl Player {
                             }
                         }
                     }
+                    cb_played.fetch_add(got, Ordering::Relaxed);
                 },
                 |e| tracing::warn!(error = %e, "audio output"),
                 None,
@@ -229,10 +242,41 @@ impl Player {
                 Err(e) => return tracing::error!(error = %e, "opus decoder"),
             };
             let mut pcm = vec![0f32; MAX_FRAME * CHANNELS];
+            let (mut decoded, mut failed, mut peak) = (0u64, 0u64, 0f32);
+            let mut last = std::time::Instant::now();
             while let Some(packet) = packets.blocking_recv() {
-                match dec.decode_float(&packet, &mut pcm, false) {
-                    Ok(n) => ring.lock().unwrap().push(&pcm[..n * CHANNELS]),
-                    Err(e) => tracing::debug!(error = %e, "dropping undecodable opus packet"),
+                // The pure-Rust decoder can panic on odd packets (an overflowing shift in a
+                // CELT band mask); lose the packet, not the audio.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    dec.decode_float(&packet, &mut pcm, false)
+                }))
+                .unwrap_or_else(|_| {
+                    dec = OpusDecoder::new(RATE, CHANNELS).expect("opus decoder");
+                    Err(opus_decoder::OpusError::InvalidPacket)
+                });
+                match result {
+                    Ok(n) => {
+                        decoded += 1;
+                        peak = pcm[..n * CHANNELS].iter().fold(peak, |m, s| m.max(s.abs()));
+                        ring.lock().unwrap().push(&pcm[..n * CHANNELS]);
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        tracing::debug!(error = %e, "dropping undecodable opus packet");
+                    }
+                }
+                if last.elapsed() >= Duration::from_secs(1) {
+                    last = std::time::Instant::now();
+                    let queued = ring.lock().unwrap().samples.len() / CHANNELS;
+                    tracing::debug!(
+                        decoded,
+                        failed,
+                        peak,
+                        queued_frames = queued,
+                        played = played.load(Ordering::Relaxed),
+                        "audio player"
+                    );
+                    peak = 0.0;
                 }
             }
         });

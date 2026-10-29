@@ -14,3 +14,7 @@ debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# Its CELT band mask shifts a u8 past its width; harmless when it wraps, a panic when checked.
+[profile.dev.package.opus-decoder]
+overflow-checks = false

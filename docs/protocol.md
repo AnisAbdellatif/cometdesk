@@ -103,17 +103,16 @@ Device in `video_mode = webrtc`, Mac and Comet on a tailnet (direct path, ~25 ms
   frames, same loss) but the connection survives longer.
 - Consequence: Pion/Janus work only on a clean link (LAN) until FlexFEC-03 is decoded or the
   server honors NACK. Over Tailscale use Direct (TCP): 1.0 s to first keyframe, 60 fps.
-- **Audio** (`speaker: true`, video false, own connection, as the web app does it): the server
-  answers Opus 48k/2 sendonly and ICE and DTLS connect, but **zero media bytes arrive**
-  (`bytes_rx = 0`; only STUN/RTCP trickles in), with or without `client-ice-complete` and the
-  video-only config fields. Tried with a client that was told sound was playing; whether the
-  Comet captures HDMI audio at all is not known yet (`/api/info` and `system/capability` list
-  no audio field; `get_param` lists `mic_name`, the device's USB microphone).
-  The web app picks the audio transport by `video_mode`, like video: **Janus** in `webrtc`
-  (our device), Pion in `flex_fec`; none in Direct. Janus audio is a second handle with
-  `watch {audio: true, video: false, mic: false, camera: false}` (after a `features` request),
-  the offer is answered recvonly. It also reaches `status: started`, `webrtcup`, ICE and DTLS,
-  and **also delivers zero RTP** (2026-10-29, web-app audio toggle on at the time).
+- **Audio** (own connection, as the web app does it): works on **both** Pion
+  (`speaker: true`, video false; base64 SDPs, `client-ice-complete`) and Janus (second handle,
+  `watch {audio: true, video: false, mic: false, camera: false}`). Opus 48k/2, ~50 packets/s,
+  ~130 kbps, decodes cleanly, ~25 ms RTT. Earlier runs got zero RTP (`bytes_rx = 0`) while the
+  target was apparently silent; it started delivering once sound was playing and the web app's
+  audio toggle had been turned on. Which of the two mattered is unknown (the toggle is client
+  state in the web app, so most likely the target was silent). The web app picks the audio
+  transport by `video_mode`: Janus in `webrtc`, Pion in `flex_fec`, none in Direct.
+- `opus-decoder` 0.1.1 can panic on some packets (`celt/vq.rs`: `1 << i` on a `u8` with more
+  than 8 blocks), only with overflow checks on. The player catches it and recreates the decoder.
 
 ## U8 (partial)
 

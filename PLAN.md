@@ -211,12 +211,13 @@ but **plain RTP without FlexFEC is not usable on a lossy path**: gl-pion sends u
 loses part of each, and never answers NACK or PLI. So the spike's answer is "accepts it, but only
 good on a clean LAN". Next for remote: a FlexFEC-03 decoder (str0m has none, so we would receive
 raw RTP ourselves), or Direct over the VPN, which works (60 fps, 1.0 s to first frame). M7 not run.
-Audio (Pion only): `pion::start_audio` opens a second, audio-only connection (`speaker: true`,
+Audio: `pion::start_audio` or `janus::start_audio` opens a second, audio-only connection (`speaker: true`,
 Opus recv-only); `audio::Player` decodes with the pure-Rust `opus-decoder` (no libopus/cmake)
 and plays through `cpal` with a 40 ms prebuffer and a 150 ms latency cap. CLI: `view --transport
 pion --audio`; GUI: Video menu → "Play audio". Unit-tested for the decoder glue and buffer
-behavior; on the device the audio connection reaches ICE/DTLS but no packets arrived while the
-target was presumably silent (unconfirmed with sound).
+behavior. On the device (2026-10-29) both Pion and Janus audio deliver Opus once the target
+plays sound, and decode and reach the output callback; the source follows the device's video
+mode (`audio::start`).
 
 ### 2.4 Decode
 
