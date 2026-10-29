@@ -19,8 +19,8 @@ use glkvm::api::bridge::BRIDGE_WS;
 use glkvm::client::WsStream;
 use glkvm::events::HidSender;
 use glkvm_clip::{
-    Content, Dedup, Endpoint, Error, Event, Hello, InsertReply, PasteKey, PastePref, Policy, Role,
-    Secret,
+    Content, Dedup, Endpoint, Error, Event, Hello, Info, InsertReply, PasteKey, PastePref, Policy,
+    Role, Secret,
 };
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -40,9 +40,19 @@ const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(15);
 const RETRY_SLOW: Duration = Duration::from_secs(30);
 const INSERT_TIMEOUT: Duration = Duration::from_secs(5);
+/// A 4K screenshot is several MB through the relay.
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Outcome of an insert: a short description, or why it failed.
 pub type InsertResult = Result<String, String>;
+
+/// PNG bytes of the target's screen, or why there are none.
+pub type CaptureResult = Result<Vec<u8>, String>;
+
+struct CaptureRequest {
+    display: Option<u32>,
+    reply: oneshot::Sender<CaptureResult>,
+}
 
 struct InsertRequest {
     text: String,
@@ -62,6 +72,7 @@ fn paste_keys(key: PasteKey) -> &'static [&'static str] {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum BridgeState {
     Connecting,
     /// The relay is not installed on this device (`bridge/install.sh`).
@@ -72,7 +83,8 @@ pub enum BridgeState {
     Mismatch,
     /// The agent speaks another protocol version: set up the target again.
     AgentOutdated(u16),
-    Connected(Hello),
+    /// The agent's hello, and what it last told us about the target.
+    Connected(Hello, Info),
     Error(String),
 }
 
@@ -86,7 +98,7 @@ impl BridgeState {
             BridgeState::AgentOutdated(_) => {
                 "the agent on the target is outdated: set up the target again".into()
             }
-            BridgeState::Connected(h) => format!("connected to {} ({})", h.name, h.os),
+            BridgeState::Connected(h, _) => format!("connected to {} ({})", h.name, h.os),
             BridgeState::Error(e) => format!("error: {e}"),
         }
     }
@@ -116,6 +128,7 @@ pub struct ClipBridge {
     state: watch::Receiver<BridgeState>,
     settings: watch::Sender<Settings>,
     inserts: mpsc::UnboundedSender<InsertRequest>,
+    captures: mpsc::UnboundedSender<CaptureRequest>,
     task: JoinHandle<()>,
 }
 
@@ -131,11 +144,13 @@ impl ClipBridge {
         let (state_tx, state) = watch::channel(BridgeState::Connecting);
         let (settings, settings_rx) = watch::channel(settings);
         let (inserts, inserts_rx) = mpsc::unbounded_channel();
+        let (captures, captures_rx) = mpsc::unbounded_channel();
         let task = rt.spawn(supervise(
             session,
             secret,
             settings_rx,
             inserts_rx,
+            captures_rx,
             state_tx,
             wake,
         ));
@@ -143,6 +158,7 @@ impl ClipBridge {
             state,
             settings,
             inserts,
+            captures,
             task,
         }
     }
@@ -161,7 +177,15 @@ impl ClipBridge {
 
     /// Whether text can be inserted through the agent right now.
     pub fn can_insert(&self) -> bool {
-        matches!(*self.state.borrow(), BridgeState::Connected(_))
+        matches!(*self.state.borrow(), BridgeState::Connected(..))
+    }
+
+    /// Asks the agent for a pixel-exact screenshot (PNG). `display` indexes the agent's
+    /// reported displays; `None` takes all of them.
+    pub fn capture(&self, display: Option<u32>) -> oneshot::Receiver<CaptureResult> {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.captures.send(CaptureRequest { display, reply });
+        rx
     }
 
     /// Inserts `text` at the target's focus through the agent. The receiver gets the
@@ -202,6 +226,7 @@ async fn supervise(
     secret: Secret,
     mut settings: watch::Receiver<Settings>,
     mut inserts: mpsc::UnboundedReceiver<InsertRequest>,
+    mut captures: mpsc::UnboundedReceiver<CaptureRequest>,
     state: watch::Sender<BridgeState>,
     wake: impl Fn() + Send + Sync + 'static,
 ) {
@@ -229,6 +254,7 @@ async fn supervise(
                         &secret,
                         &mut settings,
                         &mut inserts,
+                        &mut captures,
                         &mut local,
                         &set,
                         &wake,
@@ -282,6 +308,7 @@ async fn run(
     secret: &Secret,
     settings: &mut watch::Receiver<Settings>,
     inserts: &mut mpsc::UnboundedReceiver<InsertRequest>,
+    captures: &mut mpsc::UnboundedReceiver<CaptureRequest>,
     local: &mut LocalClipboard,
     set: &impl Fn(BridgeState),
     wake: &(impl Fn() + Send + Sync),
@@ -298,6 +325,7 @@ async fn run(
     // Inserts waiting for the agent's reply: id -> (reply, keyboard, asked at).
     let mut pending: HashMap<u32, (oneshot::Sender<InsertResult>, HidSender, Instant)> =
         HashMap::new();
+    let mut captured: HashMap<u32, (oneshot::Sender<CaptureResult>, Instant)> = HashMap::new();
     let mut poll = interval(POLL);
     let mut ping = interval(PING);
     let mut status = interval(STATUS_EVERY);
@@ -331,7 +359,7 @@ async fn run(
                     match ev {
                         Event::Ready(peer) => {
                             tracing::info!(agent = %peer.name, os = %peer.os, "clipboard bridge connected");
-                            set(BridgeState::Connected(peer));
+                            set(BridgeState::Connected(peer, Info::default()));
                             if let Err(e) = ep.set_policy(settings.borrow().policy()) {
                                 return End::Lost(e.to_string(), true);
                             }
@@ -360,7 +388,28 @@ async fn run(
                             let _ = tx.send(outcome);
                             wake();
                         }
-                        Event::Policy(_) | Event::Insert { .. } | Event::InsertPasted { .. } => {}
+                        Event::Info(info) => {
+                            tracing::info!(?info, "target info");
+                            if let Some(peer) = ep.peer() {
+                                set(BridgeState::Connected(peer.clone(), info));
+                            }
+                        }
+                        Event::Screenshot { id, png } => {
+                            if let Some((tx, _)) = captured.remove(&id) {
+                                let _ = tx.send(Ok(png));
+                                wake();
+                            }
+                        }
+                        Event::CaptureFailed { id, reason } => {
+                            if let Some((tx, _)) = captured.remove(&id) {
+                                let _ = tx.send(Err(reason));
+                                wake();
+                            }
+                        }
+                        Event::Policy(_)
+                        | Event::Insert { .. }
+                        | Event::InsertPasted { .. }
+                        | Event::Capture { .. } => {}
                     }
                 }
             }
@@ -378,7 +427,22 @@ async fn run(
                     }
                 }
             }
+            Some(req) = captures.recv() => {
+                if !up {
+                    let _ = req.reply.send(Err("the agent is not connected".into()));
+                    continue;
+                }
+                match ep.send_capture(req.display) {
+                    Ok(id) => {
+                        captured.insert(id, (req.reply, Instant::now()));
+                    }
+                    Err(e) => {
+                        let _ = req.reply.send(Err(e.to_string()));
+                    }
+                }
+            }
             _ = poll.tick() => {
+                captured.retain(|_, (_, at)| at.elapsed() <= CAPTURE_TIMEOUT);
                 let expired: Vec<u32> = pending
                     .iter()
                     .filter(|(_, (_, _, at))| at.elapsed() > INSERT_TIMEOUT)

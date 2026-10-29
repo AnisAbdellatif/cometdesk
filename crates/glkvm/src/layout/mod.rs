@@ -57,6 +57,90 @@ pub fn names() -> Vec<&'static str> {
     v
 }
 
+/// The device keymap for a layout the target reports, tagged by source: `xkb:de+nodeadkeys`,
+/// `win:0407` (the language id of the active keyboard layout, hex), `mac:<input source>`.
+/// Only layouts we have tables for. Variants (Dvorak, dead keys) are not told apart.
+pub fn keymap_from_native(id: &str) -> Option<&'static str> {
+    let (kind, v) = id.split_once(':')?;
+    let name = match kind {
+        "xkb" => {
+            let (code, variant) = v.split_once('+').unwrap_or((v, ""));
+            match (code, variant) {
+                ("ch", "fr") => "fr-ch",
+                ("ch", _) => "de-ch",
+                ("de" | "at", _) => "de",
+                ("us", _) => "en-us",
+                ("gb", _) => "en-gb",
+                ("be", _) => "fr-be",
+                ("ca", _) => "fr-ca",
+                ("br", _) => "pt-br",
+                ("dk", _) => "da",
+                ("se", _) => "sv",
+                ("ee", _) => "et",
+                ("si", _) => "sl",
+                (c, _) => c,
+            }
+        }
+        "win" => match u16::from_str_radix(v, 16).ok()? {
+            0x0409 => "en-us",
+            0x0809 => "en-gb",
+            0x0407 | 0x0c07 => "de",
+            0x0807 => "de-ch",
+            0x040c => "fr",
+            0x080c => "fr-be",
+            0x100c => "fr-ch",
+            0x0c0c => "fr-ca",
+            0x040a | 0x0c0a => "es",
+            0x0410 => "it",
+            0x0816 => "pt",
+            0x0416 => "pt-br",
+            0x0413 => "nl",
+            0x0406 => "da",
+            0x0414 | 0x0814 => "no",
+            0x041d => "sv",
+            0x040b => "fi",
+            0x0415 => "pl",
+            0x0405 => "cz",
+            0x040e => "hu",
+            0x041f => "tr",
+            0x0419 => "ru",
+            0x040f => "is",
+            0x0425 => "et",
+            0x0424 => "sl",
+            0x0427 => "lt",
+            0x0426 => "lv",
+            _ => return None,
+        },
+        "mac" => match v.strip_prefix("com.apple.keylayout.")? {
+            "US" | "ABC" => "en-us",
+            "British" => "en-gb",
+            "German" => "de",
+            "SwissGerman" => "de-ch",
+            "French" => "fr",
+            "Spanish" => "es",
+            "Italian" => "it",
+            "Portuguese" => "pt",
+            "Brazilian" => "pt-br",
+            "Dutch" => "nl",
+            "Danish" => "da",
+            "Norwegian" => "no",
+            "Swedish" => "sv",
+            "Finnish" => "fi",
+            "Polish" => "pl",
+            "Czech" => "cz",
+            "Hungarian" => "hu",
+            "Turkish" => "tr",
+            "Russian" => "ru",
+            _ => return None,
+        },
+        _ => return None,
+    };
+    data::LAYOUTS
+        .iter()
+        .map(|(n, _, _)| *n)
+        .find(|n| *n == name)
+}
+
 /// Key presses for one character, or `None` if the layout cannot produce it.
 pub type Keys = Vec<HidCommand>;
 
@@ -225,5 +309,21 @@ mod tests {
             }
         }
         assert!(names().contains(&"de"));
+    }
+}
+
+#[cfg(test)]
+mod native_tests {
+    use super::keymap_from_native as k;
+
+    #[test]
+    fn maps_native_ids() {
+        assert_eq!(k("xkb:de+nodeadkeys"), Some("de"));
+        assert_eq!(k("xkb:ch+fr"), Some("fr-ch"));
+        assert_eq!(k("xkb:us"), Some("en-us"));
+        assert_eq!(k("win:0807"), Some("de-ch"));
+        assert_eq!(k("mac:com.apple.keylayout.German"), Some("de"));
+        assert_eq!(k("xkb:jp"), None);
+        assert_eq!(k("nonsense"), None);
     }
 }

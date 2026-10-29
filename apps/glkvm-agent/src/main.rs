@@ -15,8 +15,10 @@
 //! Normally installed by the installer the Comet serves on the USB link (bridge/target/),
 //! which glkvm-gui types on the target for you. Only one instance runs per user.
 
+mod capture;
 mod clipboard;
 mod config;
+mod info;
 mod insert;
 
 use std::io::{ErrorKind, Read, Write};
@@ -241,6 +243,7 @@ fn session(
         agent_may_send: false,
     };
     let mut last_rx = Instant::now();
+    let mut probe = info::Probe::new();
     let mut buf = vec![0u8; 64 * 1024];
     // Changes seen before the session was up are not sent: only what changes while connected.
     while local_rx.try_recv().is_ok() {}
@@ -283,7 +286,23 @@ fn session(
                                 .send(ClipCommand::RestoreSoon)
                                 .map_err(|_| SessionEnd::ClipboardGone)?;
                         }
-                        Event::InsertReply { .. } => {}
+                        Event::Capture { id, display } => {
+                            let sent = match capture::screenshot(display) {
+                                Ok(png) => {
+                                    log!("screenshot for the GUI: {} bytes", png.len());
+                                    ep.send_screenshot(id, &png)
+                                }
+                                Err(reason) => {
+                                    log!("screenshot failed: {reason}");
+                                    ep.send_capture_failed(id, reason)
+                                }
+                            };
+                            sent.map_err(|e| SessionEnd::Lost(e.to_string(), true))?;
+                        }
+                        Event::InsertReply { .. }
+                        | Event::Info(_)
+                        | Event::Screenshot { .. }
+                        | Event::CaptureFailed { .. } => {}
                         Event::Clip(content) => {
                             log!("received {content:?}");
                             cmd_tx
@@ -311,6 +330,13 @@ fn session(
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => return Err(SessionEnd::ClipboardGone),
             }
+        }
+        if ep.is_ready()
+            && let Some(i) = probe.changed()
+        {
+            log!("target info: {i:?}");
+            ep.send_info(&i)
+                .map_err(|e| lost(std::io::Error::other(e), true))?;
         }
         if ep.has_outgoing() {
             stream

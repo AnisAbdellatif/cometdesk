@@ -17,8 +17,8 @@ use glkvm::api::system::VideoMode;
 use glkvm::events::{ConnState, DeviceState, EventOptions, EventSession, HidSender};
 use glkvm::hid::{HidCommand, MouseButton};
 use glkvm::{Session, SystemConfig};
-use glkvm_clip::PastePref;
-use glkvm_media::direct::{MediaSession, SourceState};
+use glkvm_clip::{Hello, Info, PastePref, SessionState};
+use glkvm_media::direct::{self, DirectOptions, MediaSession, SourceState};
 use glkvm_media::{SourceOptions, Transport};
 use glkvm_view::pipeline::FramePipeline;
 use glkvm_view::{InputMapper, Rect, ScrollOptions, letterbox_in};
@@ -146,6 +146,13 @@ pub struct Console {
     transport: Transport,
     video_info: VideoInfo,
     video_info_rx: Option<tokio::sync::oneshot::Receiver<VideoInfo>>,
+    /// Last keyboard layout from the agent we applied; a new report is applied again.
+    adopted_keyboard: Option<String>,
+    /// Last uptime the agent reported and when, to show a running value between reports.
+    uptime_seen: Option<(u64, Instant)>,
+    /// What the agent last said about the session, to announce changes.
+    last_session: Option<SessionState>,
+    agent_was_up: bool,
 }
 
 impl Console {
@@ -198,6 +205,10 @@ impl Console {
             transport: Transport::default(),
             video_info: VideoInfo::default(),
             video_info_rx: None,
+            adopted_keyboard: None,
+            uptime_seen: None,
+            last_session: None,
+            agent_was_up: false,
         };
         console.transport = std::env::var("GLKVM_TRANSPORT")
             .ok()
@@ -258,9 +269,16 @@ impl Console {
 
     /// The agent reports the target's real OS: correct a wrong (e.g. default) setting.
     fn adopt_agent_os(&mut self) {
-        let Some(BridgeState::Connected(hello)) = self.clip.as_ref().map(ClipBridge::state) else {
+        let Some((hello, info)) = self.agent() else {
+            if std::mem::take(&mut self.agent_was_up) {
+                self.last_session = None;
+                self.notify("Agent disconnected: the target slept, restarted or logged out".into());
+            }
             return;
         };
+        self.agent_was_up = true;
+        self.track_agent_info(&info);
+        self.adopt_agent_keymap(info.keyboard.as_deref());
         let reported = match hello.os.as_str() {
             "linux" => TargetOs::Linux,
             "windows" => TargetOs::Windows,
@@ -273,6 +291,50 @@ impl Console {
                 "Target set to {} (reported by the agent)",
                 reported.label()
             ));
+        }
+    }
+
+    /// The agent's hello and latest report, while it is connected.
+    fn agent(&self) -> Option<(Hello, Info)> {
+        match self.clip.as_ref()?.state() {
+            BridgeState::Connected(h, i) => Some((h, i)),
+            _ => None,
+        }
+    }
+
+    fn track_agent_info(&mut self, info: &Info) {
+        if let Some(up) = info.uptime_secs
+            && self.uptime_seen.is_none_or(|(u, _)| u != up)
+        {
+            self.uptime_seen = Some((up, Instant::now()));
+        }
+        let before = self.last_session.replace(info.session);
+        match (before, info.session) {
+            (_, SessionState::Locked) if before != Some(SessionState::Locked) => {
+                self.notify("Target is locked: typed text goes to the lock screen".into());
+            }
+            (Some(SessionState::Locked), SessionState::Active) => {
+                self.notify("Target unlocked".into());
+            }
+            _ => {}
+        }
+    }
+
+    /// The agent reports the target's active keyboard layout: use it for typing, once per
+    /// change, so a manual choice sticks until the target's layout changes.
+    fn adopt_agent_keymap(&mut self, reported: Option<&str>) {
+        let Some(reported) = reported else { return };
+        if self.adopted_keyboard.as_deref() == Some(reported) {
+            return;
+        }
+        self.adopted_keyboard = Some(reported.to_owned());
+        let Some(map) = glkvm::layout::keymap_from_native(reported) else {
+            return;
+        };
+        if self.keymap().as_deref() != Some(map) && self.keymaps.iter().any(|k| k == map) {
+            self.device.keymap = Some(map.to_owned());
+            self.target_changed = true;
+            self.notify(format!("Layout set to {map} (reported by the agent)"));
         }
     }
 
@@ -300,7 +362,7 @@ impl Console {
             Some(_) if needs_device => "Clipboard: needs repair".into(),
             None => "Clipboard: off".into(),
             Some(_) if self.clip_paused => "Clipboard: paused".into(),
-            Some(BridgeState::Connected(_)) => "Clipboard: synced".into(),
+            Some(BridgeState::Connected(..)) => "Clipboard: synced".into(),
             Some(_) => "Clipboard: not connected".into(),
         };
         ui.menu_button(label, |ui| {
@@ -406,7 +468,7 @@ impl Console {
         let agent = agent_name(os);
         let missing_agent = agent.is_some_and(|a| !self.setup.has_agent(a));
         let state = self.clip.as_ref().map(ClipBridge::state);
-        let connected = matches!(state, Some(BridgeState::Connected(_)));
+        let connected = matches!(state, Some(BridgeState::Connected(..)));
         let mut close = false;
         egui::Modal::new(egui::Id::unique("target-setup")).show(ctx, |ui| {
             ui.set_max_width(560.0);
@@ -1016,28 +1078,204 @@ impl Console {
         }
     }
 
+    /// `~/Downloads/glkvm-<host>-<time>.<ext>`.
+    fn download_path(&self, ext: &str) -> std::path::PathBuf {
+        let dir = std::env::var_os("HOME")
+            .map(|h| std::path::PathBuf::from(h).join("Downloads"))
+            .unwrap_or_else(std::env::temp_dir);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        dir.join(format!(
+            "glkvm-{}-{stamp}.{ext}",
+            self.device.host.replace(':', "_")
+        ))
+    }
+
+    fn save_notice(what: &str, path: &std::path::Path, bytes: &[u8]) -> String {
+        match std::fs::write(path, bytes) {
+            Ok(()) => format!("{what} saved to {}", path.display()),
+            Err(e) => format!("Cannot save {what}: {e}"),
+        }
+    }
+
+    /// The device's snapshot (JPEG of the capture, before H.264).
     pub fn snapshot(&mut self) {
         let session = self.session.clone();
         let proxy = self.proxy.clone();
-        let host = self.device.host.replace(':', "_");
+        let path = self.download_path("jpg");
         self.rt.spawn(async move {
             let msg = match session.snapshot(SnapshotOptions::default()).await {
-                Ok(jpeg) => {
-                    let dir = std::env::var_os("HOME")
-                        .map(|h| std::path::PathBuf::from(h).join("Downloads"))
-                        .unwrap_or_else(std::env::temp_dir);
-                    let stamp = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |d| d.as_secs());
-                    let path = dir.join(format!("glkvm-{host}-{stamp}.jpg"));
-                    match std::fs::write(&path, &jpeg) {
-                        Ok(()) => format!("Snapshot saved to {}", path.display()),
-                        Err(e) => format!("Cannot save snapshot: {e}"),
-                    }
-                }
+                Ok(jpeg) => Self::save_notice("Snapshot", &path, &jpeg),
                 Err(e) => format!("Snapshot failed: {e}"),
             };
             let _ = proxy.send_event(UserEvent::Notice(msg));
+        });
+    }
+
+    /// A pixel-exact screenshot of the target's desktop (all monitors), taken by the agent.
+    pub fn exact_screenshot(&mut self) {
+        let Some(rx) = self.agent_capture(None) else {
+            return;
+        };
+        let proxy = self.proxy.clone();
+        let path = self.download_path("png");
+        self.rt.spawn(async move {
+            let msg = match rx.await {
+                Ok(Ok(png)) => Self::save_notice("Screenshot", &path, &png),
+                Ok(Err(e)) => format!("Screenshot failed: {e}"),
+                Err(_) => "Screenshot failed: the agent did not answer".into(),
+            };
+            let _ = proxy.send_event(UserEvent::Notice(msg));
+        });
+    }
+
+    fn agent_capture(
+        &mut self,
+        display: Option<u32>,
+    ) -> Option<tokio::sync::oneshot::Receiver<crate::clipsync::CaptureResult>> {
+        let rx = self
+            .clip
+            .as_ref()
+            .filter(|c| c.can_insert())
+            .map(|c| c.capture(display));
+        if rx.is_none() {
+            self.notify("No agent connected on the target".into());
+        }
+        rx
+    }
+
+    /// Recognizes the text on the target's screen and copies it. From the agent's exact
+    /// screenshot of the main monitor when it is connected and the session is unlocked,
+    /// else from the device snapshot.
+    pub fn copy_screen_text(&mut self) {
+        let primary = self.agent().and_then(|(_, i)| {
+            (i.session != SessionState::Locked)
+                .then(|| i.displays.iter().position(|d| d.primary).unwrap_or(0) as u32)
+        });
+        let exact = primary.and_then(|d| self.clip.as_ref().map(|c| c.capture(Some(d))));
+        let session = self.session.clone();
+        let proxy = self.proxy.clone();
+        self.rt.spawn(async move {
+            let from_device = || async {
+                session
+                    .snapshot(SnapshotOptions::default())
+                    .await
+                    .map(|b| b.to_vec())
+                    .map_err(|e| format!("Snapshot failed: {e}"))
+            };
+            let image = match exact {
+                Some(rx) => match rx.await {
+                    Ok(Ok(png)) => Ok(png),
+                    _ => from_device().await,
+                },
+                None => from_device().await,
+            };
+            let msg = match image {
+                Err(e) => e,
+                Ok(img) => match tokio::task::spawn_blocking(move || crate::ocr::recognize(&img))
+                    .await
+                {
+                    Ok(Ok(text)) if text.trim().is_empty() => "No text found on the screen".into(),
+                    Ok(Ok(text)) => {
+                        let n = text.chars().count();
+                        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
+                            Ok(()) => format!("Copied {n} characters of screen text"),
+                            Err(e) => format!("Cannot copy: {e}"),
+                        }
+                    }
+                    Ok(Err(e)) => format!("Text recognition failed: {e}"),
+                    Err(e) => format!("Text recognition failed: {e}"),
+                },
+            };
+            let _ = proxy.send_event(UserEvent::Notice(msg));
+        });
+    }
+
+    /// What the agent reports, as a menu: for checking at a glance that the target is what
+    /// the app assumes.
+    fn info_menu(&mut self, ui: &mut egui::Ui) {
+        let Some((hello, info)) = self.agent() else {
+            return;
+        };
+        let up = match (info.uptime_secs, self.uptime_seen) {
+            (Some(u), Some((seen, at))) if seen == u => Some(u + at.elapsed().as_secs()),
+            (u, _) => u,
+        };
+        let title = match info.session {
+            SessionState::Locked => "Target: locked",
+            _ => "Target info",
+        };
+        ui.menu_button(title, |ui| {
+            let layouts: Vec<&str> = info
+                .layouts
+                .iter()
+                .filter_map(|l| glkvm::layout::keymap_from_native(l))
+                .collect();
+            let mut rows: Vec<(&str, String)> = vec![
+                ("Host", hello.name.clone()),
+                ("OS", info.os_version.clone().unwrap_or(hello.os.clone())),
+                ("User", info.user.clone().unwrap_or_default()),
+                (
+                    "Session",
+                    match info.session {
+                        SessionState::Locked => "locked (lock screen)".into(),
+                        SessionState::Active => "active".into(),
+                        SessionState::Unknown => "unknown".into(),
+                    },
+                ),
+                ("Keyboard", info.keyboard.clone().unwrap_or_default()),
+                ("Layouts", layouts.join(", ")),
+            ];
+            rows.push((
+                "Input method",
+                match info.ime {
+                    Some(true) => "on (typing key by key may be composed)".into(),
+                    Some(false) => "off".into(),
+                    None => String::new(),
+                },
+            ));
+            if let Some(f) = &info.focus {
+                rows.push((
+                    "Focus",
+                    format!("{}{}", f.app, if f.terminal { " (terminal)" } else { "" }),
+                ));
+            }
+            for (i, d) in info.displays.iter().enumerate() {
+                rows.push((
+                    "Display",
+                    format!(
+                        "{}: {}x{} at {},{} · {}%{}",
+                        i + 1,
+                        d.width,
+                        d.height,
+                        d.x,
+                        d.y,
+                        d.scale,
+                        if d.primary { " · main" } else { "" }
+                    ),
+                ));
+            }
+            if let Some(u) = up {
+                rows.push(("Uptime", format!("{}h {:02}m", u / 3600, u / 60 % 60)));
+            }
+            if let Some(b) = info.battery {
+                rows.push((
+                    "Battery",
+                    format!(
+                        "{}%{}",
+                        b.percent,
+                        if b.charging { " (charging)" } else { "" }
+                    ),
+                ));
+            }
+            egui::Grid::new("agent_info").num_columns(2).show(ui, |ui| {
+                for (k, v) in rows.iter().filter(|(_, v)| !v.is_empty()) {
+                    ui.label(*k);
+                    ui.label(v);
+                    ui.end_row();
+                }
+            });
         });
     }
 
@@ -1228,13 +1466,37 @@ impl Console {
         if self.clip_menu(ui) != ConsoleAction::None {
             action = ConsoleAction::TargetChanged;
         }
-        if ui
-            .button("Snapshot")
-            .on_hover_text("Saved to ~/Downloads")
-            .clicked()
-        {
-            self.snapshot();
-        }
+        let agent_up = self.inserts_via_agent();
+        ui.menu_button("Snapshot", |ui| {
+            if ui
+                .button("Save device snapshot")
+                .on_hover_text("JPEG from the KVM capture, saved to ~/Downloads")
+                .clicked()
+            {
+                self.snapshot();
+                ui.close();
+            }
+            if ui
+                .add_enabled(agent_up, egui::Button::new("Save exact screenshot"))
+                .on_hover_text("Pixel-exact, taken by the agent on the target (all monitors)")
+                .on_disabled_hover_text("Needs the agent connected on the target")
+                .clicked()
+            {
+                self.exact_screenshot();
+                ui.close();
+            }
+            if ui
+                .button("Copy screen text (OCR)")
+                .on_hover_text(
+                    "Recognized on this Mac; from the agent's exact screenshot when available",
+                )
+                .clicked()
+            {
+                self.copy_screen_text();
+                ui.close();
+            }
+        });
+        self.info_menu(ui);
         if self.caps.supports(Feature::Atx) {
             ui.menu_button("Power", |ui| {
                 let items = [
@@ -1267,12 +1529,26 @@ impl Console {
             action = ConsoleAction::TargetChanged;
         }
         let current = self.keymap().unwrap_or_else(|| "default".into());
+        let on_target: Vec<&'static str> = self
+            .agent()
+            .map(|(_, i)| {
+                i.layouts
+                    .iter()
+                    .filter_map(|l| glkvm::layout::keymap_from_native(l))
+                    .collect()
+            })
+            .unwrap_or_default();
         let before = self.device.keymap.clone();
         egui::ComboBox::from_id_salt("keymap")
             .selected_text(format!("Layout: {current}"))
             .show_ui(ui, |ui| {
                 for k in &self.keymaps {
-                    ui.selectable_value(&mut self.device.keymap, Some(k.clone()), k.as_str());
+                    let label = if on_target.contains(&k.as_str()) {
+                        format!("{k} (on target)")
+                    } else {
+                        k.clone()
+                    };
+                    ui.selectable_value(&mut self.device.keymap, Some(k.clone()), label);
                 }
             })
             .response
