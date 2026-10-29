@@ -249,8 +249,7 @@ Windows tables serve Linux too; BIOS always gets US. Characters the layout can't
 skipped and reported. Keymaps we have no table for fall back to `hid/print`.
 
 ### Telemetry, session actions, files, notifications (protocol v7, 2026-10-29)
-All carried by the same Noise session; `PROTOCOL` is 7, so the agent must be rebuilt and
-reinstalled with the GUI.
+All carried by the same Noise session; `PROTOCOL` was 7 here (now 8, below).
 
 - **Telemetry**: `Info.load` (CPU %, memory, system drive). Not part of `same_as`; the agent
   resends `Info` every 10 s. macOS targets report disk only. The "Target" menu title shows
@@ -276,6 +275,46 @@ reinstalled with the GUI.
   burst of 5, one more per 2 s); the agent also notifies at 15 % battery when unplugged. The
   GUI shows a toast while focused and a macOS notification (via `osascript`, texts passed as
   arguments) otherwise.
+
+### Volume, displays, file browser, agent updates (protocol v8, 2026-10-29)
+`PROTOCOL` is 8; `Hello` gained `arch`, so an older agent's hello no longer decodes and shows
+as "outdated" (`Error::Version(0)`). Reinstall the agent once; later updates are automatic.
+
+- **Folders in clipboard files**: copied folders go as their files, named `folder/sub/file`
+  (`cometdesk_clip::expand`, links not followed, depth 16). The receiver sanitizes every
+  component, stages the files of one folder together and puts the folder itself on the
+  clipboard. Limits: 512 files, 64 MiB in total. Empty folders are lost.
+- **Volume**: `Info.volume` (percent, muted) and `SetVolume{id, level, mute}` → `Ack`.
+  Linux `pactl`, else `wpctl`, else `amixer`; Windows `IAudioEndpointVolume` (default render
+  endpoint); macOS `osascript`. Target menu: slider (sent on release) and Mute.
+- **Displays**: `Display.modes` (resolutions the display accepts) and `SetDisplay{id, display,
+  mode, primary}` → `Ack`. Linux `xrandr --output … --mode/--primary` (X11 and XWayland);
+  Windows `ChangeDisplaySettingsExW` (a new primary moves the others by its position); not
+  on macOS. After changing, "Match the EDID" offers the Comet's EDID preset whose label names
+  the new resolution (`1920x1080`, `1080p`), so the target keeps offering that mode.
+- **File browser / download**: `ListDir{id, target}` → `DirList{id, Ok(Listing) | Err}`
+  (`DirTarget`: home, roots, a path, a child, the parent; cut to one message, `truncated` says
+  so) and `Fetch{id, dir, name}` → `Ack`, after which the agent streams the file as a
+  `FileOffer` with `Purpose::Save`, which the GUI saves to Downloads (it accepts such an offer
+  only for a fetch it asked for). The "Files" button opens the window. The agent shows what
+  the user it runs as can read; the paired GUI is that user's own machine.
+- **Agent update**: `Purpose::Update` streams a new agent program (up to 256 MiB) to the
+  agent, which stages it, runs it with `--version`, swaps it in (Unix: rename over the
+  program; Windows: the running one is renamed to `.old`), answers `FileResult` and restarts
+  itself (`COMETDESK_AGENT_RESTARTED` makes the successor wait for the instance port). The
+  GUI sends the program from `agents/` (`setup::agent_binary`, by the hello's `os` and `arch`)
+  when the agent's protocol is older, or the same with an older `version`: **bump the crate
+  version to roll out a change**. One attempt per agent version per run of the GUI.
+  When the protocols differ and both are ≥ 8 (`UPDATE_PROTOCOL`) the session is *limited*:
+  `Event::Mismatch`, and only `Purpose::Update` transfers and pings are served, so a newer
+  GUI can still update an older agent across a protocol bump. For that to keep working,
+  never reorder `Msg` (append only) and keep `Hello` as it is. Anyone paired can replace the
+  agent program this way: the pairing code is the trust.
+- **Reboot notice**: an `Info` whose `uptime_secs` is lower than the previous one raises a
+  "Target restarted" notification (sleep does not reset it).
+- **macOS agent** (development targets): layouts listed and switched through the Text Input
+  Sources API; CPU (`ps`), memory (`vm_stat`), uptime (`kern.boottime`) and battery
+  (`pmset`).
 
 ### Fallback for macOS targets / no network: FunctionFS
 

@@ -2,6 +2,7 @@
 
 mod actions;
 mod app;
+mod browser;
 mod clipsync;
 mod console;
 mod crop;

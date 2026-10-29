@@ -27,10 +27,15 @@ use sha2::{Digest, Sha256};
 pub use content::{Content, ContentKey, Dedup, encode_png};
 pub use pairing::Secret;
 pub use receive::FileReceiver;
-pub use send::{FileSender, Pump};
+pub use send::{FileSender, Pump, expand};
 
 /// Bumped on incompatible protocol changes; both ends refuse a different major.
-pub const PROTOCOL: u16 = 7;
+pub const PROTOCOL: u16 = 8;
+/// From this protocol on, a peer of another version can still be sent a new agent: the
+/// session is *limited* to file transfers for [`Purpose::Update`]. Keep the first messages
+/// (`Hello`, `Ping`, `Pong`) and the file messages where they are in [`Msg`], and only ever
+/// append variants, so an older agent can still decode what such a session needs.
+pub const UPDATE_PROTOCOL: u16 = 8;
 /// Longest text for one [`Endpoint::send_insert`] (one Noise message).
 pub const MAX_INSERT: usize = 60 * 1024;
 /// Largest clipboard item (encoded: UTF-8 text or PNG).
@@ -42,7 +47,11 @@ pub const FILE_CHUNK: usize = 60 * 1024;
 /// Copied files travel on their own, so each one and the whole batch stay small enough to
 /// send without asking; larger ones go through "Send file".
 pub const MAX_CLIP_FILES_BYTES: u64 = 64 * 1024 * 1024;
-pub const MAX_CLIP_FILES: usize = 64;
+pub const MAX_CLIP_FILES: usize = 512;
+/// Largest agent program for [`Purpose::Update`].
+pub const MAX_UPDATE: u64 = 256 * 1024 * 1024;
+/// A directory listing is cut to what fits one message.
+const MAX_LISTING_BYTES: usize = 56 * 1024;
 /// Notification text the agent forwards is cut to this many characters.
 pub const MAX_NOTIFY_TITLE: usize = 100;
 pub const MAX_NOTIFY_BODY: usize = 500;
@@ -54,6 +63,8 @@ pub enum Purpose {
     Save,
     /// Stage it, and put it on the clipboard with the rest of its batch on `FilesReady`.
     Clipboard,
+    /// A new agent program (GUI → agent): replace the running one and restart.
+    Update,
 }
 
 const NOISE_PARAMS: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
@@ -102,6 +113,8 @@ pub struct Hello {
     pub name: String,
     /// Software version (`CARGO_PKG_VERSION`).
     pub version: String,
+    /// `x86_64`, `aarch64`: picks the agent program an update installs.
+    pub arch: String,
 }
 
 impl Hello {
@@ -111,6 +124,7 @@ impl Hello {
             os: std::env::consts::OS.to_owned(),
             name,
             version: version.to_owned(),
+            arch: std::env::consts::ARCH.to_owned(),
         }
     }
 }
@@ -142,6 +156,14 @@ pub struct Info {
     /// Load, memory and system-drive use. Moves constantly: not compared when deciding
     /// whether to resend (the agent resends it on a timer instead).
     pub load: Option<Load>,
+    /// Master output volume, if the OS says.
+    pub volume: Option<Volume>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Volume {
+    pub percent: u8,
+    pub muted: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,6 +184,8 @@ pub struct Display {
     /// Percent: 100, 125, 150, 200.
     pub scale: u32,
     pub primary: bool,
+    /// Resolutions the display accepts (width, height), largest first; empty if unknown.
+    pub modes: Vec<(u32, u32)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -230,6 +254,59 @@ impl PowerAction {
             self,
             PowerAction::Logoff | PowerAction::Restart | PowerAction::Shutdown
         )
+    }
+}
+
+/// Which folder of the target's file system to list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DirTarget {
+    /// The user's home folder.
+    Home,
+    /// The drives (Windows) or `/`.
+    Roots,
+    /// A path from an earlier [`Listing`].
+    Open(String),
+    /// A folder inside `dir` (a path from an earlier listing); `name` is one entry's name.
+    Child { dir: String, name: String },
+    /// The folder containing `dir`; the drives above a drive's root.
+    Parent(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirEntry {
+    pub name: String,
+    pub dir: bool,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Listing {
+    /// The folder listed; empty for the list of drives.
+    pub path: String,
+    /// Folders first, then files, each sorted by name.
+    pub entries: Vec<DirEntry>,
+    /// More entries existed than fit one message.
+    pub truncated: bool,
+}
+
+impl Listing {
+    /// Cuts `entries` to what fits one message.
+    pub fn fit(mut self) -> Listing {
+        let mut budget = MAX_LISTING_BYTES.saturating_sub(self.path.len());
+        let keep = self
+            .entries
+            .iter()
+            .take_while(|e| {
+                let cost = e.name.len() + 12;
+                budget = budget.saturating_sub(cost);
+                budget > 0
+            })
+            .count();
+        if keep < self.entries.len() {
+            self.entries.truncate(keep);
+            self.truncated = true;
+        }
+        self
     }
 }
 
@@ -362,6 +439,35 @@ enum Msg {
         id: u32,
         result: std::result::Result<String, String>,
     },
+    /// Set the master volume and/or mute; answered with `Ack`.
+    SetVolume {
+        id: u32,
+        level: Option<u8>,
+        muted: Option<bool>,
+    },
+    /// Change a display's resolution and/or make it the primary one; answered with `Ack`.
+    SetDisplay {
+        id: u32,
+        /// Index into `Info::displays`.
+        display: u32,
+        mode: Option<(u32, u32)>,
+        primary: bool,
+    },
+    ListDir {
+        id: u32,
+        target: DirTarget,
+    },
+    DirList {
+        id: u32,
+        result: std::result::Result<Listing, String>,
+    },
+    /// Send a file of the target to the GUI (a `FileOffer` with [`Purpose::Save`] follows);
+    /// `Ack` says whether it will.
+    Fetch {
+        id: u32,
+        dir: String,
+        name: String,
+    },
 }
 
 /// Something the caller must act on.
@@ -449,11 +555,38 @@ pub enum Event {
         id: u32,
         result: std::result::Result<String, String>,
     },
-    /// The agent's answer to a power or layout request (GUI only).
+    /// The agent's answer to a power, layout, volume, display or fetch request (GUI only).
     Ack {
         id: u32,
         result: std::result::Result<(), String>,
     },
+    SetVolume {
+        id: u32,
+        level: Option<u8>,
+        muted: Option<bool>,
+    },
+    SetDisplay {
+        id: u32,
+        display: u32,
+        mode: Option<(u32, u32)>,
+        primary: bool,
+    },
+    ListDir {
+        id: u32,
+        target: DirTarget,
+    },
+    DirList {
+        id: u32,
+        result: std::result::Result<Listing, String>,
+    },
+    Fetch {
+        id: u32,
+        dir: String,
+        name: String,
+    },
+    /// The peer runs another protocol version that can still be updated: the session only
+    /// carries a [`Purpose::Update`] transfer (see [`UPDATE_PROTOCOL`]).
+    Mismatch(Hello),
 }
 
 enum Noise {
@@ -486,6 +619,8 @@ pub struct Endpoint {
     /// Running hashes of the files in flight, in either direction.
     files: HashMap<u32, Sha256>,
     next_id: u32,
+    /// The peer speaks another protocol: only update transfers are served.
+    limited: bool,
 }
 
 impl Endpoint {
@@ -511,6 +646,7 @@ impl Endpoint {
             incoming: None,
             files: HashMap::new(),
             next_id: 1,
+            limited: false,
         };
         if role == Role::Client {
             ep.write_handshake()?;
@@ -615,10 +751,69 @@ impl Endpoint {
         Ok(id)
     }
 
+    pub fn send_set_volume(&mut self, level: Option<u8>, muted: Option<bool>) -> Result<u32> {
+        let id = self.take_id();
+        self.send(&Msg::SetVolume {
+            id,
+            level: level.map(|l| l.min(100)),
+            muted,
+        })?;
+        Ok(id)
+    }
+
+    pub fn send_set_display(
+        &mut self,
+        display: u32,
+        mode: Option<(u32, u32)>,
+        primary: bool,
+    ) -> Result<u32> {
+        let id = self.take_id();
+        self.send(&Msg::SetDisplay {
+            id,
+            display,
+            mode,
+            primary,
+        })?;
+        Ok(id)
+    }
+
+    pub fn send_list_dir(&mut self, target: DirTarget) -> Result<u32> {
+        let id = self.take_id();
+        self.send(&Msg::ListDir { id, target })?;
+        Ok(id)
+    }
+
+    pub fn send_dir_list(
+        &mut self,
+        id: u32,
+        result: std::result::Result<Listing, String>,
+    ) -> Result<()> {
+        self.send(&Msg::DirList {
+            id,
+            result: result.map(Listing::fit),
+        })
+    }
+
+    pub fn send_fetch(&mut self, dir: &str, name: &str) -> Result<u32> {
+        let id = self.take_id();
+        self.send(&Msg::Fetch {
+            id,
+            dir: dir.to_owned(),
+            name: name.to_owned(),
+        })?;
+        Ok(id)
+    }
+
+    fn take_id(&mut self) -> u32 {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        id
+    }
+
     /// Starts sending a file: follow with [`Endpoint::send_file_data`] pieces and
     /// [`Endpoint::send_file_end`].
     pub fn send_file_offer(&mut self, name: &str, size: u64, purpose: Purpose) -> Result<u32> {
-        if size > MAX_FILE {
+        if size > MAX_FILE || (purpose == Purpose::Update && size > MAX_UPDATE) {
             return Err(Error::Message("file too large".into()));
         }
         let id = self.next_id;
@@ -775,6 +970,7 @@ impl Endpoint {
         // the arms can still call `&mut self` methods; restore it for the next message.
         let mut plain = std::mem::take(&mut self.scratch);
         plain.resize(frame.len(), 0);
+        let (limited, peer_unknown) = (self.limited, self.peer.is_none());
         let result = match &mut self.noise {
             Noise::Handshake(hs) => hs
                 .read_message(frame, &mut plain)
@@ -789,10 +985,16 @@ impl Endpoint {
             Noise::Transport(t) => t
                 .read_message(frame, &mut plain)
                 .map_err(|_| Error::Crypto)
-                .and_then(|n| {
-                    postcard::from_bytes(&plain[..n]).map_err(|e| Error::Message(e.to_string()))
+                .and_then(|n| match postcard::from_bytes(&plain[..n]) {
+                    Ok(msg) => Ok(Some(msg)),
+                    // What another version sent may not decode; only updates matter then.
+                    Err(_) if limited => Ok(None),
+                    // The first message is the peer's hello: if it cannot be read, the peer
+                    // predates the hello's current layout.
+                    Err(_) if peer_unknown => Err(Error::Version(0)),
+                    Err(e) => Err(Error::Message(e.to_string())),
                 })
-                .and_then(|msg| self.on_msg(msg, events)),
+                .and_then(|msg| msg.map_or(Ok(()), |m| self.on_msg(m, events))),
             Noise::Failed => Err(Error::Handshake),
         };
         plain.clear();
@@ -801,9 +1003,27 @@ impl Endpoint {
     }
 
     fn on_msg(&mut self, msg: Msg, events: &mut Vec<Event>) -> Result<()> {
+        if self.limited {
+            let allowed = match &msg {
+                Msg::Ping | Msg::FileData { .. } | Msg::FileEnd { .. } | Msg::FileCancel { .. } => {
+                    true
+                }
+                Msg::FileOffer { purpose, .. } => *purpose == Purpose::Update,
+                _ => false,
+            };
+            if !allowed {
+                return Ok(());
+            }
+        }
         match msg {
             Msg::Hello(h) => {
                 if h.protocol != PROTOCOL {
+                    if h.protocol >= UPDATE_PROTOCOL {
+                        self.limited = true;
+                        self.peer = Some(h.clone());
+                        events.push(Event::Mismatch(h));
+                        return Ok(());
+                    }
                     return Err(Error::Version(h.protocol));
                 }
                 self.peer = Some(h.clone());
@@ -838,7 +1058,7 @@ impl Endpoint {
                 size,
                 purpose,
             } => {
-                if size > MAX_FILE {
+                if size > MAX_FILE || (purpose == Purpose::Update && size > MAX_UPDATE) {
                     return Err(Error::Message("file too large".into()));
                 }
                 self.files.insert(id, Sha256::new());
@@ -885,7 +1105,39 @@ impl Endpoint {
             Msg::Ack { id, result } if self.role == Role::Client => {
                 events.push(Event::Ack { id, result });
             }
-            Msg::Power { .. } | Msg::SetLayout { .. } | Msg::Ack { .. } => {
+            Msg::SetVolume { id, level, muted } if self.role == Role::Agent => {
+                events.push(Event::SetVolume { id, level, muted });
+            }
+            Msg::SetDisplay {
+                id,
+                display,
+                mode,
+                primary,
+            } if self.role == Role::Agent => {
+                events.push(Event::SetDisplay {
+                    id,
+                    display,
+                    mode,
+                    primary,
+                });
+            }
+            Msg::ListDir { id, target } if self.role == Role::Agent => {
+                events.push(Event::ListDir { id, target });
+            }
+            Msg::Fetch { id, dir, name } if self.role == Role::Agent => {
+                events.push(Event::Fetch { id, dir, name });
+            }
+            Msg::DirList { id, result } if self.role == Role::Client => {
+                events.push(Event::DirList { id, result });
+            }
+            Msg::Power { .. }
+            | Msg::SetLayout { .. }
+            | Msg::Ack { .. }
+            | Msg::SetVolume { .. }
+            | Msg::SetDisplay { .. }
+            | Msg::ListDir { .. }
+            | Msg::Fetch { .. }
+            | Msg::DirList { .. } => {
                 return Err(Error::Message("request for the wrong role".into()));
             }
             Msg::Policy(p) => {
@@ -1347,5 +1599,107 @@ mod tests {
         assert!(a.receive(&[0, 0, 0, 0]).is_err());
         let (_c, mut a) = pair(&s, &s);
         assert!(a.receive(&[0, 0, 0, 3, 1, 2, 3]).is_err());
+    }
+
+    #[test]
+    fn volume_display_listing_and_fetch_round_trip() {
+        let s = Secret::generate();
+        let (mut c, mut a) = pair(&s, &s);
+        pump(&mut c, &mut a).unwrap();
+        let v = c.send_set_volume(Some(250), Some(true)).unwrap();
+        let d = c.send_set_display(1, Some((1920, 1080)), true).unwrap();
+        let l = c.send_list_dir(DirTarget::Home).unwrap();
+        let f = c.send_fetch("/home/u", "a.txt").unwrap();
+        let (_, ae) = pump(&mut c, &mut a).unwrap();
+        assert_eq!(
+            ae,
+            [
+                Event::SetVolume {
+                    id: v,
+                    level: Some(100),
+                    muted: Some(true)
+                },
+                Event::SetDisplay {
+                    id: d,
+                    display: 1,
+                    mode: Some((1920, 1080)),
+                    primary: true
+                },
+                Event::ListDir {
+                    id: l,
+                    target: DirTarget::Home
+                },
+                Event::Fetch {
+                    id: f,
+                    dir: "/home/u".into(),
+                    name: "a.txt".into()
+                },
+            ]
+        );
+        // A huge folder is cut to one message and says so.
+        let entries = (0..5000)
+            .map(|i| DirEntry {
+                name: format!("file-number-{i}.txt"),
+                dir: false,
+                size: 1,
+            })
+            .collect();
+        a.send_dir_list(
+            l,
+            Ok(Listing {
+                path: "/home/u".into(),
+                entries,
+                truncated: false,
+            }),
+        )
+        .unwrap();
+        let (ce, _) = pump(&mut c, &mut a).unwrap();
+        let [
+            Event::DirList {
+                result: Ok(list), ..
+            },
+        ] = &ce[..]
+        else {
+            panic!("{ce:?}")
+        };
+        assert!(list.truncated && !list.entries.is_empty() && list.entries.len() < 5000);
+        // Requests only go GUI → agent.
+        assert!(a.send_fetch("/", "x").is_ok());
+        assert!(c.receive(&a.take_outgoing()).is_err());
+    }
+
+    #[test]
+    fn other_protocol_gets_updates_only() {
+        let s = Secret::generate();
+        let newer = Hello {
+            protocol: PROTOCOL + 1,
+            ..Hello::local("2", "mac".into())
+        };
+        let mut c = Endpoint::new(Role::Client, &s, newer).unwrap();
+        let mut a = Endpoint::new(Role::Agent, &s, Hello::local("1", "laptop".into())).unwrap();
+        let (ce, ae) = pump(&mut c, &mut a).unwrap();
+        // (This end's own constant is still 8, so only the agent sees a mismatch.)
+        assert!(matches!(ae[..], [Event::Mismatch(_)]) && matches!(ce[..], [Event::Ready(_)]));
+        // Clipboard traffic is ignored; an update transfer goes through.
+        c.send_clip(&Content::Text("hi".into())).unwrap();
+        let id = c.send_file_offer("agent", 3, Purpose::Update).unwrap();
+        c.send_file_data(id, b"abc").unwrap();
+        c.send_file_end(id).unwrap();
+        let (_, ae) = pump(&mut c, &mut a).unwrap();
+        assert!(matches!(
+            ae[..],
+            [
+                Event::FileOffer {
+                    purpose: Purpose::Update,
+                    ..
+                },
+                Event::FileData { .. },
+                Event::FileEnd { intact: true, .. }
+            ]
+        ));
+        // Other transfers are refused quietly.
+        let id = c.send_file_offer("x", 1, Purpose::Save).unwrap();
+        c.send_file_data(id, b"x").unwrap();
+        assert!(pump(&mut c, &mut a).unwrap().1.is_empty());
     }
 }

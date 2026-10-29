@@ -162,6 +162,18 @@ impl BridgeSetup {
     }
 }
 
+/// The agent program for a target running `os` on `arch` (as in its hello), if this app ships
+/// one.
+pub fn agent_binary(os: &str, arch: &str) -> Option<PathBuf> {
+    let name = match (os, arch) {
+        ("linux", "x86_64") => "linux-x86_64",
+        ("linux", "aarch64") => "linux-aarch64",
+        ("windows", "x86_64") => "windows-x86_64.exe",
+        _ => return None,
+    };
+    Some(agents_dir()?.join(name)).filter(|p| p.is_file())
+}
+
 /// Where the agent binaries (`scripts/build-agents.sh`) are: `$COMETDESK_AGENTS_DIR`, next to
 /// the executable, in the app bundle's Resources, or the repo's `dist/agents` in development.
 fn agents_dir() -> Option<PathBuf> {

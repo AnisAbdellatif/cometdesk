@@ -202,6 +202,10 @@ pub struct Console {
     video_pts: Option<egui::Rect>,
     /// Files on their way to the target through the agent.
     transfers: Vec<crate::clipsync::FileSend>,
+    /// The target's file browser window.
+    browser: crate::browser::Browser,
+    /// A volume the user set a moment ago, shown until the target reports it back.
+    volume_edit: Option<(u8, Instant)>,
     /// Files chosen in the "Send file" dialog, picked up by the next frame.
     picked_files: Arc<std::sync::Mutex<Vec<std::path::PathBuf>>>,
     notice: Option<(String, Instant)>,
@@ -280,6 +284,8 @@ impl Console {
             region: None,
             video_pts: None,
             transfers: Vec::new(),
+            browser: crate::browser::Browser::default(),
+            volume_edit: None,
             picked_files: Arc::default(),
             notice: None,
             stats: FrameStats::default(),
@@ -1805,6 +1811,13 @@ impl Console {
                     ui.end_row();
                 }
             });
+            if let Some(v) = info.volume {
+                ui.separator();
+                self.volume_row(ui, v);
+            }
+            for (i, d) in info.displays.iter().enumerate() {
+                self.display_menu(ui, i, d, info.displays.len());
+            }
             if info.layouts.len() > 1 {
                 ui.separator();
                 ui.menu_button("Switch the target's layout", |ui| {
@@ -1956,22 +1969,145 @@ impl Console {
     }
 
     fn request_layout(&mut self, layout: String) {
-        let Some(rx) = self
-            .clip
-            .as_ref()
-            .map(|c| c.request(Request::Layout(layout)))
-        else {
+        self.ask_agent(Request::Layout(layout), "Cannot switch the layout", None);
+    }
+
+    /// Sends `request` to the agent; `failure` prefixes the error shown if it says no, and
+    /// `done` is shown if it says yes.
+    fn ask_agent(&mut self, request: Request, failure: &'static str, done: Option<String>) {
+        let Some(rx) = self.clip.as_ref().map(|c| c.request(request)) else {
             return;
         };
         let proxy = self.proxy.clone();
         self.rt.spawn(async move {
             let msg = match rx.await {
-                Ok(Ok(())) => return,
-                Ok(Err(e)) => format!("Cannot switch the layout: {e}"),
-                Err(_) => "Cannot switch the layout: the agent disconnected".into(),
+                Ok(Ok(())) => match done {
+                    Some(m) => m,
+                    None => return,
+                },
+                Ok(Err(e)) => format!("{failure}: {e}"),
+                Err(_) => format!("{failure}: the agent disconnected"),
             };
             let _ = proxy.send_event(UserEvent::Notice(msg));
         });
+    }
+
+    /// The master volume of the target: a slider that sends on release, and mute.
+    fn volume_row(&mut self, ui: &mut egui::Ui, volume: cometdesk_clip::Volume) {
+        let shown = self
+            .volume_edit
+            .filter(|(_, at)| at.elapsed() < Duration::from_secs(3))
+            .map_or(volume.percent, |(v, _)| v);
+        let mut level = f32::from(shown);
+        let mut muted = volume.muted;
+        ui.horizontal(|ui| {
+            ui.label("Volume");
+            let slider = ui.add(egui::Slider::new(&mut level, 0.0..=100.0).suffix("%"));
+            if slider.changed() {
+                self.volume_edit = Some((level as u8, Instant::now()));
+            }
+            if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
+                self.ask_agent(
+                    Request::Volume {
+                        level: Some(level as u8),
+                        muted: None,
+                    },
+                    "Cannot set the volume",
+                    None,
+                );
+            }
+            if ui.checkbox(&mut muted, "Mute").changed() {
+                self.ask_agent(
+                    Request::Volume {
+                        level: None,
+                        muted: Some(muted),
+                    },
+                    "Cannot change the mute",
+                    None,
+                );
+            }
+        });
+    }
+
+    /// Resolution and main-display choices for display `index` of the target.
+    fn display_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        index: usize,
+        d: &cometdesk_clip::Display,
+        count: usize,
+    ) {
+        let can_main = count > 1 && !d.primary;
+        if d.modes.is_empty() && !can_main {
+            return;
+        }
+        ui.menu_button(format!("Display {}", index + 1), |ui| {
+            if !d.modes.is_empty() {
+                ui.label("Resolution");
+                egui::ScrollArea::vertical()
+                    .max_height(240.0)
+                    .show(ui, |ui| {
+                        for &(w, h) in &d.modes {
+                            let on = (w, h) == (d.width, d.height);
+                            if ui.selectable_label(on, format!("{w}×{h}")).clicked() && !on {
+                                self.ask_agent(
+                                    Request::Display {
+                                        index: index as u32,
+                                        mode: Some((w, h)),
+                                        primary: false,
+                                    },
+                                    "Cannot change the resolution",
+                                    Some(format!("Resolution set to {w}×{h}")),
+                                );
+                                ui.close();
+                            }
+                        }
+                    });
+                // The KVM's EDID tells the target which modes the monitor has: when the
+                // target runs a mode the current EDID does not name, offer the matching one.
+                if let Some(p) = self.edid_for(d.width, d.height)
+                    && ui
+                        .button(format!("Match the EDID: {}", p.label))
+                        .on_hover_text("Tell the target the monitor is this one")
+                        .clicked()
+                {
+                    self.apply_video(VideoChange::Edid(p));
+                    ui.close();
+                }
+            }
+            if can_main && ui.button("Make this the main display").clicked() {
+                self.ask_agent(
+                    Request::Display {
+                        index: index as u32,
+                        mode: None,
+                        primary: true,
+                    },
+                    "Cannot change the main display",
+                    Some(format!("Display {} is now the main display", index + 1)),
+                );
+                ui.close();
+            }
+        });
+    }
+
+    /// The device's EDID preset named for `width`×`height` (or its `…p`), if it is not the
+    /// one in use.
+    fn edid_for(&self, width: u32, height: u32) -> Option<EdidPreset> {
+        let needles = [
+            format!("{width}x{height}"),
+            format!("{width}×{height}"),
+            format!("{height}p"),
+        ];
+        let current = &self.video_info.edid;
+        self.video_info
+            .edid_presets
+            .iter()
+            .filter(|p| edid::normalize(&p.content) != *current)
+            .find(|p| {
+                let label = p.label.to_lowercase();
+                needles.iter().any(|n| label.contains(n.as_str()))
+            })
+            .cloned()
     }
 
     fn session_action(&mut self, action: SessionAction) {
@@ -2072,6 +2208,12 @@ impl Console {
             }
         }
         self.poll_transfers(ui.ctx());
+        if self.browser.is_open() {
+            match self.clip.as_ref().filter(|_| self.inserts_via_agent()) {
+                Some(clip) => self.browser.ui(ui.ctx(), clip, &self.rt, &self.proxy),
+                None => self.browser.close(),
+            }
+        }
         if let Some(rx) = self.inserting.as_mut() {
             match rx.try_recv() {
                 Ok(Ok(msg)) => {
@@ -2253,6 +2395,15 @@ impl Console {
                 .clicked()
         {
             self.pick_files_to_send();
+        }
+        if agent_up
+            && ui
+                .button("Files")
+                .on_hover_text("Browse the target's files and download them to this Mac")
+                .clicked()
+            && let Some(clip) = self.clip.as_ref()
+        {
+            self.browser.open(clip);
         }
         ui.menu_button("Capture", |ui| {
             if ui

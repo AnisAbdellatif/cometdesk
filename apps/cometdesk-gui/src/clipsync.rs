@@ -10,7 +10,7 @@
 //! step instead of a stream of key presses that a window switch could misdirect. When the
 //! agent asks for a paste keystroke, this task sends it over the KVM's keyboard.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -21,8 +21,8 @@ use cometdesk::api::bridge::BRIDGE_WS;
 use cometdesk::client::WsStream;
 use cometdesk::events::HidSender;
 use cometdesk_clip::{
-    Content, Dedup, Endpoint, Error, Event, FileReceiver, FileSender, Hello, Info, InsertReply,
-    PasteKey, PastePref, Policy, PowerAction, Pump, Purpose, Role, Secret,
+    Content, Dedup, DirTarget, Endpoint, Error, Event, FileReceiver, FileSender, Hello, Info,
+    InsertReply, Listing, PasteKey, PastePref, Policy, PowerAction, Pump, Purpose, Role, Secret,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::runtime::Handle;
@@ -59,6 +59,94 @@ pub type AckResult = Result<(), String>;
 pub enum Request {
     Power(PowerAction),
     Layout(String),
+    Volume {
+        level: Option<u8>,
+        muted: Option<bool>,
+    },
+    /// Resolution and/or primary status of display `index` (of `Info::displays`).
+    Display {
+        index: u32,
+        mode: Option<(u32, u32)>,
+        primary: bool,
+    },
+    /// Download `name` from folder `dir` of the target into Downloads.
+    Fetch {
+        dir: String,
+        name: String,
+    },
+}
+
+/// A folder of the target, or why it cannot be listed.
+pub type ListResult = Result<Listing, String>;
+
+struct DirRequest {
+    target: DirTarget,
+    reply: oneshot::Sender<ListResult>,
+}
+
+/// What the bridge remembers across connections, for noticing reboots and for not offering
+/// the same agent update twice.
+#[derive(Default)]
+struct Memory {
+    /// The target's uptime in its last report.
+    uptime: Option<u64>,
+    /// The agent (version, protocol) an update was already sent to.
+    update_tried: Option<(String, u16)>,
+}
+
+/// The target's uptime went down since the last report: it restarted (a sleep does not
+/// reset it).
+fn restarted(last: Option<u64>, uptime: u64) -> bool {
+    last.is_some_and(|prev| uptime + 5 < prev)
+}
+
+/// Queues the agent program this app ships for `peer`, if `peer` is older and no update was
+/// sent to that version yet. Whether anything was queued.
+fn queue_update(
+    peer: &Hello,
+    memory: &mut Memory,
+    queue: &mut VecDeque<FileRequest>,
+    notes: &mpsc::UnboundedSender<Note>,
+) -> bool {
+    let tried = (peer.version.clone(), peer.protocol);
+    if !agent_is_older(peer) || memory.update_tried.as_ref() == Some(&tried) {
+        return false;
+    }
+    let Some(path) = crate::setup::agent_binary(&peer.os, &peer.arch) else {
+        return false;
+    };
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return false;
+    };
+    memory.update_tried = Some(tried);
+    let (reply, _) = oneshot::channel();
+    queue.push_front(FileRequest {
+        progress: Arc::new(TransferProgress {
+            name: "cometdesk-agent".into(),
+            total: meta.len(),
+            sent: AtomicU64::new(0),
+            cancel: AtomicBool::new(false),
+        }),
+        path,
+        reply,
+        batch: None,
+        update: true,
+    });
+    let _ = notes.send(Note::Info(format!(
+        "Updating the agent on the target ({} to {})",
+        peer.version,
+        env!("CARGO_PKG_VERSION")
+    )));
+    true
+}
+
+/// Whether `peer` runs an older agent than this app ships.
+fn agent_is_older(peer: &Hello) -> bool {
+    let version = |v: &str| -> Vec<u32> { v.split('.').filter_map(|p| p.parse().ok()).collect() };
+    match peer.protocol.cmp(&cometdesk_clip::PROTOCOL) {
+        std::cmp::Ordering::Equal => version(&peer.version) < version(env!("CARGO_PKG_VERSION")),
+        o => o.is_lt(),
+    }
 }
 
 /// How long the agent gets to verify, sync and rename a file after its last byte.
@@ -85,6 +173,8 @@ struct FileRequest {
     /// Part of a clipboard batch (its number): the files are staged on the target and put on
     /// its clipboard together.
     batch: Option<u32>,
+    /// A new agent program, to replace the one running on the target.
+    update: bool,
 }
 
 /// The transfer being streamed, or waiting for the agent's verdict.
@@ -153,6 +243,8 @@ pub enum BridgeState {
     Mismatch,
     /// The agent speaks another protocol version: set up the target again.
     AgentOutdated(u16),
+    /// The agent is older than this app and is being sent a new program.
+    Updating,
     /// The agent's hello, and what it last told us about the target.
     Connected(Hello, Info),
     Error(String),
@@ -168,6 +260,7 @@ impl BridgeState {
             BridgeState::AgentOutdated(_) => {
                 "the agent on the target is outdated: set up the target again".into()
             }
+            BridgeState::Updating => "updating the agent on the target…".into(),
             BridgeState::Connected(h, _) => format!("connected to {} ({})", h.name, h.os),
             BridgeState::Error(e) => format!("error: {e}"),
         }
@@ -200,6 +293,7 @@ pub struct ClipBridge {
     inserts: mpsc::UnboundedSender<InsertRequest>,
     captures: mpsc::UnboundedSender<CaptureRequest>,
     acks: mpsc::UnboundedSender<AckRequest>,
+    dirs: mpsc::UnboundedSender<DirRequest>,
     files: mpsc::UnboundedSender<FileRequest>,
     notes: Mutex<mpsc::UnboundedReceiver<Note>>,
     task: JoinHandle<()>,
@@ -219,6 +313,7 @@ impl ClipBridge {
         let (inserts, inserts_rx) = mpsc::unbounded_channel();
         let (captures, captures_rx) = mpsc::unbounded_channel();
         let (acks, acks_rx) = mpsc::unbounded_channel();
+        let (dirs, dirs_rx) = mpsc::unbounded_channel();
         let (files, files_rx) = mpsc::unbounded_channel();
         let (notes_tx, notes) = mpsc::unbounded_channel();
         let task = rt.spawn(supervise(
@@ -228,6 +323,7 @@ impl ClipBridge {
             inserts_rx,
             captures_rx,
             acks_rx,
+            dirs_rx,
             files_rx,
             notes_tx,
             state_tx,
@@ -239,6 +335,7 @@ impl ClipBridge {
             inserts,
             captures,
             acks,
+            dirs,
             files,
             notes: Mutex::new(notes),
             task,
@@ -297,6 +394,7 @@ impl ClipBridge {
             progress: progress.clone(),
             reply,
             batch: None,
+            update: false,
         };
         self.files
             .send(req)
@@ -315,6 +413,13 @@ impl ClipBridge {
     pub fn request(&self, request: Request) -> oneshot::Receiver<AckResult> {
         let (reply, rx) = oneshot::channel();
         let _ = self.acks.send(AckRequest { request, reply });
+        rx
+    }
+
+    /// Lists a folder of the target's file system.
+    pub fn list_dir(&self, target: DirTarget) -> oneshot::Receiver<ListResult> {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.dirs.send(DirRequest { target, reply });
         rx
     }
 
@@ -359,6 +464,7 @@ async fn supervise(
     mut inserts: mpsc::UnboundedReceiver<InsertRequest>,
     mut captures: mpsc::UnboundedReceiver<CaptureRequest>,
     mut acks: mpsc::UnboundedReceiver<AckRequest>,
+    mut dirs: mpsc::UnboundedReceiver<DirRequest>,
     mut files: mpsc::UnboundedReceiver<FileRequest>,
     notes: mpsc::UnboundedSender<Note>,
     state: watch::Sender<BridgeState>,
@@ -374,6 +480,7 @@ async fn supervise(
         }
     };
     let mut local = LocalClipboard::new().await;
+    let mut memory = Memory::default();
     let mut backoff = BACKOFF_MIN;
     loop {
         set(BridgeState::Connecting);
@@ -390,9 +497,11 @@ async fn supervise(
                         &mut inserts,
                         &mut captures,
                         &mut acks,
+                        &mut dirs,
                         &mut files,
                         &notes,
                         &mut local,
+                        &mut memory,
                         &set,
                         &wake,
                     )
@@ -439,6 +548,9 @@ async fn supervise(
                 Some(req) = acks.recv() => {
                     let _ = req.reply.send(Err("the agent is not connected".into()));
                 }
+                Some(req) = dirs.recv() => {
+                    let _ = req.reply.send(Err("the agent is not connected".into()));
+                }
                 Some(req) = files.recv() => {
                     let _ = req.reply.send(Err("the agent is not connected".into()));
                 }
@@ -456,9 +568,11 @@ async fn run(
     inserts: &mut mpsc::UnboundedReceiver<InsertRequest>,
     captures: &mut mpsc::UnboundedReceiver<CaptureRequest>,
     acks: &mut mpsc::UnboundedReceiver<AckRequest>,
+    dirs: &mut mpsc::UnboundedReceiver<DirRequest>,
     files: &mut mpsc::UnboundedReceiver<FileRequest>,
     notes: &mpsc::UnboundedSender<Note>,
     local: &mut LocalClipboard,
+    memory: &mut Memory,
     set: &impl Fn(BridgeState),
     wake: &(impl Fn() + Send + Sync),
 ) -> End {
@@ -482,6 +596,12 @@ async fn run(
     let mut receiver = FileReceiver::new(std::env::temp_dir().join("cometdesk-clip"));
     let mut last_wake = Instant::now();
     let mut acked: HashMap<u32, (oneshot::Sender<AckResult>, Instant)> = HashMap::new();
+    let mut listed: HashMap<u32, (oneshot::Sender<ListResult>, Instant)> = HashMap::new();
+    // Files the user asked to download that have not been offered or refused yet, and the
+    // ones being received now.
+    let mut fetches = 0u32;
+    let mut fetch_acks: HashSet<u32> = HashSet::new();
+    let mut downloading: HashSet<u32> = HashSet::new();
     let mut poll = interval(POLL);
     let mut ping = interval(PING);
     let mut status = interval(STATUS_EVERY);
@@ -540,10 +660,21 @@ async fn run(
                     match ev {
                         Event::Ready(peer) => {
                             tracing::info!(agent = %peer.name, os = %peer.os, "clipboard bridge connected");
-                            set(BridgeState::Connected(peer, Info::default()));
+                            set(BridgeState::Connected(peer.clone(), Info::default()));
                             if let Err(e) = ep.set_policy(settings.borrow().policy()) {
                                 return End::Lost(e.to_string(), true);
                             }
+                            queue_update(&peer, memory, &mut queue, notes);
+                        }
+                        Event::Mismatch(peer) => {
+                            tracing::info!(agent = %peer.name, protocol = peer.protocol, "agent speaks another protocol");
+                            if peer.protocol > cometdesk_clip::PROTOCOL {
+                                return End::Lost("the agent on the target is newer than this app".into(), true);
+                            }
+                            if !queue_update(&peer, memory, &mut queue, notes) {
+                                return End::AgentOutdated(peer.protocol);
+                            }
+                            set(BridgeState::Updating);
                         }
                         Event::Clip(content) => {
                             if settings.borrow().receives() {
@@ -571,6 +702,16 @@ async fn run(
                         }
                         Event::Info(info) => {
                             tracing::info!(?info, "target info");
+                            if let Some(up) = info.uptime_secs {
+                                if restarted(memory.uptime, up) {
+                                    let _ = notes.send(Note::Target {
+                                        title: "Target restarted".into(),
+                                        body: "The target booted again and its agent is back.".into(),
+                                    });
+                                    wake();
+                                }
+                                memory.uptime = Some(up);
+                            }
                             if let Some(peer) = ep.peer() {
                                 set(BridgeState::Connected(peer.clone(), info));
                             }
@@ -588,7 +729,16 @@ async fn run(
                             }
                         }
                         Event::Ack { id, result } => {
+                            if fetch_acks.remove(&id) && result.is_err() {
+                                fetches = fetches.saturating_sub(1);
+                            }
                             if let Some((tx, _)) = acked.remove(&id) {
+                                let _ = tx.send(result);
+                                wake();
+                            }
+                        }
+                        Event::DirList { id, result } => {
+                            if let Some((tx, _)) = listed.remove(&id) {
                                 let _ = tx.send(result);
                                 wake();
                             }
@@ -597,6 +747,12 @@ async fn run(
                             if active.as_ref().is_some_and(|a| a.sender.id == id)
                                 && let Some(a) = active.take()
                             {
+                                if a.req.update {
+                                    let _ = notes.send(Note::Info(match &result {
+                                        Ok(_) => "The agent on the target was updated and is restarting".into(),
+                                        Err(e) => format!("Agent update failed: {e}"),
+                                    }));
+                                }
                                 match &result {
                                     Ok(_) => {
                                         if let Some(b) = a.req.batch
@@ -629,10 +785,20 @@ async fn run(
                         }
                         // The agent sends files when something was copied on the target.
                         Event::FileOffer { id, name, size, purpose } => {
-                            let refused = if purpose != Purpose::Clipboard || !settings.borrow().receives() {
-                                Err("the GUI does not take files from the target".to_string())
-                            } else {
-                                receiver.offer(id, &name, size, purpose)
+                            let refused = match purpose {
+                                Purpose::Clipboard if settings.borrow().receives() => {
+                                    receiver.offer(id, &name, size, purpose)
+                                }
+                                // Only what the user picked in the file browser.
+                                Purpose::Save if fetches > 0 => {
+                                    fetches -= 1;
+                                    let r = receiver.offer(id, &name, size, purpose);
+                                    if r.is_ok() {
+                                        downloading.insert(id);
+                                    }
+                                    r
+                                }
+                                _ => Err("the GUI does not take files from the target".to_string()),
                             };
                             if let Err(e) = refused
                                 && let Err(e) = ep.send_file_result(id, Err(e))
@@ -641,19 +807,36 @@ async fn run(
                             }
                         }
                         Event::FileData { id, data } => {
-                            if let Err(e) = receiver.data(id, &data)
-                                && let Err(e) = ep.send_file_result(id, Err(e))
-                            {
-                                return End::Lost(e.to_string(), true);
+                            if let Err(e) = receiver.data(id, &data) {
+                                if downloading.remove(&id) {
+                                    let _ = notes.send(Note::Info(format!("Download failed: {e}")));
+                                    wake();
+                                }
+                                if let Err(e) = ep.send_file_result(id, Err(e)) {
+                                    return End::Lost(e.to_string(), true);
+                                }
                             }
                         }
                         Event::FileEnd { id, intact } => {
                             let result = receiver.end(id, intact);
+                            if downloading.remove(&id) {
+                                let _ = notes.send(Note::Info(match &result {
+                                    Ok(path) => format!("Downloaded to {path}"),
+                                    Err(e) => format!("Download failed: {e}"),
+                                }));
+                                wake();
+                            }
                             if let Err(e) = ep.send_file_result(id, result) {
                                 return End::Lost(e.to_string(), true);
                             }
                         }
-                        Event::FileCancel { id } => receiver.cancel(id),
+                        Event::FileCancel { id } => {
+                            receiver.cancel(id);
+                            if downloading.remove(&id) {
+                                let _ = notes.send(Note::Info("Download cancelled on the target".into()));
+                                wake();
+                            }
+                        }
                         Event::FilesReady { ids } => {
                             if let Some(paths) = receiver.take_staged(&ids) {
                                 tracing::info!(count = paths.len(), "copied files from the target");
@@ -667,6 +850,10 @@ async fn run(
                         Event::Policy(_)
                         | Event::Power { .. }
                         | Event::SetLayout { .. }
+                        | Event::SetVolume { .. }
+                        | Event::SetDisplay { .. }
+                        | Event::ListDir { .. }
+                        | Event::Fetch { .. }
                         | Event::Insert { .. }
                         | Event::InsertPasted { .. }
                         | Event::Capture { .. } => {}
@@ -708,6 +895,20 @@ async fn run(
                     let _ = req.reply.send(Err("the agent is not connected".into()));
                 }
             }
+            Some(req) = dirs.recv() => {
+                if !up {
+                    let _ = req.reply.send(Err("the agent is not connected".into()));
+                    continue;
+                }
+                match ep.send_list_dir(req.target) {
+                    Ok(id) => {
+                        listed.insert(id, (req.reply, Instant::now()));
+                    }
+                    Err(e) => {
+                        let _ = req.reply.send(Err(e.to_string()));
+                    }
+                }
+            }
             Some(req) = acks.recv() => {
                 if !up {
                     let _ = req.reply.send(Err("the agent is not connected".into()));
@@ -716,9 +917,20 @@ async fn run(
                 let sent = match &req.request {
                     Request::Power(a) => ep.send_power(*a),
                     Request::Layout(l) => ep.send_set_layout(l),
+                    Request::Volume { level, muted } => ep.send_set_volume(*level, *muted),
+                    Request::Display { index, mode, primary } => {
+                        ep.send_set_display(*index, *mode, *primary)
+                    }
+                    Request::Fetch { dir, name } => {
+                        fetches += 1;
+                        ep.send_fetch(dir, name)
+                    }
                 };
                 match sent {
                     Ok(id) => {
+                        if matches!(req.request, Request::Fetch { .. }) {
+                            fetch_acks.insert(id);
+                        }
                         acked.insert(id, (req.reply, Instant::now()));
                     }
                     Err(e) => {
@@ -737,6 +949,7 @@ async fn run(
                     wake();
                 }
                 acked.retain(|_, (_, at)| at.elapsed() <= INSERT_TIMEOUT);
+                listed.retain(|_, (_, at)| at.elapsed() <= INSERT_TIMEOUT);
                 captured.retain(|_, (_, at)| at.elapsed() <= CAPTURE_TIMEOUT);
                 let expired: Vec<u32> = pending
                     .iter()
@@ -934,16 +1147,16 @@ fn queue_clip_files(
     next_batch: &mut u32,
     notes: &mpsc::UnboundedSender<Note>,
 ) {
-    let sized: Vec<(PathBuf, u64)> = paths
+    let sized: Vec<(PathBuf, String, u64)> = cometdesk_clip::expand(&paths)
         .into_iter()
-        .filter_map(|p| {
-            let m = std::fs::metadata(&p).ok().filter(|m| m.is_file())?;
-            Some((p, m.len()))
+        .filter_map(|(p, name)| {
+            let len = std::fs::metadata(&p).ok()?.len();
+            Some((p, name, len))
         })
         .collect();
-    let total: u64 = sized.iter().map(|(_, n)| n).sum();
+    let total: u64 = sized.iter().map(|(_, _, n)| n).sum();
     let skipped = if sized.is_empty() {
-        Some("folders are not supported")
+        Some("nothing to send")
     } else if sized.len() > cometdesk_clip::MAX_CLIP_FILES
         || total > cometdesk_clip::MAX_CLIP_FILES_BYTES
     {
@@ -963,10 +1176,7 @@ fn queue_clip_files(
             remaining: sized.len(),
         },
     );
-    for (path, size) in sized {
-        let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
-            continue;
-        };
+    for (path, name, size) in sized {
         let (reply, _) = oneshot::channel();
         queue.push_back(FileRequest {
             progress: Arc::new(TransferProgress {
@@ -978,13 +1188,16 @@ fn queue_clip_files(
             path,
             reply,
             batch: Some(*next_batch),
+            update: false,
         });
     }
 }
 
 /// Opens the file and tells the agent about it. On failure the request comes back with why.
 fn start_file(ep: &mut Endpoint, req: FileRequest) -> Result<ActiveFile, (FileRequest, String)> {
-    let purpose = if req.batch.is_some() {
+    let purpose = if req.update {
+        Purpose::Update
+    } else if req.batch.is_some() {
         Purpose::Clipboard
     } else {
         Purpose::Save
@@ -1038,5 +1251,39 @@ fn stream_file(
             a.fail(e);
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+
+    fn hello(protocol: u16, version: &str) -> Hello {
+        Hello {
+            protocol,
+            version: version.into(),
+            ..Hello::local("0", "t".into())
+        }
+    }
+
+    #[test]
+    fn older_agents_are_updated_newer_ones_are_not() {
+        let ours = env!("CARGO_PKG_VERSION");
+        assert!(agent_is_older(&hello(cometdesk_clip::PROTOCOL - 1, ours)));
+        assert!(!agent_is_older(&hello(
+            cometdesk_clip::PROTOCOL + 1,
+            "0.0.1"
+        )));
+        assert!(!agent_is_older(&hello(cometdesk_clip::PROTOCOL, ours)));
+        assert!(agent_is_older(&hello(cometdesk_clip::PROTOCOL, "0.0.1")));
+        assert!(!agent_is_older(&hello(cometdesk_clip::PROTOCOL, "99.0.0")));
+    }
+
+    #[test]
+    fn a_lower_uptime_means_a_restart() {
+        assert!(restarted(Some(3600), 40));
+        assert!(!restarted(Some(3600), 3610));
+        assert!(!restarted(Some(100), 98));
+        assert!(!restarted(None, 5));
     }
 }

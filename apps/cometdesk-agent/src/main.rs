@@ -16,14 +16,18 @@
 //! Normally installed by the installer the Comet serves on the USB link (bridge/target/),
 //! which cometdesk-gui types on the target for you. Only one instance runs per user.
 
+mod browse;
 mod capture;
 mod clipboard;
 mod config;
+mod display;
 mod filesend;
 mod info;
 mod insert;
 mod notify;
 mod power;
+mod update;
+mod volume;
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -172,11 +176,24 @@ fn run(relay: &str, log_file: Option<&str>) -> ExitCode {
         }
         detach_console();
     }
+    update::cleanup();
     let (note_tx, note_rx) = mpsc::channel();
-    match std::net::TcpListener::bind(("127.0.0.1", INSTANCE_PORT)) {
+    // After an update the predecessor is still closing down.
+    let tries = if std::env::var_os(update::RESTARTED).is_some() {
+        50
+    } else {
+        1
+    };
+    let listener = (0..tries).find_map(|i| {
+        if i > 0 {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        std::net::TcpListener::bind(("127.0.0.1", INSTANCE_PORT)).ok()
+    });
+    match listener.ok_or(()) {
         // Held for as long as the process lives, by the thread that answers `notify`.
         Ok(l) => notify::serve(l, note_tx),
-        Err(_) => {
+        Err(()) => {
             log!("another cometdesk-agent is already running for this user; exiting");
             return ExitCode::SUCCESS;
         }
@@ -344,10 +361,28 @@ fn session(
                         }
                         Event::FileResult { id, result } => outbox.result(&mut ep, id, result),
                         Event::FileEnd { id, intact } => {
-                            let result = files.end(id, intact);
+                            let update = files.is_update(id);
+                            let mut result = files.end(id, intact);
+                            let mut restart_as = None;
+                            if update {
+                                result = result
+                                    .and_then(|staged| {
+                                        update::install(std::path::Path::new(&staged))
+                                    })
+                                    .map(|exe| {
+                                        restart_as = Some(exe);
+                                        "installed; restarting".to_owned()
+                                    });
+                            }
                             log!("file done: {result:?}");
                             ep.send_file_result(id, result)
                                 .map_err(|e| SessionEnd::Lost(e.to_string(), true))?;
+                            if let Some(exe) = restart_as {
+                                let _ = stream.write_all(&ep.take_outgoing());
+                                let args: Vec<String> = std::env::args().skip(1).collect();
+                                log!("restarting as the updated agent");
+                                update::restart(&exe, &args);
+                            }
                         }
                         Event::FileCancel { id } => files.cancel(id),
                         Event::FilesReady { ids } => match files.take_staged(&ids) {
@@ -366,7 +401,45 @@ fn session(
                             ep.send_ack(id, result)
                                 .map_err(|e| SessionEnd::Lost(e.to_string(), true))?;
                         }
+                        Event::SetVolume { id, level, muted } => {
+                            let result = volume::set(level, muted);
+                            log!("volume {level:?} muted {muted:?}: {result:?}");
+                            probe.refresh();
+                            ep.send_ack(id, result)
+                                .map_err(|e| SessionEnd::Lost(e.to_string(), true))?;
+                        }
+                        Event::SetDisplay {
+                            id,
+                            display,
+                            mode,
+                            primary,
+                        } => {
+                            let result = display::set(display, mode, primary);
+                            log!("display {display} {mode:?} primary {primary}: {result:?}");
+                            probe.refresh();
+                            ep.send_ack(id, result)
+                                .map_err(|e| SessionEnd::Lost(e.to_string(), true))?;
+                        }
+                        Event::ListDir { id, target } => {
+                            let result = browse::list(target);
+                            ep.send_dir_list(id, result)
+                                .map_err(|e| SessionEnd::Lost(e.to_string(), true))?;
+                        }
+                        Event::Fetch { id, dir, name } => {
+                            let result = browse::file(&dir, &name).map(|path| {
+                                log!("the GUI fetches {}", path.display());
+                                outbox.fetch(&mut ep, path);
+                            });
+                            ep.send_ack(id, result)
+                                .map_err(|e| SessionEnd::Lost(e.to_string(), true))?;
+                        }
+                        Event::Mismatch(peer) => log!(
+                            "the GUI speaks protocol {}, this agent {}: waiting for an update",
+                            peer.protocol,
+                            cometdesk_clip::PROTOCOL
+                        ),
                         Event::Notify { .. }
+                        | Event::DirList { .. }
                         | Event::InsertReply { .. }
                         | Event::Ack { .. }
                         | Event::Info(_)

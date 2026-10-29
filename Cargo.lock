@@ -948,6 +948,7 @@ version = "0.1.0"
 dependencies = [
  "arboard",
  "cometdesk-clip",
+ "windows",
  "windows-sys 0.61.2",
  "x11rb",
 ]

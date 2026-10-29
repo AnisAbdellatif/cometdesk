@@ -12,13 +12,19 @@ use std::time::{Duration, SystemTime};
 use crate::{MAX_CLIP_FILES_BYTES, Purpose};
 
 /// Staged clipboard files older than this are removed the next time a receiver is created.
+/// Folders deeper than this are not copied.
+const MAX_DEPTH: usize = 16;
+
 const STAGING_KEEP: Duration = Duration::from_secs(24 * 60 * 60);
 
 struct Receiving {
     file: File,
     part: PathBuf,
+    /// The folder the finished file goes in.
     dir: PathBuf,
     name: String,
+    /// What a clipboard batch gets for this file: the file, or the folder it is part of.
+    top: PathBuf,
     size: u64,
     written: u64,
     purpose: Purpose,
@@ -39,6 +45,8 @@ pub struct FileReceiver {
     open: HashMap<u32, Receiving>,
     /// Finished clipboard files by transfer id, until [`FileReceiver::take_staged`].
     staged: HashMap<u32, PathBuf>,
+    /// Staging folders of the copied folders of this session, by their name.
+    trees: HashMap<String, PathBuf>,
     staging: PathBuf,
     /// Keeps this session's staging folders apart from older ones.
     nonce: u128,
@@ -54,6 +62,7 @@ impl FileReceiver {
         FileReceiver {
             open: HashMap::new(),
             staged: HashMap::new(),
+            trees: HashMap::new(),
             staging,
             nonce,
         }
@@ -66,14 +75,41 @@ impl FileReceiver {
         size: u64,
         purpose: Purpose,
     ) -> Result<(), String> {
-        let name = sanitize(name).ok_or("the file name is not usable")?;
-        let dir = match purpose {
-            Purpose::Save => downloads().ok_or("cannot find the Downloads folder")?,
+        let (dir, name, top) = match purpose {
+            Purpose::Save => {
+                let name = sanitize(name).ok_or("the file name is not usable")?;
+                (
+                    downloads().ok_or("cannot find the Downloads folder")?,
+                    name,
+                    None,
+                )
+            }
+            Purpose::Update => {
+                let dir = self.staging.join(format!("{:x}-{id}", self.nonce));
+                (dir, "cometdesk-agent".to_owned(), None)
+            }
             Purpose::Clipboard => {
                 if size > MAX_CLIP_FILES_BYTES {
                     return Err("too large to copy through the clipboard".into());
                 }
-                self.staging.join(format!("{:x}-{id}", self.nonce))
+                let mut parts = sanitize_path(name).ok_or("the file name is not usable")?;
+                let name = parts.pop().expect("at least one component");
+                if parts.is_empty() {
+                    let dir = self.staging.join(format!("{:x}-{id}", self.nonce));
+                    let top = dir.join(&name);
+                    (dir, name, Some(top))
+                } else {
+                    // A file of a copied folder: all of them share the folder's staging.
+                    let next = self.trees.len();
+                    let root = self
+                        .trees
+                        .entry(parts[0].clone())
+                        .or_insert_with(|| self.staging.join(format!("{:x}-t{next}", self.nonce)))
+                        .clone();
+                    let top = root.join(&parts[0]);
+                    let dir = parts.iter().fold(root, |d, p| d.join(p));
+                    (dir, name, Some(top))
+                }
             }
         };
         fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
@@ -84,6 +120,7 @@ impl FileReceiver {
             Receiving {
                 file,
                 part,
+                top: top.unwrap_or_else(|| dir.join(&name)),
                 dir,
                 name,
                 size,
@@ -131,14 +168,21 @@ impl FileReceiver {
         // Clipboard folders are ours alone; Downloads may already hold the name.
         let dest = match r.purpose {
             Purpose::Save => unique(&r.dir, &r.name),
-            Purpose::Clipboard => r.dir.join(&r.name),
+            Purpose::Clipboard | Purpose::Update => r.dir.join(&r.name),
         };
         fs::rename(&r.part, &dest).map_err(|e| format!("cannot save the file: {e}"))?;
         r.done = true;
         if r.purpose == Purpose::Clipboard {
-            self.staged.insert(id, dest.clone());
+            self.staged.insert(id, r.top.clone());
         }
         Ok(dest.display().to_string())
+    }
+
+    /// Whether `id` is an incoming agent program (see [`Purpose::Update`]).
+    pub fn is_update(&self, id: u32) -> bool {
+        self.open
+            .get(&id)
+            .is_some_and(|r| r.purpose == Purpose::Update)
     }
 
     pub fn cancel(&mut self, id: u32) {
@@ -148,7 +192,11 @@ impl FileReceiver {
     /// The finished clipboard files for `ids`, in order; `None` if any is missing.
     pub fn take_staged(&mut self, ids: &[u32]) -> Option<Vec<PathBuf>> {
         let paths: Option<Vec<PathBuf>> = ids.iter().map(|i| self.staged.remove(i)).collect();
-        paths.filter(|p| !p.is_empty())
+        let mut paths = paths.filter(|p| !p.is_empty())?;
+        // Every file of a copied folder stages to the same top.
+        let mut seen = std::collections::HashSet::new();
+        paths.retain(|p| seen.insert(p.clone()));
+        Some(paths)
     }
 }
 
@@ -188,6 +236,12 @@ fn downloads() -> Option<PathBuf> {
         }
     }
     Some(PathBuf::from(home?).join("Downloads"))
+}
+
+/// A relative path of at most [`MAX_DEPTH`] sanitized components, split at `/`.
+fn sanitize_path(raw: &str) -> Option<Vec<String>> {
+    let parts: Vec<String> = raw.split('/').map(sanitize).collect::<Option<Vec<_>>>()?;
+    (parts.len() <= MAX_DEPTH).then_some(parts)
 }
 
 /// A bare, portable file name, or `None` if nothing usable is left. Applied on every OS, so a
@@ -248,6 +302,33 @@ mod tests {
         assert_eq!(sanitize("com1").as_deref(), Some("_com1"));
         assert_eq!(sanitize("com0").as_deref(), Some("com0"));
         assert_eq!(sanitize("a\nb").as_deref(), Some("a_b"));
+    }
+
+    #[test]
+    fn relative_paths_keep_folders_but_not_escapes() {
+        assert_eq!(
+            sanitize_path("a/b/c.txt").unwrap(),
+            ["a", "b", "c.txt"].map(String::from)
+        );
+        assert!(sanitize_path("a/../c.txt").is_none());
+        assert!(sanitize_path("/etc/passwd").is_none());
+        assert!(sanitize_path(&["x"; 20].join("/")).is_none());
+    }
+
+    #[test]
+    fn copied_folder_stages_as_one_item() {
+        let dir = std::env::temp_dir().join(format!("cometdesk-tree-{}", std::process::id()));
+        let mut rx = FileReceiver::new(dir.clone());
+        for (id, name) in [(1, "pics/a.txt"), (2, "pics/sub/b.txt"), (3, "solo.txt")] {
+            rx.offer(id, name, 1, Purpose::Clipboard).unwrap();
+            rx.data(id, b"x").unwrap();
+            rx.end(id, true).unwrap();
+        }
+        let paths = rx.take_staged(&[1, 2, 3]).unwrap();
+        assert_eq!(paths.len(), 2);
+        assert!(paths[0].ends_with("pics") && paths[0].join("sub/b.txt").is_file());
+        assert!(paths[1].ends_with("solo.txt") && paths[1].is_file());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -128,7 +128,7 @@ mod sys {
     use std::sync::Mutex;
 
     use super::*;
-    use cometdesk_clip::{Battery, Display, Load, SessionState};
+    use cometdesk_clip::{Battery, Load, SessionState, Volume};
 
     /// Keyboard layout, input method and display scale rarely change and each costs one or more
     /// subprocesses (`gsettings`, `setxkbmap`, `ibus`/`fcitx5-remote`); refresh them this often
@@ -141,6 +141,7 @@ mod sys {
         layouts: Vec<String>,
         ime: Option<bool>,
         scale: u32,
+        volume: Option<Volume>,
     }
 
     /// Drops the cached slow fields so the next [`read`] asks the OS again.
@@ -164,6 +165,7 @@ mod sys {
             layouts,
             ime: ime(),
             scale: scale(),
+            volume: crate::volume::read(),
         };
         *cache = Some((Instant::now(), s.clone()));
         s
@@ -181,7 +183,7 @@ mod sys {
                     Some(v.trim_matches('"').to_owned())
                 }),
             session: session(),
-            displays: displays(slow.scale),
+            displays: crate::display::list(slow.scale),
             ime: slow.ime,
             focus: focus(),
             user: std::env::var("USER")
@@ -192,6 +194,7 @@ mod sys {
                 .and_then(|t| t.split('.').next()?.parse().ok()),
             battery: battery(),
             load: Some(load()),
+            volume: slow.volume,
         }
     }
 
@@ -360,34 +363,6 @@ mod sys {
         .map_or(100, |s| s * 100)
     }
 
-    /// `xrandr` geometry (`2560x1440+0+0`); `scale` is GNOME's cached integer factor.
-    fn displays(scale: u32) -> Vec<Display> {
-        let Some(out) = run("xrandr", &["--query"]) else {
-            return Vec::new();
-        };
-        out.lines()
-            .filter(|l| l.contains(" connected"))
-            .filter_map(|l| {
-                let geom = l.split_whitespace().find(|t| {
-                    t.contains('x')
-                        && t.matches('+').count() == 2
-                        && t.as_bytes()[0].is_ascii_digit()
-                })?;
-                let (size, pos) = geom.split_once('+')?;
-                let (w, h) = size.split_once('x')?;
-                let (x, y) = pos.split_once('+')?;
-                Some(Display {
-                    x: x.parse().ok()?,
-                    y: y.parse().ok()?,
-                    width: w.parse().ok()?,
-                    height: h.parse().ok()?,
-                    scale,
-                    primary: l.contains(" primary"),
-                })
-            })
-            .collect()
-    }
-
     /// IBus: any engine but a plain `xkb:` layout is an input method. Fcitx5: 2 is active.
     fn ime() -> Option<bool> {
         if let Some(e) = run("ibus", &["engine"]) {
@@ -448,8 +423,102 @@ mod sys {
 
 #[cfg(target_os = "macos")]
 mod sys {
+    use std::ffi::{CStr, CString, c_char, c_void};
+
     use super::*;
-    use cometdesk_clip::Load;
+    use cometdesk_clip::{Battery, Load};
+
+    // Text Input Sources (HIToolbox) and Core Foundation, just enough to list and select the
+    // enabled keyboard layouts.
+    type CFRef = *const c_void;
+    const UTF8: u32 = 0x0800_0100;
+
+    #[link(name = "Carbon", kind = "framework")]
+    unsafe extern "C" {
+        static kTISPropertyInputSourceID: CFRef;
+        fn TISCreateInputSourceList(properties: CFRef, include_all: u8) -> CFRef;
+        fn TISGetInputSourceProperty(source: CFRef, key: CFRef) -> CFRef;
+        fn TISSelectInputSource(source: CFRef) -> i32;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        static kCFTypeDictionaryKeyCallBacks: c_void;
+        static kCFTypeDictionaryValueCallBacks: c_void;
+        fn CFStringCreateWithCString(alloc: CFRef, s: *const c_char, enc: u32) -> CFRef;
+        fn CFStringGetCString(s: CFRef, buf: *mut c_char, size: isize, enc: u32) -> u8;
+        fn CFDictionaryCreate(
+            alloc: CFRef,
+            keys: *const CFRef,
+            values: *const CFRef,
+            n: isize,
+            key_cb: *const c_void,
+            value_cb: *const c_void,
+        ) -> CFRef;
+        fn CFArrayGetCount(a: CFRef) -> isize;
+        fn CFArrayGetValueAtIndex(a: CFRef, i: isize) -> CFRef;
+        fn CFRelease(r: CFRef);
+    }
+
+    /// The IDs of the enabled keyboard layouts (`com.apple.keylayout.German`).
+    fn layout_ids() -> Vec<String> {
+        let mut ids = Vec::new();
+        unsafe {
+            let list = TISCreateInputSourceList(std::ptr::null(), 0);
+            if list.is_null() {
+                return ids;
+            }
+            for i in 0..CFArrayGetCount(list) {
+                let id = TISGetInputSourceProperty(
+                    CFArrayGetValueAtIndex(list, i),
+                    kTISPropertyInputSourceID,
+                );
+                let mut buf = [0 as c_char; 256];
+                if !id.is_null() && CFStringGetCString(id, buf.as_mut_ptr(), 256, UTF8) != 0 {
+                    let id = CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned();
+                    if id.starts_with("com.apple.keylayout.") {
+                        ids.push(id);
+                    }
+                }
+            }
+            CFRelease(list);
+        }
+        ids
+    }
+
+    pub fn set_layout(layout: &str) -> Result<(), String> {
+        let id = layout.strip_prefix("mac:").ok_or("not a macOS layout")?;
+        let c_id = CString::new(id).map_err(|_| "bad layout name")?;
+        let status = unsafe {
+            let value = CFStringCreateWithCString(std::ptr::null(), c_id.as_ptr(), UTF8);
+            let key = kTISPropertyInputSourceID;
+            let props = CFDictionaryCreate(
+                std::ptr::null(),
+                &key,
+                &value,
+                1,
+                &raw const kCFTypeDictionaryKeyCallBacks,
+                &raw const kCFTypeDictionaryValueCallBacks,
+            );
+            let list = TISCreateInputSourceList(props, 0);
+            let status = if !list.is_null() && CFArrayGetCount(list) > 0 {
+                Some(TISSelectInputSource(CFArrayGetValueAtIndex(list, 0)))
+            } else {
+                None
+            };
+            for r in [list, props, value] {
+                if !r.is_null() {
+                    CFRelease(r);
+                }
+            }
+            status
+        };
+        match status {
+            Some(0) => Ok(()),
+            Some(code) => Err(format!("macOS refused (status {code})")),
+            None => Err("that layout is not enabled on the target".into()),
+        }
+    }
 
     pub fn read() -> Info {
         let keyboard = run(
@@ -461,17 +530,107 @@ mod sys {
             ],
         )
         .map(|o| format!("mac:{}", o.trim()));
+        let mut layouts: Vec<String> = layout_ids()
+            .into_iter()
+            .map(|i| format!("mac:{i}"))
+            .collect();
+        if layouts.is_empty() {
+            layouts = keyboard.iter().cloned().collect();
+        }
         Info {
-            layouts: keyboard.iter().cloned().collect(),
+            layouts,
             keyboard,
             os_version: run("sw_vers", &["-productVersion"]).map(|v| format!("macOS {}", v.trim())),
             user: std::env::var("USER").ok(),
-            load: Some(Load {
-                disk: root_disk(),
-                ..Load::default()
-            }),
+            uptime_secs: uptime(),
+            battery: battery(),
+            load: Some(load()),
+            volume: crate::volume::read(),
+            displays: crate::display::list(100),
             ..Info::default()
         }
+    }
+
+    /// `kern.boottime` is `{ sec = 1730000000, usec = 0 } Tue ...`.
+    fn uptime() -> Option<u64> {
+        let out = run("sysctl", &["-n", "kern.boottime"])?;
+        let sec: u64 = out
+            .split("sec = ")
+            .nth(1)?
+            .split(',')
+            .next()?
+            .trim()
+            .parse()
+            .ok()?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        now.checked_sub(sec)
+    }
+
+    /// `Now drawing from 'Battery Power'` then ` -InternalBattery-0 ... 85%; discharging; ...`.
+    fn battery() -> Option<Battery> {
+        let out = run("pmset", &["-g", "batt"])?;
+        let line = out.lines().find(|l| l.contains("InternalBattery"))?;
+        let percent = line
+            .split('%')
+            .next()?
+            .rsplit(|c: char| !c.is_ascii_digit())
+            .next()?;
+        Some(Battery {
+            percent: percent.parse().ok()?,
+            charging: !line.contains("discharging"),
+        })
+    }
+
+    /// CPU: the processes' `%cpu` summed over the cores; memory: `vm_stat` against `hw.memsize`.
+    fn load() -> Load {
+        let cores: f32 = run("sysctl", &["-n", "hw.ncpu"])
+            .and_then(|t| t.trim().parse().ok())
+            .unwrap_or(1.0);
+        let cpu = run("ps", &["-A", "-o", "%cpu="]).map(|t| {
+            let sum: f32 = t.lines().filter_map(|l| l.trim().parse::<f32>().ok()).sum();
+            (sum / cores).clamp(0.0, 100.0) as u8
+        });
+        Load {
+            cpu_percent: cpu,
+            memory: memory(),
+            disk: root_disk(),
+        }
+    }
+
+    fn memory() -> Option<Usage> {
+        let total: u64 = run("sysctl", &["-n", "hw.memsize"])?.trim().parse().ok()?;
+        let vm = run("vm_stat", &[])?;
+        let page: u64 = vm
+            .lines()
+            .next()?
+            .split("page size of ")
+            .nth(1)?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()?;
+        let pages = |name: &str| -> u64 {
+            vm.lines()
+                .find(|l| l.starts_with(name))
+                .and_then(|l| {
+                    l.split(':')
+                        .nth(1)?
+                        .trim()
+                        .trim_end_matches('.')
+                        .parse()
+                        .ok()
+                })
+                .unwrap_or(0)
+        };
+        let free =
+            (pages("Pages free") + pages("Pages inactive") + pages("Pages speculative")) * page;
+        Some(Usage {
+            used_mb: total.saturating_sub(free) / (1024 * 1024),
+            total_mb: total / (1024 * 1024),
+        })
     }
 
     pub fn focus() -> Option<Focus> {
@@ -479,10 +638,6 @@ mod sys {
     }
 
     pub fn invalidate() {}
-
-    pub fn set_layout(_: &str) -> Result<(), String> {
-        Err("switching layouts is not supported on macOS targets".into())
-    }
 }
 
 // ----- Windows
@@ -490,11 +645,8 @@ mod sys {
 #[cfg(windows)]
 mod sys {
     use super::*;
-    use cometdesk_clip::{Battery, Display, Load, SessionState};
-    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, LPARAM, RECT};
-    use windows_sys::Win32::Graphics::Gdi::{
-        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
-    };
+    use cometdesk_clip::{Battery, Load, SessionState};
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
     use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
     use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
     use windows_sys::Win32::System::StationsAndDesktops::{CloseDesktop, OpenInputDesktop};
@@ -505,8 +657,7 @@ mod sys {
         GetSystemTimes, OpenProcess, QueryFullProcessImageNameW,
     };
     use windows_sys::Win32::UI::HiDpi::{
-        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor, MDT_EFFECTIVE_DPI,
-        SetProcessDpiAwarenessContext,
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
     };
     use windows_sys::Win32::UI::Input::Ime::ImmGetDefaultIMEWnd;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -575,13 +726,14 @@ mod sys {
             layouts,
             os_version: windows_version(),
             session: session(),
-            displays: displays(),
+            displays: crate::display::list(100),
             ime: ime(),
             focus: focus(),
             user: std::env::var("USERNAME").ok(),
             uptime_secs: Some(unsafe { GetTickCount64() } / 1000),
             battery: battery(),
             load: Some(load()),
+            volume: crate::volume::read(),
         }
     }
 
@@ -637,38 +789,6 @@ mod sys {
             CloseDesktop(desk);
         }
         SessionState::Active
-    }
-
-    fn displays() -> Vec<Display> {
-        unsafe extern "system" fn each(m: HMONITOR, _: HDC, _: *mut RECT, out: LPARAM) -> i32 {
-            let out = unsafe { &mut *(out as *mut Vec<Display>) };
-            let mut mi: MONITORINFO = unsafe { std::mem::zeroed() };
-            mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-            if unsafe { GetMonitorInfoW(m, &mut mi) } != 0 {
-                let (mut dx, mut dy) = (96, 96);
-                unsafe { GetDpiForMonitor(m, MDT_EFFECTIVE_DPI, &mut dx, &mut dy) };
-                let r = mi.rcMonitor;
-                out.push(Display {
-                    x: r.left,
-                    y: r.top,
-                    width: (r.right - r.left) as u32,
-                    height: (r.bottom - r.top) as u32,
-                    scale: dx * 100 / 96,
-                    primary: mi.dwFlags & 1 != 0,
-                });
-            }
-            1
-        }
-        let mut out: Vec<Display> = Vec::new();
-        unsafe {
-            EnumDisplayMonitors(
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                Some(each),
-                &mut out as *mut _ as LPARAM,
-            );
-        }
-        out
     }
 
     /// Whether the input method of the focused window is open (Japanese kana mode, …).
