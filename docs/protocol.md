@@ -103,9 +103,12 @@ Device in `video_mode = webrtc`, Mac and Comet on a tailnet (direct path, ~25 ms
   frames, same loss) but the connection survives longer.
 - Consequence: Pion/Janus work only on a clean link (LAN) until FlexFEC-03 is decoded or the
   server honors NACK. Over Tailscale use Direct (TCP): 1.0 s to first keyframe, 60 fps.
-- **Audio** (`speaker: true`, video false, separate connection): negotiates Opus 48k/2
-  sendonly, ICE and DTLS connect, but no packets arrived while the target was presumably
-  silent. Not confirmed with sound playing.
+- **Audio** (`speaker: true`, video false, own connection, as the web app does it): the server
+  answers Opus 48k/2 sendonly and ICE and DTLS connect, but **zero media bytes arrive**
+  (`bytes_rx = 0`; only STUN/RTCP trickles in), with or without `client-ice-complete` and the
+  video-only config fields. Tried with a client that was told sound was playing; whether the
+  Comet captures HDMI audio at all is not known yet (`/api/info` and `system/capability` list
+  no audio field; `get_param` lists `mic_name`, the device's USB microphone).
 
 ## U8 (partial)
 

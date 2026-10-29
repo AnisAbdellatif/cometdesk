@@ -97,20 +97,21 @@ pub fn parse_signal(text: &str) -> Signal {
 
 fn config_message(kind: MediaKind) -> Message {
     let video = kind == MediaKind::Video;
-    Message::text(
-        json!({
-            "type": "config",
-            "video": video,
-            "speaker": !video,
-            "mic": false,
-            "hid": false,
-            "offerer": true,
-            "flexfecLevel": 0,
-            "orientation": 0,
-            "camera": false,
-        })
-        .to_string(),
-    )
+    let mut config = json!({
+        "type": "config",
+        "video": video,
+        "speaker": !video,
+        "mic": false,
+        "hid": false,
+        "offerer": true,
+    });
+    if video {
+        // As the web app does: these only exist on the video connection.
+        config["flexfecLevel"] = 0.into();
+        config["orientation"] = 0.into();
+        config["camera"] = false.into();
+    }
+    Message::text(config.to_string())
 }
 
 async fn negotiate(session: Session, kind: MediaKind) -> Result<Negotiated> {
@@ -161,6 +162,11 @@ async fn negotiate(session: Session, kind: MediaKind) -> Result<Negotiated> {
             let _ = cand_tx.send(c);
         }
     }
+    // Our only candidate is in the SDP, so gathering is already complete.
+    sink.send(Message::text(
+        json!({"type": "client-ice-complete"}).to_string(),
+    ))
+    .await?;
 
     let task = tokio::spawn(async move {
         let _sink = sink; // keeps the socket open

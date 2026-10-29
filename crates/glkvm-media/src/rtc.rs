@@ -395,6 +395,19 @@ async fn pump_audio(
                     tracing::info!(?st, "audio ice state");
                 }
                 Ok(Output::Event(Event::Connected)) => tracing::info!("audio dtls connected"),
+                Ok(Output::Event(Event::PeerStats(p))) => {
+                    tracing::debug!(
+                        rx = p.peer_bytes_rx,
+                        media_rx = p.bytes_rx,
+                        "audio peer stats"
+                    );
+                }
+                Ok(Output::Event(Event::MediaIngressStats(m))) => {
+                    tracing::debug!(packets = m.packets, "audio media stats");
+                }
+                Ok(Output::Event(Event::MediaAdded(m))) => {
+                    tracing::info!(kind = ?m.kind, "audio media added");
+                }
                 Ok(Output::Event(Event::MediaData(d))) => {
                     if !got_any {
                         got_any = true;
