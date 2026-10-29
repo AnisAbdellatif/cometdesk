@@ -128,6 +128,17 @@ impl Ring {
             }
         }
     }
+
+    /// Pops up to `max` stereo frames into `dst`. Lets the RT callback hold the lock only for
+    /// this copy, resampling afterwards without it.
+    fn drain_frames(&mut self, max: usize, dst: &mut Vec<[f32; 2]>) {
+        for _ in 0..max {
+            match self.pop_frame() {
+                Some(f) => dst.push(f),
+                None => break,
+            }
+        }
+    }
 }
 
 fn device_name(d: &cpal::Device) -> Option<String> {
@@ -146,7 +157,16 @@ pub fn output_devices() -> Vec<String> {
 pub struct Player {
     _stream: cpal::Stream,
     muted: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
     _decoder: JoinHandle<()>,
+}
+
+impl Drop for Player {
+    fn drop(&mut self) {
+        // The decode task is `spawn_blocking` and cannot be aborted; ask it to exit so it does
+        // not linger decoding into a dropped ring until the packet channel closes.
+        self.stop.store(true, Ordering::Relaxed);
+    }
 }
 
 impl Player {
@@ -183,6 +203,7 @@ impl Player {
 
         let ring = Arc::new(Mutex::new(Ring::default()));
         let muted = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
 
         let cb_ring = ring.clone();
         let cb_muted = muted.clone();
@@ -190,27 +211,35 @@ impl Player {
         let cb_played = played.clone();
         // Linear resampler state: position between `prev` and `next` source frames.
         let (mut prev, mut next, mut pos) = ([0f32; 2], [0f32; 2], 1.0f32);
+        // Source frames fetched for the current callback, consumed from `used` onward.
+        let (mut src, mut used) = (Vec::<[f32; 2]>::new(), 0usize);
         let stream = device
             .build_output_stream(
                 config.config(),
                 move |out: &mut [f32], _| {
                     let silent = cb_muted.load(Ordering::Relaxed);
-                    let mut ring = cb_ring.lock().unwrap();
+                    let out_frames = out.len() / out_channels.max(1);
+                    // Fetch once, holding the lock only for the copy; resample without it.
+                    let need = (out_frames as f32 * step).ceil() as usize + 2;
+                    if src.len() - used < need {
+                        src.drain(..used);
+                        used = 0;
+                        let want = need - src.len();
+                        cb_ring.lock().unwrap().drain_frames(want, &mut src);
+                    }
                     let mut got = 0u64;
                     for frame in out.chunks_mut(out_channels) {
                         while pos >= 1.0 {
                             pos -= 1.0;
                             prev = next;
-                            match ring.pop_frame() {
-                                Some(f) => {
-                                    next = f;
-                                    got += 1;
-                                }
-                                None => {
-                                    next = [0.0; 2];
-                                    pos = 1.0;
-                                    break;
-                                }
+                            if used < src.len() {
+                                next = src[used];
+                                used += 1;
+                                got += 1;
+                            } else {
+                                next = [0.0; 2];
+                                pos = 1.0;
+                                break;
                             }
                         }
                         let l = prev[0] + (next[0] - prev[0]) * pos;
@@ -236,6 +265,7 @@ impl Player {
             .play()
             .map_err(|e| PlayError::Device(e.to_string()))?;
 
+        let dec_stop = stop.clone();
         let decoder = tokio::task::spawn_blocking(move || {
             let mut dec = match OpusDecoder::new(RATE, CHANNELS) {
                 Ok(d) => d,
@@ -245,6 +275,9 @@ impl Player {
             let (mut decoded, mut failed, mut peak) = (0u64, 0u64, 0f32);
             let mut last = std::time::Instant::now();
             while let Some(packet) = packets.blocking_recv() {
+                if dec_stop.load(Ordering::Relaxed) {
+                    break;
+                }
                 // The pure-Rust decoder can panic on odd packets (an overflowing shift in a
                 // CELT band mask); lose the packet, not the audio.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -283,6 +316,7 @@ impl Player {
         Ok(Player {
             _stream: stream,
             muted,
+            stop,
             _decoder: decoder,
         })
     }

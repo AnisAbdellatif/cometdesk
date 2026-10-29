@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use glkvm::api::atx::{AtxButton, PowerAction};
 use glkvm::api::streamer::{QualityPreset, StreamerUpdate};
-use glkvm::api::system::VideoMode;
+use glkvm::api::system::{LatencyMode, Orientation, VencMode, VideoMode};
 use glkvm::events::{EventOptions, EventSession};
 use glkvm::tls::PinStore;
 use glkvm::{Credentials, Session};
@@ -109,6 +109,36 @@ enum Cmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Show the encoder mode, or change it (device-wide, asks for confirmation).
+    VencMode {
+        #[arg(value_enum)]
+        mode: Option<VencModeArg>,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Show the latency mode, or change it (device-wide, asks for confirmation).
+    LatencyMode {
+        #[arg(value_enum)]
+        mode: Option<LatencyModeArg>,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Show the picture rotation, or change it (device-wide, asks for confirmation).
+    Orientation {
+        /// Degrees.
+        #[arg(value_parser = clap::builder::PossibleValuesParser::new(["0", "90", "180", "270"]))]
+        degrees: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// List the display (EDID) presets, or switch to one by key (device-wide, asks for
+    /// confirmation; the target sees a monitor change).
+    Edid {
+        /// Preset key from the list, e.g. E1920x1080.
+        key: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
     /// Show or change encoder quality (device-wide, asks for confirmation).
     Quality {
         /// Named level; sets bitrate (inside the device limits) and fps.
@@ -145,10 +175,49 @@ enum Cmd {
     },
     /// Record scrubbed read-only API responses as test fixtures.
     RecordFixtures { dir: PathBuf },
+    /// Virtual media: images stored on the device, mounted as a CD-ROM or USB drive.
+    Msd {
+        #[command(subcommand)]
+        cmd: MsdCmd,
+    },
     /// Clipboard bridge on the device (docs/clipboard-bridge.md).
     Bridge {
         #[command(subcommand)]
         cmd: BridgeCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum MsdCmd {
+    /// Show the stored images and what the target sees.
+    Status,
+    /// Upload an image file to the device's storage.
+    Upload {
+        file: PathBuf,
+        /// Name on the device. Defaults to the file name.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Connect an image to the target (device-wide, asks for confirmation).
+    Mount {
+        /// Image name as listed by `msd status`.
+        image: String,
+        /// Present it as a USB flash drive instead of a CD-ROM.
+        #[arg(long)]
+        flash: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Disconnect the drive from the target.
+    Unmount {
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Delete a stored image.
+    Remove {
+        image: String,
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -227,6 +296,19 @@ enum VideoModeArg {
     /// GL native adaptive mode (disables Janus).
     GlWebrtc,
     DirectH264,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum VencModeArg {
+    /// Reduces bandwidth.
+    Smart,
+    Normal,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum LatencyModeArg {
+    LowestLatency,
+    SmoothDisplay,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -367,6 +449,28 @@ async fn one_shot(session: &Session, cmd: Cmd) -> Result<()> {
             };
             commands::quality(session, preset, manual, yes).await
         }
+        Cmd::VencMode { mode, yes } => {
+            let mode = mode.map(|m| match m {
+                VencModeArg::Smart => VencMode::Smart,
+                VencModeArg::Normal => VencMode::Normal,
+            });
+            commands::venc_mode(session, mode, yes).await
+        }
+        Cmd::LatencyMode { mode, yes } => {
+            let mode = mode.map(|m| match m {
+                LatencyModeArg::LowestLatency => LatencyMode::LowestLatency,
+                LatencyModeArg::SmoothDisplay => LatencyMode::SmoothDisplay,
+            });
+            commands::latency_mode(session, mode, yes).await
+        }
+        Cmd::Orientation { degrees, yes } => {
+            let o = degrees
+                .map(|d| d.parse().ok().and_then(Orientation::from_degrees))
+                .map(|o| o.context("orientation must be 0, 90, 180 or 270"))
+                .transpose()?;
+            commands::orientation(session, o, yes).await
+        }
+        Cmd::Edid { key, yes } => commands::edid(session, key.as_deref(), yes).await,
         Cmd::VideoMode { mode, yes } => {
             let mode = mode.map(|m| match m {
                 VideoModeArg::FlexFec => VideoMode::FlexFec,
@@ -382,6 +486,15 @@ async fn one_shot(session: &Session, cmd: Cmd) -> Result<()> {
             commands::type_text(session, text, keymap.as_deref(), slow).await
         }
         Cmd::RecordFixtures { dir } => commands::record_fixtures(session, &dir).await,
+        Cmd::Msd { cmd } => match cmd {
+            MsdCmd::Status => commands::msd_status(session).await,
+            MsdCmd::Upload { file, name } => commands::msd_upload(session, &file, name).await,
+            MsdCmd::Mount { image, flash, yes } => {
+                commands::msd_mount(session, &image, !flash, yes).await
+            }
+            MsdCmd::Unmount { yes } => commands::msd_unmount(session, yes).await,
+            MsdCmd::Remove { image, yes } => commands::msd_remove(session, &image, yes).await,
+        },
         Cmd::Bridge { cmd } => match cmd {
             BridgeCmd::Status => commands::bridge_status(session).await,
             BridgeCmd::Setup { agents } => commands::bridge_setup(session, &agents).await,
@@ -508,7 +621,12 @@ async fn probe(session: Session, frames: usize) -> Result<()> {
             continue;
         }
         let text = ev.data.to_string();
-        println!("event {:<12} {}", ev.kind, &text[..text.len().min(300)]);
+        let max = text.len().min(300);
+        let cut = (0..=max)
+            .rev()
+            .find(|&i| text.is_char_boundary(i))
+            .unwrap_or(0);
+        println!("event {:<12} {}", ev.kind, &text[..cut]);
     }
     let streamer = session.streamer_state().await?;
     println!("streamer (after /api/ws, 3 s): {:?}", streamer.streamer);

@@ -295,7 +295,7 @@ pub async fn sync_agents(
 ) -> Result<Vec<String>> {
     let mut uploaded = Vec::new();
     for name in AGENT_NAMES {
-        let Ok(data) = std::fs::read(dir.join(name)) else {
+        let Ok(data) = tokio::fs::read(dir.join(name)).await else {
             continue;
         };
         let sha = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&data));

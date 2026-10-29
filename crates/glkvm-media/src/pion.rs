@@ -96,7 +96,7 @@ pub fn parse_signal(text: &str) -> Signal {
     }
 }
 
-fn config_message(kind: MediaKind) -> Message {
+fn config_message(kind: MediaKind, orientation: i32) -> Message {
     let video = kind == MediaKind::Video;
     let mut config = json!({
         "type": "config",
@@ -109,7 +109,7 @@ fn config_message(kind: MediaKind) -> Message {
     if video {
         // As the web app does: these only exist on the video connection.
         config["flexfecLevel"] = fec_level().into();
-        config["orientation"] = 0.into();
+        config["orientation"] = orientation.into();
         config["camera"] = false.into();
     }
     Message::text(config.to_string())
@@ -180,7 +180,14 @@ async fn negotiate(session: Session, kind: MediaKind) -> Result<Negotiated> {
         fec = Some(pt);
     }
     tracing::debug!(sdp = %offer_sdp, "pion offer");
-    sink.send(config_message(kind)).await?;
+    // The device rotates the picture for WebRTC; a failed read just means no rotation.
+    let orientation = session
+        .system_config()
+        .await
+        .ok()
+        .and_then(|c| c.orientation)
+        .unwrap_or(0);
+    sink.send(config_message(kind, orientation)).await?;
     sink.send(Message::text(
         json!({"type": "offer", "sdp": encode_sdp("offer", &offer_sdp)}).to_string(),
     ))

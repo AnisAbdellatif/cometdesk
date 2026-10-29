@@ -57,9 +57,23 @@ impl PinStore {
     }
 
     pub fn pin(&self, host: &str, fingerprint: &str) -> io::Result<()> {
-        let mut pins = self.pins.lock().unwrap();
-        pins.insert(host.to_owned(), fingerprint.to_owned());
+        self.remember(host, fingerprint);
+        self.flush()
+    }
+
+    /// Records a pin in memory only. Persist with [`Self::flush`].
+    pub(crate) fn remember(&self, host: &str, fingerprint: &str) {
+        self.pins
+            .lock()
+            .unwrap()
+            .insert(host.to_owned(), fingerprint.to_owned());
+    }
+
+    /// Writes the current pins to disk, if this store is persisted. Blocking (does an
+    /// `fsync`): never call it directly from an async task — see [`TofuVerifier`].
+    pub(crate) fn flush(&self) -> io::Result<()> {
         if let Some(path) = &self.path {
+            let pins = self.pins.lock().unwrap();
             save_pins(path, &pins)?;
         }
         Ok(())
@@ -167,9 +181,29 @@ impl TofuVerifier {
         }
     }
 
-    /// `(pinned, presented)` if the last handshake failed because the certificate changed.
+    /// `(pinned, presented)` if the certificate presented for this host no longer matches the
+    /// pin. Does not consume the record: every concurrent request that fails on a changed
+    /// certificate reports it, and a later successful handshake clears it.
     pub fn take_mismatch(&self) -> Option<(String, String)> {
-        self.mismatch.lock().unwrap().take()
+        self.mismatch.lock().unwrap().clone()
+    }
+
+    /// Persists the pin store off the async worker. The pin is already in memory, so the
+    /// handshake does not wait for the disk.
+    fn flush_store(&self) {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                let store = self.store.clone();
+                handle.spawn_blocking(move || {
+                    if let Err(e) = store.flush() {
+                        tracing::warn!(%e, "could not persist the pinned certificate");
+                    }
+                });
+            }
+            Err(_) => {
+                let _ = self.store.flush();
+            }
+        }
     }
 }
 
@@ -182,18 +216,25 @@ impl ServerCertVerifier for TofuVerifier {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
+        // The disk write on first contact is kept off this thread: this verifier runs inside
+        // the TLS handshake on an async worker, and `save_pins` does a blocking `fsync`.
         let fp = fingerprint(end_entity);
-        match check_pin(&self.store, &self.host, &fp) {
-            Ok(PinCheck::Match) => Ok(ServerCertVerified::assertion()),
-            Ok(PinCheck::Pinned) => {
-                tracing::info!(host = %self.host, fingerprint = %fp, "pinned device certificate");
+        match self.store.get(&self.host) {
+            Some(pinned) if pinned == fp => {
+                *self.mismatch.lock().unwrap() = None;
                 Ok(ServerCertVerified::assertion())
             }
-            Ok(PinCheck::Mismatch { pinned }) => {
+            Some(pinned) => {
                 *self.mismatch.lock().unwrap() = Some((pinned, fp));
                 Err(rustls::Error::General("device certificate changed".into()))
             }
-            Err(e) => Err(rustls::Error::General(format!("pin store: {e}"))),
+            None => {
+                self.store.remember(&self.host, &fp);
+                self.flush_store();
+                *self.mismatch.lock().unwrap() = None;
+                tracing::info!(host = %self.host, fingerprint = %fp, "pinned device certificate");
+                Ok(ServerCertVerified::assertion())
+            }
         }
     }
 

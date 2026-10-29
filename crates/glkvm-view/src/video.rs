@@ -13,10 +13,16 @@ use glkvm_media::vt::VideoFrame;
 use crate::input::Rect;
 
 const SHADER: &str = r#"
+struct Rot {
+    quarter_turns: u32,
+};
+
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
 };
+
+@group(0) @binding(3) var<uniform> rot: Rot;
 
 @vertex
 fn vs(@builtin(vertex_index) i: u32) -> VsOut {
@@ -24,7 +30,14 @@ fn vs(@builtin(vertex_index) i: u32) -> VsOut {
     let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
     var out: VsOut;
     out.pos = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
-    out.uv = vec2<f32>(p.x, 1.0 - p.y);
+    // Position in the displayed (rotated) picture, y down; map back to the source frame.
+    let d = vec2<f32>(p.x, 1.0 - p.y);
+    switch rot.quarter_turns {
+        case 1u: { out.uv = vec2<f32>(1.0 - d.y, d.x); }
+        case 2u: { out.uv = vec2<f32>(1.0 - d.x, 1.0 - d.y); }
+        case 3u: { out.uv = vec2<f32>(d.y, 1.0 - d.x); }
+        default: { out.uv = d; }
+    }
     return out;
 }
 
@@ -69,6 +82,8 @@ struct Nv12 {
 }
 
 pub struct VideoRenderer {
+    rotation: wgpu::Buffer,
+    quarter_turns: u32,
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
@@ -117,6 +132,16 @@ impl VideoRenderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -163,7 +188,16 @@ impl VideoRenderer {
             return Err(RenderError::ZeroCopyUnavailable);
         }
 
+        let rotation = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rotation"),
+            // 16 bytes: the smallest uniform binding every backend accepts.
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let r = Self {
+            rotation,
+            quarter_turns: 0,
             device: device.clone(),
             queue: queue.clone(),
             pipeline,
@@ -179,9 +213,31 @@ impl VideoRenderer {
         Ok(r)
     }
 
-    /// Size of the current frame.
+    /// Size of the current frame as displayed (after rotation).
     pub fn video_size(&self) -> Option<(u32, u32)> {
-        self.current.as_ref().map(|t| t.size)
+        let (w, h) = self.current.as_ref()?.size;
+        Some(if self.quarter_turns % 2 == 1 {
+            (h, w)
+        } else {
+            (w, h)
+        })
+    }
+
+    /// Rotates the picture clockwise by `degrees` (0, 90, 180 or 270; others count as 0).
+    /// Matches the device's `orientation` setting.
+    pub fn set_rotation(&mut self, degrees: i32) {
+        let turns = match degrees {
+            90 => 1,
+            180 => 2,
+            270 => 3,
+            _ => 0,
+        };
+        if turns != self.quarter_turns {
+            self.quarter_turns = turns;
+            let mut bytes = [0u8; 16];
+            bytes[..4].copy_from_slice(&turns.to_le_bytes());
+            self.queue.write_buffer(&self.rotation, 0, &bytes);
+        }
     }
 
     pub fn path_name(&self) -> &'static str {
@@ -324,6 +380,10 @@ impl VideoRenderer {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.rotation.as_entire_binding(),
                 },
             ],
         })

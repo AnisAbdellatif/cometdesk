@@ -71,17 +71,23 @@ impl Session {
             .and_then(VideoMode::parse))
     }
 
-    /// Switches the saved video mode. **Device-wide and persisted.** `set_config` replaces
-    /// the whole object, so this reads it, changes only `video_mode` and writes it back, then
-    /// re-reads to confirm. A change made by another viewer in between is overwritten.
+    /// Switches the saved video mode. **Device-wide and persisted.** See
+    /// [`Session::set_config_field`] for the write semantics.
     pub async fn set_video_mode(&self, mode: VideoMode) -> Result<()> {
+        self.set_config_field("video_mode", mode.wire_name().into())
+            .await
+    }
+
+    /// Reads `system/get_config`, replaces one field and writes the object back (the API
+    /// replaces the whole object), then re-reads to confirm. **Device-wide and persisted**:
+    /// a change made by another viewer in between is overwritten.
+    pub async fn set_config_field(&self, key: &str, value: Value) -> Result<()> {
         #[derive(Deserialize)]
         struct Cfg {
             config: Map<String, Value>,
         }
         let mut cfg: Cfg = self.get("system/get_config", &[]).await?;
-        cfg.config
-            .insert("video_mode".into(), mode.wire_name().into());
+        cfg.config.insert(key.into(), value.clone());
         let body = Value::Object(cfg.config).to_string();
         let (status, bytes) = self
             .request(
@@ -92,12 +98,126 @@ impl Session {
             )
             .await?;
         parse_envelope::<Value>(status, &bytes)?;
-        match self.video_mode().await? {
-            Some(m) if m == mode => Ok(()),
+        let after: Cfg = self.get("system/get_config", &[]).await?;
+        match after.config.get(key) {
+            Some(v) if *v == value => Ok(()),
             other => Err(Error::Protocol(format!(
-                "device kept video_mode {other:?} after set_config"
+                "device kept {key} = {other:?} after set_config"
             ))),
         }
+    }
+
+    /// Rotates the picture. **Device-wide and persisted.** WebRTC sources rotate on the
+    /// device (the angle is sent when the stream starts); Direct frames are rotated by the
+    /// viewer.
+    pub async fn set_orientation(&self, o: Orientation) -> Result<()> {
+        self.set_config_field("orientation", o.degrees().into())
+            .await
+    }
+
+    /// Smart/normal encoder mode. **Device-wide and persisted** in both the config and the
+    /// encoder parameters, as the web app does.
+    pub async fn set_venc_mode(&self, mode: VencMode) -> Result<()> {
+        self.set_config_field("venc_mode", mode.wire_name().into())
+            .await?;
+        self.set_stream_param("venc_mode", mode.wire_name()).await
+    }
+
+    /// Latency/quality trade-off. **Device-wide and persisted**: the config keeps the choice
+    /// and the encoder's `zero_delay` flag follows it.
+    pub async fn set_latency_mode(&self, mode: LatencyMode) -> Result<()> {
+        self.set_config_field("video_processing", mode.wire_name().into())
+            .await?;
+        let zero_delay = if mode == LatencyMode::LowestLatency {
+            "true"
+        } else {
+            "false"
+        };
+        self.set_stream_param("zero_delay", zero_delay).await
+    }
+
+    async fn set_stream_param(&self, key: &str, value: &str) -> Result<()> {
+        self.post::<Value>("streamer/set_params", &[(key, value)])
+            .await?;
+        Ok(())
+    }
+}
+
+/// Picture rotation (`system/get_config` → `orientation`, degrees).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Orientation {
+    #[default]
+    Deg0,
+    Deg90,
+    Deg180,
+    Deg270,
+}
+
+impl Orientation {
+    pub const ALL: [Orientation; 4] = [
+        Orientation::Deg0,
+        Orientation::Deg90,
+        Orientation::Deg180,
+        Orientation::Deg270,
+    ];
+
+    pub fn degrees(self) -> i32 {
+        match self {
+            Orientation::Deg0 => 0,
+            Orientation::Deg90 => 90,
+            Orientation::Deg180 => 180,
+            Orientation::Deg270 => 270,
+        }
+    }
+
+    pub fn from_degrees(d: i32) -> Option<Orientation> {
+        Self::ALL.into_iter().find(|o| o.degrees() == d)
+    }
+}
+
+/// Encoder mode (`venc_mode`). Smart reduces bandwidth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VencMode {
+    Smart,
+    Normal,
+}
+
+impl VencMode {
+    pub const ALL: [VencMode; 2] = [VencMode::Smart, VencMode::Normal];
+
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            VencMode::Smart => "smart",
+            VencMode::Normal => "normal",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<VencMode> {
+        Self::ALL.into_iter().find(|m| m.wire_name() == s)
+    }
+}
+
+/// `video_processing`: web UI "Latency Mode".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LatencyMode {
+    /// Lowest latency (the encoder's `zero_delay`).
+    LowestLatency,
+    /// Smooth display: steadier picture, more delay.
+    SmoothDisplay,
+}
+
+impl LatencyMode {
+    pub const ALL: [LatencyMode; 2] = [LatencyMode::LowestLatency, LatencyMode::SmoothDisplay];
+
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            LatencyMode::LowestLatency => "low_latency_first",
+            LatencyMode::SmoothDisplay => "quality_first",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<LatencyMode> {
+        Self::ALL.into_iter().find(|m| m.wire_name() == s)
     }
 }
 

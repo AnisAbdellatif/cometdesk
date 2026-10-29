@@ -26,8 +26,10 @@ import glob
 import hashlib
 import logging
 import os
+import pwd
 import re
 import socket
+import tempfile
 import time
 
 from aiohttp import WSMsgType, web
@@ -263,20 +265,26 @@ def list_agents() -> list[dict]:
 async def handle_agent_upload(request: web.Request) -> web.Response:
     path = _agent_path(request.match_info["name"])
     os.makedirs(AGENTS_DIR, exist_ok=True)
-    tmp = path + ".part"
+    # Unique temp name so concurrent PUTs don't clobber each other; the "." prefix keeps it
+    # out of AGENT_NAME (so list_agents/_agent_path never surface an in-flight upload, even
+    # one named "x.part"). Cleaned up on any failure.
+    fd, tmp = tempfile.mkstemp(dir=AGENTS_DIR, prefix=".upload-")
     digest = hashlib.sha256()
     size = 0
-    with open(tmp, "wb") as f:
-        async for chunk in request.content.iter_chunked(65536):
-            size += len(chunk)
-            if size > MAX_AGENT_SIZE:
-                f.close()
-                os.unlink(tmp)
-                raise web.HTTPRequestEntityTooLarge(MAX_AGENT_SIZE, size)
-            digest.update(chunk)
-            f.write(chunk)
-    os.chmod(tmp, 0o644)
-    os.replace(tmp, path)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            async for chunk in request.content.iter_chunked(65536):
+                size += len(chunk)
+                if size > MAX_AGENT_SIZE:
+                    raise web.HTTPRequestEntityTooLarge(MAX_AGENT_SIZE, size)
+                digest.update(chunk)
+                f.write(chunk)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
     log.info("agent binary %s stored (%d bytes)", os.path.basename(path), size)
     return web.json_response({"name": os.path.basename(path), "size": size, "sha256": digest.hexdigest()})
 
@@ -325,6 +333,46 @@ async def serve_downloads(host: str, port: int) -> None:
             await asyncio.sleep(5)
 
 
+def _restrict_socket(path: str) -> None:
+    """Lock the relay socket down to nginx only.
+
+    nginx proxies to this socket *after* the kvmd login check, so any local uid able to
+    connect to it would bypass that login entirely. 0o666 let everyone in; use 0o660 and
+    give it to the user nginx runs as. We learn that uid/gid from the owner of nginx's
+    pidfile, falling back to the kvmd-nginx / nginx accounts. If none resolve, keep 0o660
+    but hand the socket to its directory's group (e.g. /run/kvmd's) so it is at least not
+    world-reachable, and log loudly so the operator can verify nginx can still connect.
+    """
+    os.chmod(path, 0o660)
+    try:
+        st = os.stat("/run/kvmd/nginx.pid")
+        uid, gid, how = st.st_uid, st.st_gid, "nginx.pid owner"
+    except OSError:
+        uid = gid = -1
+        how = ""
+        for name in ("kvmd-nginx", "nginx"):
+            try:
+                ent = pwd.getpwnam(name)
+                uid, gid, how = ent.pw_uid, ent.pw_gid, "user " + name
+                break
+            except KeyError:
+                continue
+    if how:
+        try:
+            os.chown(path, uid, gid)
+            log.info("relay socket %s: mode 0o660, owned by nginx (%s)", path, how)
+            return
+        except OSError as ex:
+            log.warning("cannot chown relay socket to nginx (%s): %s", how, ex)
+    try:
+        dir_gid = os.stat(os.path.dirname(path) or ".").st_gid
+        os.chown(path, -1, dir_gid)
+    except OSError as ex:
+        log.warning("cannot set relay socket group: %s", ex)
+    log.warning("relay socket %s: mode 0o660 but nginx uid/gid unknown; "
+                "confirm nginx can still reach it", path)
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--unix", default="/run/kvmd/glkvm-bridge.sock")
@@ -345,7 +393,7 @@ async def main() -> None:
     if os.path.exists(args.unix):
         os.unlink(args.unix)
     await web.UnixSite(runner, args.unix).start()
-    os.chmod(args.unix, 0o666)  # nginx connects as its own user
+    _restrict_socket(args.unix)  # nginx-only: a world-writable socket bypasses kvmd login
     log.info("glkvm-bridge %s: client socket %s", VERSION, args.unix)
     asyncio.ensure_future(serve_downloads(args.agent_host, args.download_port))
     await serve_agent(bridge, args.agent_host, args.agent_port)

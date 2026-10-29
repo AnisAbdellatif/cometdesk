@@ -21,6 +21,10 @@ use crate::api::streamer::StreamerState;
 use crate::client::{Session, WsStream};
 use crate::hid::{Coalescer, HidCommand, MouseButton};
 
+/// HID command queue depth. A live socket drains it immediately; this only caps memory if
+/// input keeps arriving while the socket is down (that backlog is dropped on reconnect
+/// anyway). Large enough that normal use never fills it, so no real input is dropped.
+const HID_QUEUE: usize = 4096;
 const PING_INTERVAL: Duration = Duration::from_secs(2);
 const PONG_TIMEOUT: Duration = Duration::from_secs(6);
 const BACKOFF_MIN: Duration = Duration::from_millis(250);
@@ -125,12 +129,13 @@ impl Default for EventOptions {
 /// Cheap, cloneable handle for sending input. Never blocks.
 #[derive(Debug, Clone)]
 pub struct HidSender {
-    tx: mpsc::UnboundedSender<HidCommand>,
+    tx: mpsc::Sender<HidCommand>,
 }
 
 impl HidSender {
     pub fn send(&self, cmd: HidCommand) {
-        let _ = self.tx.send(cmd);
+        // Non-blocking: a full queue (socket down, input still arriving) drops the command.
+        let _ = self.tx.try_send(cmd);
     }
     pub fn key(&self, code: &'static str, pressed: bool) {
         self.send(HidCommand::Key { code, pressed });
@@ -161,7 +166,7 @@ pub struct EventSession {
 impl EventSession {
     /// Starts the session on the current tokio runtime.
     pub fn spawn(session: Session, opts: EventOptions) -> EventSession {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(HID_QUEUE);
         let (conn_tx, conn) = watch::channel(ConnState::Connecting);
         let (state_tx, state) = watch::channel(DeviceState::default());
         let (events, _) = broadcast::channel(256);
@@ -229,7 +234,7 @@ enum Exit {
 async fn supervise(
     session: Session,
     opts: EventOptions,
-    mut rx: mpsc::UnboundedReceiver<HidCommand>,
+    mut rx: mpsc::Receiver<HidCommand>,
     conn_tx: watch::Sender<ConnState>,
     state_tx: watch::Sender<DeviceState>,
     events: broadcast::Sender<Event>,
@@ -291,7 +296,7 @@ async fn supervise(
 
 async fn run(
     ws: WsStream,
-    rx: &mut mpsc::UnboundedReceiver<HidCommand>,
+    rx: &mut mpsc::Receiver<HidCommand>,
     coalescer: &mut Coalescer,
     state_tx: &watch::Sender<DeviceState>,
     events: &broadcast::Sender<Event>,

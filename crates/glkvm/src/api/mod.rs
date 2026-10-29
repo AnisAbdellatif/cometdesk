@@ -7,12 +7,17 @@
 //! Beware when adding routes: several state-changing routes on this firmware are `GET`s
 //! (`upgrade/reboot`, `upgrade/reset_default`, `2fa/create`, `2fa/delete`,
 //! `msd/partition_*`). Never call routes speculatively.
+//!
+//! `msd` covers the image-mounting half of virtual media (kvmd's standard routes); the
+//! partition ("file sharing") half uses the `partition_*` GETs and is not wired.
 
 pub mod atx;
 pub mod bridge;
 pub mod capabilities;
+pub mod edid;
 pub mod hid;
 pub mod info;
+pub mod msd;
 pub mod streamer;
 pub mod system;
 pub mod wol;

@@ -24,7 +24,8 @@ use crate::actions::Shortcut;
 use crate::console::{Connected, Console, ConsoleAction};
 use crate::devices::{ConnectError, ConnectRequest, DevicesUi};
 use crate::gpu::Gpu;
-use crate::store::Store;
+use crate::store::{SavedDevice, Store};
+use crate::theme;
 
 pub enum UserEvent {
     /// A decoded video frame is waiting.
@@ -33,6 +34,10 @@ pub enum UserEvent {
     Refresh,
     Connected(Box<Result<Connected, (ConnectRequest, ConnectError)>>),
     Notice(String),
+    /// A keychain password lookup for a device the user clicked Connect on finished.
+    Password(SavedDevice, Option<String>),
+    /// The stored clipboard pairing secret loaded for the current console.
+    ClipSecret(glkvm_clip::Secret),
 }
 
 pub struct App {
@@ -66,6 +71,7 @@ impl App {
         pins: Arc<PinStore>,
         iso_fix: bool,
     ) -> Self {
+        let devices = DevicesUi::new(Store::load_default(), rt.handle().clone(), proxy.clone());
         Self {
             rt,
             proxy,
@@ -75,7 +81,7 @@ impl App {
             gpu: None,
             egui_ctx: egui::Context::default(),
             egui_state: None,
-            devices: DevicesUi::new(Store::load_default()),
+            devices,
             console: None,
             connecting: None,
             focused: true,
@@ -101,7 +107,7 @@ impl App {
     fn pointer_to_target(&self) -> bool {
         self.console
             .as_ref()
-            .is_some_and(|c| !c.has_modal() && c.cursor_inside())
+            .is_some_and(|c| !c.has_modal() && !c.menu_open() && c.cursor_inside())
             && !self.pointer_over_ui()
     }
 
@@ -222,6 +228,7 @@ impl App {
         let ppp = self.pixels_per_point();
         let Some(gpu) = &mut self.gpu else { return };
         let rect = self.console.as_mut().and_then(|c| {
+            gpu.video.set_rotation(c.video_rotation());
             c.update_layout(gpu, ppp);
             c.video_rect(gpu, ppp)
         });
@@ -286,9 +293,16 @@ impl ApplicationHandler<UserEvent> for App {
         if self.window.is_some() {
             return;
         }
-        let attrs = Window::default_attributes()
+        #[allow(unused_mut)]
+        let mut attrs = Window::default_attributes()
             .with_title("glkvm")
-            .with_inner_size(LogicalSize::new(1280.0, 800.0));
+            .with_inner_size(LogicalSize::new(1280.0, 800.0))
+            .with_min_inner_size(LogicalSize::new(1000.0, 600.0));
+        // macOS takes the icon from the app bundle (and ignores window icons).
+        #[cfg(not(target_os = "macos"))]
+        if let Some((rgba, w, h)) = theme::logo_rgba() {
+            attrs = attrs.with_window_icon(winit::window::Icon::from_rgba(rgba, w, h).ok());
+        }
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {
@@ -298,7 +312,11 @@ impl ApplicationHandler<UserEvent> for App {
             }
         };
         #[cfg(target_os = "macos")]
-        hide_menu_bar_in_fullscreen(&window);
+        {
+            hide_menu_bar_in_fullscreen(&window);
+            set_dock_icon();
+        }
+        theme::apply(&self.egui_ctx);
         let gpu = match pollster::block_on(Gpu::new(window.clone(), RenderPath::Auto)) {
             Ok(g) => g,
             Err(e) => {
@@ -368,6 +386,18 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.request_redraw();
             }
+            UserEvent::Password(device, password) => {
+                if let Some(req) = self.devices.on_password(device, password) {
+                    self.start_connect(req);
+                }
+                self.request_redraw();
+            }
+            UserEvent::ClipSecret(secret) => {
+                if let Some(c) = &mut self.console {
+                    c.on_clip_secret(secret);
+                }
+                self.request_redraw();
+            }
         }
     }
 
@@ -375,10 +405,13 @@ impl ApplicationHandler<UserEvent> for App {
         match &event {
             WindowEvent::CloseRequested => {
                 if let Some(c) = self.console.take() {
-                    c.disconnect();
+                    let logout = c.disconnect();
+                    // Wait for the logout, but no longer than this; the runtime is dropped
+                    // with the app.
+                    let _ = self
+                        .rt
+                        .block_on(tokio::time::timeout(Duration::from_millis(500), logout));
                 }
-                // Give the logout a moment; the runtime is dropped with the app.
-                std::thread::sleep(Duration::from_millis(200));
                 event_loop.exit();
                 return;
             }
@@ -527,12 +560,7 @@ fn hide_menu_bar_in_fullscreen(window: &Window) {
     use objc2_app_kit::NSApplicationPresentationOptions as Opts;
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-    unsafe extern "C" fn options(
-        _: *mut AnyObject,
-        _: Sel,
-        _: *mut AnyObject,
-        _: usize,
-    ) -> usize {
+    unsafe extern "C" fn options(_: *mut AnyObject, _: Sel, _: *mut AnyObject, _: usize) -> usize {
         (Opts::FullScreen | Opts::HideDock | Opts::HideMenuBar).bits()
     }
 
@@ -565,5 +593,33 @@ fn hide_menu_bar_in_fullscreen(window: &Window) {
             imp,
             c"Q@:@Q".as_ptr(),
         );
+    }
+}
+
+/// Shows the logo in the Dock when running outside an app bundle (a bundle supplies its own).
+#[cfg(target_os = "macos")]
+fn set_dock_icon() {
+    use objc2::msg_send;
+    use objc2::runtime::{AnyClass, AnyObject};
+
+    let (Some(nsimage), Some(nsdata), Some(nsapp)) = (
+        AnyClass::get(c"NSImage"),
+        AnyClass::get(c"NSData"),
+        AnyClass::get(c"NSApplication"),
+    ) else {
+        return;
+    };
+    let png = theme::LOGO_PNG;
+    // SAFETY: plain AppKit calls on the main thread (`resumed` runs there); `dataWithBytes`
+    // copies the bytes, and the returned objects are autoreleased or owned by AppKit.
+    unsafe {
+        let data: *mut AnyObject = msg_send![nsdata, dataWithBytes: png.as_ptr().cast::<std::ffi::c_void>(), length: png.len()];
+        let image: *mut AnyObject = msg_send![nsimage, alloc];
+        let image: *mut AnyObject = msg_send![image, initWithData: data];
+        if image.is_null() {
+            return;
+        }
+        let app: *mut AnyObject = msg_send![nsapp, sharedApplication];
+        let _: () = msg_send![app, setApplicationIconImage: image];
     }
 }

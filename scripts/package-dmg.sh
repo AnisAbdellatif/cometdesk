@@ -42,7 +42,24 @@ cat >"$APP/Contents/Info.plist" <<PLIST
 </dict></plist>
 PLIST
 
-codesign --force --deep --sign "${CODESIGN_IDENTITY:--}" "$APP"
+IDENTITY=${CODESIGN_IDENTITY:--}
+if [ "$IDENTITY" = "-" ]; then
+	# Ad-hoc (local dev): one-shot deep sign, no hardened runtime. Unchanged.
+	codesign --force --deep --sign - "$APP"
+else
+	# Distribution: hardened runtime + a secure timestamp, signing nested Mach-O code
+	# inside-out first and then the app bundle. No --deep (Apple deprecates it and it
+	# skips the per-item options). This makes the bundle notarization-ready; notarization
+	# itself (notarytool submit + stapler) must run elsewhere -- not done here.
+	# (No entitlements in the repo, so none are passed; add --entitlements here if that
+	# changes.)
+	find "$APP" -type f | while IFS= read -r f; do
+		case "$(file -b "$f")" in
+		*Mach-O*) codesign --force --options runtime --timestamp --sign "$IDENTITY" "$f" ;;
+		esac
+	done
+	codesign --force --options runtime --timestamp --sign "$IDENTITY" "$APP"
+fi
 ln -s /Applications "$STAGE/dmg-root/Applications"
 rm -f "$OUT"
 hdiutil create -quiet -volname "$NAME" -srcfolder "$STAGE/dmg-root" -format UDZO -ov "$OUT"

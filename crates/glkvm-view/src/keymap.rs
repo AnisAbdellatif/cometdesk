@@ -158,6 +158,13 @@ pub fn is_meta(name: &str) -> bool {
     matches!(name, "MetaLeft" | "MetaRight")
 }
 
+/// Whether this physical key is a Meta/Super (Command) key, before any `translate`. With
+/// `swap_cmd_ctrl` the translated name is `ControlLeft`/`ControlRight`, so meta detection has
+/// to look at the physical code.
+pub fn is_meta_code(code: KeyCode) -> bool {
+    matches!(code, KeyCode::SuperLeft | KeyCode::SuperRight)
+}
+
 pub fn is_modifier(name: &str) -> bool {
     matches!(
         name,

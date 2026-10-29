@@ -292,6 +292,9 @@ pub struct Endpoint {
     peer: Option<Hello>,
     inbuf: Vec<u8>,
     out: Vec<u8>,
+    /// Reused for the plaintext/ciphertext of a single Noise message, to avoid a 64 KiB
+    /// allocation per message.
+    scratch: Vec<u8>,
     incoming: Option<Incoming>,
     next_id: u32,
 }
@@ -315,6 +318,7 @@ impl Endpoint {
             peer: None,
             inbuf: Vec::new(),
             out: Vec::new(),
+            scratch: Vec::new(),
             incoming: None,
             next_id: 1,
         };
@@ -479,28 +483,33 @@ impl Endpoint {
     }
 
     fn on_frame(&mut self, frame: &[u8], events: &mut Vec<Event>) -> Result<()> {
-        let mut plain = vec![0u8; MAX_NOISE_MSG];
-        match &mut self.noise {
-            Noise::Handshake(hs) => {
-                hs.read_message(frame, &mut plain)
-                    .map_err(|_| Error::Handshake)?;
-                if self.role == Role::Agent {
-                    self.write_handshake()?;
-                } else {
-                    self.maybe_finish_handshake()?;
-                }
-                Ok(())
-            }
-            Noise::Transport(t) => {
-                let n = t
-                    .read_message(frame, &mut plain)
-                    .map_err(|_| Error::Crypto)?;
-                let msg: Msg =
-                    postcard::from_bytes(&plain[..n]).map_err(|e| Error::Message(e.to_string()))?;
-                self.on_msg(msg, events)
-            }
+        // The plaintext never exceeds the ciphertext. Own the buffer (not a `self` borrow) so
+        // the arms can still call `&mut self` methods; restore it for the next message.
+        let mut plain = std::mem::take(&mut self.scratch);
+        plain.resize(frame.len(), 0);
+        let result = match &mut self.noise {
+            Noise::Handshake(hs) => hs
+                .read_message(frame, &mut plain)
+                .map_err(|_| Error::Handshake)
+                .and_then(|_| {
+                    if self.role == Role::Agent {
+                        self.write_handshake()
+                    } else {
+                        self.maybe_finish_handshake()
+                    }
+                }),
+            Noise::Transport(t) => t
+                .read_message(frame, &mut plain)
+                .map_err(|_| Error::Crypto)
+                .and_then(|n| {
+                    postcard::from_bytes(&plain[..n]).map_err(|e| Error::Message(e.to_string()))
+                })
+                .and_then(|msg| self.on_msg(msg, events)),
             Noise::Failed => Err(Error::Handshake),
-        }
+        };
+        plain.clear();
+        self.scratch = plain;
+        result
     }
 
     fn on_msg(&mut self, msg: Msg, events: &mut Vec<Event>) -> Result<()> {
@@ -612,11 +621,12 @@ impl Endpoint {
         };
         let plain = postcard::to_allocvec(msg).map_err(|e| Error::Message(e.to_string()))?;
         debug_assert!(plain.len() + TAG_LEN <= MAX_NOISE_MSG);
-        let mut buf = vec![0u8; plain.len() + TAG_LEN];
+        self.scratch.resize(plain.len() + TAG_LEN, 0);
         let n = t
-            .write_message(&plain, &mut buf)
+            .write_message(&plain, &mut self.scratch)
             .map_err(|_| Error::Crypto)?;
-        push_frame(&mut self.out, &buf[..n]);
+        push_frame(&mut self.out, &self.scratch[..n]);
+        self.scratch.clear();
         Ok(())
     }
 }

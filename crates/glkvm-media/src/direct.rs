@@ -244,13 +244,13 @@ async fn run(
                             key_requested_for_stall = false;
                             state_tx.send_replace(SourceState::Streaming { codec, profile: profile.clone() });
                         }
-                        stats.frames_total += 1;
-                        window_frames += 1;
-                        window_bytes += data.len();
                         if waiting_for_key && !key {
                             stats.dropped_total += 1;
                             continue;
                         }
+                        stats.frames_total += 1;
+                        window_frames += 1;
+                        window_bytes += data.len();
                         let frame = EncodedFrame { codec, data, keyframe: key, received_at: now.into_std() };
                         match frame_tx.try_send(frame) {
                             Ok(()) => waiting_for_key = false,

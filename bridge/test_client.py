@@ -69,7 +69,10 @@ def main() -> None:
 
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE  # prototype: the Comet's self-signed cert
+    # DO NOT COPY INTO PRODUCTION CODE. This disables TLS cert verification and is only
+    # acceptable here because test_client.py is a throwaway manual test tool pointed at a
+    # Comet's self-signed cert. Any real client must verify the cert (or pin it).
+    ctx.verify_mode = ssl.CERT_NONE  # prototype/manual-test only; see warning above
     sock = ctx.wrap_socket(socket.create_connection((args.host, 443), timeout=10))
 
     cookie = "" if args.no_auth else "Cookie: auth_token=%s\r\n" % auth_token(args.cookie_file)

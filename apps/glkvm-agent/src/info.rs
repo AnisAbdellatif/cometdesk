@@ -94,14 +94,49 @@ fn run(cmd: &str, args: &[&str]) -> Option<String> {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 mod sys {
+    use std::sync::Mutex;
+
     use super::*;
     use glkvm_clip::{Battery, Display, SessionState};
 
-    pub fn read() -> Info {
+    /// Keyboard layout, input method and display scale rarely change and each costs one or more
+    /// subprocesses (`gsettings`, `setxkbmap`, `ibus`/`fcitx5-remote`); refresh them this often
+    /// instead of on every poll. The cheap fields (`loginctl`, `xrandr`, sysfs) stay live.
+    const SLOW: Duration = Duration::from_secs(15);
+
+    #[derive(Clone)]
+    struct Slow {
+        keyboard: Option<String>,
+        layouts: Vec<String>,
+        ime: Option<bool>,
+        scale: u32,
+    }
+
+    /// The slow fields, recomputed at most every [`SLOW`].
+    fn slow() -> Slow {
+        static CACHE: Mutex<Option<(Instant, Slow)>> = Mutex::new(None);
+        let mut cache = CACHE.lock().unwrap();
+        if let Some((at, s)) = cache.as_ref()
+            && at.elapsed() < SLOW
+        {
+            return s.clone();
+        }
         let (keyboard, layouts) = keyboards();
-        Info {
+        let s = Slow {
             keyboard,
             layouts,
+            ime: ime(),
+            scale: scale(),
+        };
+        *cache = Some((Instant::now(), s.clone()));
+        s
+    }
+
+    pub fn read() -> Info {
+        let slow = slow();
+        Info {
+            keyboard: slow.keyboard,
+            layouts: slow.layouts,
             os_version: std::fs::read_to_string("/etc/os-release")
                 .ok()
                 .and_then(|t| {
@@ -109,8 +144,8 @@ mod sys {
                     Some(v.trim_matches('"').to_owned())
                 }),
             session: session(),
-            displays: displays(),
-            ime: ime(),
+            displays: displays(slow.scale),
+            ime: slow.ime,
             focus: focus(),
             user: std::env::var("USER")
                 .or_else(|_| std::env::var("LOGNAME"))
@@ -182,18 +217,22 @@ mod sys {
         }
     }
 
-    /// `xrandr` geometry (`2560x1440+0+0`); scale from GNOME's integer factor.
-    fn displays() -> Vec<Display> {
-        let Some(out) = run("xrandr", &["--query"]) else {
-            return Vec::new();
-        };
-        let scale = run(
+    /// GNOME's integer scaling factor as a percentage (100 = unscaled). A slow field.
+    fn scale() -> u32 {
+        run(
             "gsettings",
             &["get", "org.gnome.desktop.interface", "scaling-factor"],
         )
         .and_then(|t| t.split_whitespace().last()?.parse::<u32>().ok())
         .filter(|&s| s > 0)
-        .map_or(100, |s| s * 100);
+        .map_or(100, |s| s * 100)
+    }
+
+    /// `xrandr` geometry (`2560x1440+0+0`); `scale` is GNOME's cached integer factor.
+    fn displays(scale: u32) -> Vec<Display> {
+        let Some(out) = run("xrandr", &["--query"]) else {
+            return Vec::new();
+        };
         out.lines()
             .filter(|l| l.contains(" connected"))
             .filter_map(|l| {

@@ -48,9 +48,11 @@ impl Media {
     }
 }
 
-/// Where the XORed bytes start in the body of a packet with these flags.
+/// Where the XORed bytes start in the body of a packet with these flags: past the CSRC list
+/// (the low nibble counts them, 4 bytes each) and the 4-byte header-extension preamble when
+/// the X bit is set.
 fn region_start(flags: u8) -> usize {
-    if flags & 0x10 != 0 { 4 } else { 0 }
+    (flags & 0x0f) as usize * 4 + if flags & 0x10 != 0 { 4 } else { 0 }
 }
 
 /// XORs `src` into `dst`, growing `dst` with zeros as needed.
@@ -579,6 +581,74 @@ mod tests {
         let r = parse_repair(&p, 0).unwrap();
         assert_eq!(r.covered, [3, 7, 11, 15]);
         assert!(r.payload.is_empty());
+    }
+
+    #[test]
+    fn region_start_skips_csrc_and_extension_preamble() {
+        assert_eq!(region_start(0x00), 0); // no CSRC, no extension
+        assert_eq!(region_start(0x10), 4); // extension only
+        assert_eq!(region_start(0x02), 8); // two CSRCs, no extension
+        assert_eq!(region_start(0x12), 12); // two CSRCs and an extension
+    }
+
+    #[test]
+    fn rebuilds_a_lost_packet_with_csrcs() {
+        // Packets carry a 4-byte CSRC plus a header extension; the XOR must skip both.
+        fn pkt_csrc(seq: u16) -> Pkt {
+            let mut p = pkt(seq, 64);
+            // One CSRC (4 bytes) ahead of the one-byte header extension.
+            p.tail = [vec![0xca, 0xfe, 0xba, 0xbe], p.tail].concat();
+            p
+        }
+        // flags: X bit + CSRC count 1.
+        let flags = |_: &Pkt| 0x11u8;
+        let feed = |d: &mut Decoder, p: &Pkt| {
+            d.media(flags(p), marker_pt(p), p.seq, p.ts, &p.tail, &p.payload)
+        };
+        let encode = |base: u16, pkts: &[(u16, &Pkt)]| -> Vec<u8> {
+            let (mut flag, mut mpt, mut len, mut ts) = (0u8, 0u8, 0u16, 0u32);
+            let mut body = Vec::new();
+            let (mut w1, mut w2) = (0u16, 0u32);
+            for (off, p) in pkts {
+                flag ^= flags(p);
+                mpt ^= marker_pt(p);
+                let b: Vec<u8> = p.tail.iter().chain(&p.payload).copied().collect();
+                len ^= b.len() as u16;
+                ts ^= p.ts;
+                xor_into(&mut body, &b[region_start(flags(p))..]);
+                if *off < 15 {
+                    w1 |= 1 << (14 - off);
+                } else {
+                    w2 |= 1 << (30 - (off - 15));
+                }
+            }
+            let mut out = vec![flag, mpt];
+            out.extend(len.to_be_bytes());
+            out.extend(ts.to_be_bytes());
+            out.extend([1, 0, 0, 0]);
+            out.extend(0xdead_beefu32.to_be_bytes());
+            out.extend(base.to_be_bytes());
+            out.extend((w1 | 0x8000).to_be_bytes());
+            out.extend(w2.to_be_bytes());
+            out.extend(body);
+            out
+        };
+        let pkts: Vec<Pkt> = (200..204).map(pkt_csrc).collect();
+        let covered: Vec<(u16, &Pkt)> = pkts
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i as u16, p))
+            .collect();
+        let fec = encode(200, &covered);
+        let mut d = Decoder::new();
+        for (i, p) in pkts.iter().enumerate() {
+            if i != 1 {
+                feed(&mut d, p);
+            }
+        }
+        let out = d.repair(&fec);
+        assert_eq!(out.len(), 1);
+        expect(&pkts[1], &out[0]);
     }
 
     #[test]

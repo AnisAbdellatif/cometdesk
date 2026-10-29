@@ -11,6 +11,7 @@ use glkvm::api::bridge;
 use glkvm::api::capabilities::Feature;
 use glkvm::api::hid::PrintOptions;
 use glkvm::api::streamer::{QualityPreset, SnapshotOptions, StreamerUpdate};
+use glkvm::api::system::{LatencyMode, Orientation, VencMode};
 use glkvm::api::wol::Mac;
 use glkvm::events::{ConnState, EventOptions, EventSession};
 use serde_json::{Value, json};
@@ -171,6 +172,113 @@ pub async fn video_mode(
     Ok(())
 }
 
+pub async fn venc_mode(session: &Session, mode: Option<VencMode>, yes: bool) -> Result<()> {
+    let current = session.system_config().await?.venc_mode;
+    println!("venc_mode: {}", current.as_deref().unwrap_or("unknown"));
+    let Some(mode) = mode else { return Ok(()) };
+    if current.as_deref() == Some(mode.wire_name()) {
+        println!("already {}", mode.wire_name());
+        return Ok(());
+    }
+    confirm(
+        &format!(
+            "Switch the encoder to \"{}\" mode? This is device-wide and persisted.",
+            mode.wire_name()
+        ),
+        yes,
+    )?;
+    session.set_venc_mode(mode).await?;
+    println!("venc_mode: {} (confirmed)", mode.wire_name());
+    Ok(())
+}
+
+pub async fn latency_mode(session: &Session, mode: Option<LatencyMode>, yes: bool) -> Result<()> {
+    let current = session.system_config().await?.video_processing;
+    println!(
+        "video_processing: {}",
+        current.as_deref().unwrap_or("unknown")
+    );
+    let Some(mode) = mode else { return Ok(()) };
+    if current.as_deref() == Some(mode.wire_name()) {
+        println!("already {}", mode.wire_name());
+        return Ok(());
+    }
+    confirm(
+        &format!(
+            "Switch the latency mode to \"{}\"? This is device-wide and persisted.",
+            mode.wire_name()
+        ),
+        yes,
+    )?;
+    session.set_latency_mode(mode).await?;
+    println!("video_processing: {} (confirmed)", mode.wire_name());
+    Ok(())
+}
+
+pub async fn orientation(session: &Session, o: Option<Orientation>, yes: bool) -> Result<()> {
+    let current = session.system_config().await?.orientation;
+    println!(
+        "orientation: {}",
+        current.map_or("unknown".into(), |d| d.to_string())
+    );
+    let Some(o) = o else { return Ok(()) };
+    if current == Some(o.degrees()) {
+        println!("already {}", o.degrees());
+        return Ok(());
+    }
+    confirm(
+        &format!(
+            "Rotate the picture to {}°? This is device-wide and persisted: other viewers \
+             (web UI, other apps) are affected.",
+            o.degrees()
+        ),
+        yes,
+    )?;
+    session.set_orientation(o).await?;
+    println!("orientation: {} (confirmed)", o.degrees());
+    Ok(())
+}
+
+pub async fn edid(session: &Session, key: Option<&str>, yes: bool) -> Result<()> {
+    let current = session.edid().await?;
+    let presets = session.edid_presets().await?;
+    let is_current =
+        |p: &glkvm::api::edid::EdidPreset| glkvm::api::edid::normalize(&p.content) == current;
+    let Some(key) = key else {
+        for p in &presets {
+            println!(
+                "{} {:<18} {}{}",
+                if is_current(p) { "*" } else { " " },
+                p.key,
+                p.label,
+                if p.audio { "" } else { " (no audio)" }
+            );
+        }
+        if !presets.iter().any(is_current) {
+            println!("* (custom EDID)");
+        }
+        return Ok(());
+    };
+    let Some(p) = presets.iter().find(|p| p.key == key) else {
+        bail!("unknown EDID preset {key:?}; run `edid` to list them");
+    };
+    if is_current(p) {
+        println!("already {}", p.label);
+        return Ok(());
+    }
+    confirm(
+        &format!(
+            "Present the target a {} display? The target sees a monitor change. \
+             This is device-wide and persisted.",
+            p.label
+        ),
+        yes,
+    )?;
+    session.set_edid(&p.content).await?;
+    println!("edid: {} (confirmed)", p.label);
+    Ok(())
+}
+
 pub async fn quality(
     session: &Session,
     preset: Option<QualityPreset>,
@@ -233,6 +341,125 @@ async fn require_atx(session: &Session) -> Result<()> {
     if !session.atx_state().await?.enabled {
         bail!("ATX is not enabled on this device (no ATX board configured)");
     }
+    Ok(())
+}
+
+async fn require_msd(session: &Session) -> Result<glkvm::api::msd::MsdState> {
+    let state = session.msd_state().await?;
+    if !state.enabled {
+        bail!("virtual media is not enabled on this device");
+    }
+    Ok(state)
+}
+
+fn mib(bytes: u64) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1 << 20) as f64)
+}
+
+pub async fn msd_status(session: &Session) -> Result<()> {
+    let s = require_msd(session).await?;
+    match (s.mounted(), &s.drive.image) {
+        (Some(img), _) => println!(
+            "mounted    {img} as {}",
+            if s.drive.cdrom { "CD-ROM" } else { "USB drive" }
+        ),
+        (None, Some(img)) => println!("selected   {img} (not connected)"),
+        (None, None) => println!("mounted    nothing"),
+    }
+    if let Some(free) = s.free() {
+        println!("free       {}", mib(free));
+    }
+    for (name, img) in &s.storage.images {
+        let note = if img.complete {
+            ""
+        } else {
+            "  (incomplete upload)"
+        };
+        println!("{name:40} {:>12}{note}", mib(img.size));
+    }
+    Ok(())
+}
+
+pub async fn msd_upload(session: &Session, file: &Path, name: Option<String>) -> Result<()> {
+    let state = require_msd(session).await?;
+    let name = match name {
+        Some(n) => n,
+        None => file
+            .file_name()
+            .and_then(|n| n.to_str())
+            .context("the file name isn't valid UTF-8; pass --name")?
+            .to_owned(),
+    };
+    let size = std::fs::metadata(file)
+        .with_context(|| format!("stat {}", file.display()))?
+        .len();
+    if state.storage.images.contains_key(&name) {
+        bail!("an image named {name} already exists; remove it first or pass --name");
+    }
+    if state.free().is_some_and(|free| size > free) {
+        bail!(
+            "{} doesn't fit: {} free",
+            mib(size),
+            mib(state.free().unwrap())
+        );
+    }
+    let last = std::sync::atomic::AtomicU64::new(0);
+    session
+        .msd_upload(file, &name, move |sent, total| {
+            let pct = sent * 100 / total.max(1);
+            if pct != last.swap(pct, std::sync::atomic::Ordering::Relaxed) {
+                eprint!("\ruploading: {pct}%");
+            }
+        })
+        .await?;
+    eprintln!();
+    println!("uploaded {name} ({})", mib(size));
+    Ok(())
+}
+
+pub async fn msd_mount(session: &Session, image: &str, cdrom: bool, yes: bool) -> Result<()> {
+    let state = require_msd(session).await?;
+    if !state.storage.images.get(image).is_some_and(|i| i.complete) {
+        bail!("no complete image named {image}; see `msd status`");
+    }
+    if state.drive.connected {
+        bail!("a drive is already connected; run `msd unmount` first");
+    }
+    confirm(
+        &format!(
+            "Connect {image} to the target as a {}? (device-wide)",
+            if cdrom { "CD-ROM" } else { "USB drive" }
+        ),
+        yes,
+    )?;
+    session.msd_mount(image, cdrom).await?;
+    println!("mounted {image}");
+    Ok(())
+}
+
+pub async fn msd_unmount(session: &Session, yes: bool) -> Result<()> {
+    let state = require_msd(session).await?;
+    if !state.drive.connected {
+        println!("nothing is mounted");
+        return Ok(());
+    }
+    confirm("Disconnect the drive from the target? (device-wide)", yes)?;
+    session.msd_set_connected(false).await?;
+    println!("unmounted");
+    Ok(())
+}
+
+pub async fn msd_remove(session: &Session, image: &str, yes: bool) -> Result<()> {
+    let state = require_msd(session).await?;
+    if !state.storage.images.contains_key(image) {
+        bail!("no image named {image}; see `msd status`");
+    }
+    if state.mounted() == Some(image) {
+        bail!("{image} is mounted; run `msd unmount` first");
+    }
+    confirm(&format!("Delete {image} from the device?"), yes)?;
+    session.msd_remove(image).await?;
+    println!("removed {image}");
     Ok(())
 }
 

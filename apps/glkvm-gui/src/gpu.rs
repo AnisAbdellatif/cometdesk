@@ -124,6 +124,7 @@ impl Gpu {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Timeout => {
+                self.free_textures();
                 return Ok(());
             }
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
@@ -186,9 +187,14 @@ impl Gpu {
         extra.push(encoder.finish());
         self.queue.submit(extra);
         self.queue.present(frame);
+        self.free_textures();
+        Ok(())
+    }
+
+    /// Releases egui textures queued for freeing after the frame that stopped using them.
+    fn free_textures(&mut self) {
         for id in self.free_after_render.drain(..) {
             self.egui.free_texture(&id);
         }
-        Ok(())
     }
 }

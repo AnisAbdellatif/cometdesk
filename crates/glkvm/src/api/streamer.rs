@@ -146,15 +146,18 @@ pub enum QualityPreset {
 
 impl QualityPreset {
     pub fn update(self, limits: &StreamerLimits) -> StreamerUpdate {
-        let (bitrate_pct, fps) = match self {
+        let (bitrate_pct, fps): (i64, i64) = match self {
             QualityPreset::Low => (15, 30),
             QualityPreset::Medium => (40, 30),
             QualityPreset::High => (70, limits.desired_fps.max),
             QualityPreset::Max => (100, limits.desired_fps.max),
         };
+        // The limits come from the device, so guard against an overflowing range.
         let b = limits.h264_bitrate;
+        let span = b.max.saturating_sub(b.min);
+        let bitrate = b.min.saturating_add(span.saturating_mul(bitrate_pct) / 100);
         StreamerUpdate {
-            h264_bitrate: Some(b.min + (b.max - b.min) * bitrate_pct / 100),
+            h264_bitrate: Some(bitrate),
             desired_fps: Some(fps),
             ..Default::default()
         }

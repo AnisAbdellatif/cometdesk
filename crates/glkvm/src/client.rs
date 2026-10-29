@@ -29,6 +29,9 @@ use crate::tls::{PinStore, TofuVerifier, client_config};
 pub type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const TWO_STEP_POLL: Duration = Duration::from_secs(1);
+/// WebSocket connect timeout. Unlike the REST client, `tokio_tungstenite` has none of its
+/// own, so a black-holed host would otherwise hang the connect at OS-timeout scale.
+const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct Credentials {
@@ -110,6 +113,7 @@ pub struct SystemConfig {
     pub video_mode: Option<String>,
     pub video_processing: Option<String>,
     pub orientation: Option<i32>,
+    pub venc_mode: Option<String>,
     pub scroll_rate: Option<u32>,
     pub reverse_scrolling: Option<String>,
     pub relative_sense: Option<u32>,
@@ -307,6 +311,8 @@ pub(crate) enum Body<'a> {
     Text(&'a str),
     Json(&'a str),
     Bytes(&'a [u8]),
+    /// `multipart/form-data` with one text field, `(name, value)`.
+    Field(&'a str, &'a str),
 }
 
 impl Session {
@@ -361,6 +367,34 @@ impl Session {
         }
     }
 
+    /// `POST /api/<path>?<query>` with a streamed body and no overall timeout beyond a day.
+    /// Not retried: a stream can't be replayed, so a rejected token fails the call.
+    pub(crate) async fn post_stream<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+        body: reqwest::Body,
+    ) -> Result<T> {
+        let resp = self
+            .inner
+            .conn
+            .http
+            .post(self.inner.conn.url(path)?)
+            .query(query)
+            .timeout(Duration::from_secs(24 * 3600))
+            .header("Cookie", format!("auth_token={}", self.token()))
+            .header("Content-Type", "application/octet-stream")
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| self.inner.conn.transport(e))?;
+        let (status, bytes) = read(resp).await?;
+        if status == 401 {
+            return Err(Error::Unauthorized);
+        }
+        parse_envelope(status, &bytes)
+    }
+
     /// Sends a request, retrying once after a re-login on 401. Returns status and body.
     pub(crate) async fn request(
         &self,
@@ -395,6 +429,17 @@ impl Session {
                     req = req
                         .header("Content-Type", "application/octet-stream")
                         .body(bytes.to_vec());
+                }
+                Body::Field(name, value) => {
+                    const BOUNDARY: &str = "----glkvm-field-boundary";
+                    req = req
+                        .header(
+                            "Content-Type",
+                            format!("multipart/form-data; boundary={BOUNDARY}"),
+                        )
+                        .body(format!(
+                            "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n--{BOUNDARY}--\r\n"
+                        ));
                 }
             }
             let resp = req.send().await.map_err(|e| self.inner.conn.transport(e))?;
@@ -478,13 +523,15 @@ impl Session {
         if let Some(p) = protocol {
             headers.insert("Sec-WebSocket-Protocol", header(p)?);
         }
-        let (ws, _resp) = tokio_tungstenite::connect_async_tls_with_config(
+        let connect = tokio_tungstenite::connect_async_tls_with_config(
             req,
             None,
             true,
             Some(Connector::Rustls(self.inner.conn.tls.clone())),
-        )
-        .await?;
+        );
+        let (ws, _resp) = tokio::time::timeout(WS_CONNECT_TIMEOUT, connect)
+            .await
+            .map_err(|_| Error::Protocol(format!("websocket connect to {host} timed out")))??;
         Ok(ws)
     }
 

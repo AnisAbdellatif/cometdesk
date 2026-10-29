@@ -62,10 +62,25 @@ link_down() {
 
 start() {
 	printf "Starting glkvm-bridge: "
-	link_up
+	# link_up brings usb0 up and installs the firewall. usb0 may legitimately not exist yet
+	# (host not plugged in / gadget still enumerating), so a link_up failure is NOT fatal:
+	# start the daemon regardless -- its agent/download listeners retry until usb0 appears.
+	# Report DEGRADED (not OK) so a failed ifconfig/iptables is visible rather than hidden.
+	if link_up; then
+		link_status=OK
+	else
+		link_status=DEGRADED
+	fi
 	start-stop-daemon --start --quiet --background --make-pidfile --pidfile $PIDFILE \
 		--exec /bin/sh -- -c "exec /usr/bin/python3 $DAEMON 2>&1 | logger -t glkvm-bridge"
-	[ $? = 0 ] && echo "OK" || echo "FAIL"
+	rc=$?
+	if [ $rc != 0 ]; then
+		echo "FAIL"
+	elif [ "$link_status" = OK ]; then
+		echo "OK"
+	else
+		echo "DEGRADED (USB link not ready; daemon started, will retry)"
+	fi
 }
 
 stop() {

@@ -296,6 +296,9 @@ async fn supervise(
                 Some(req) = inserts.recv() => {
                     let _ = req.reply.send(Err("the agent is not connected".into()));
                 }
+                Some(req) = captures.recv() => {
+                    let _ = req.reply.send(Err("the agent is not connected".into()));
+                }
             }
         }
     }

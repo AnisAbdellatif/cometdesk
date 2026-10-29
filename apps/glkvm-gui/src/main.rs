@@ -6,9 +6,11 @@ mod clipsync;
 mod console;
 mod devices;
 mod gpu;
+mod media;
 mod ocr;
 mod setup;
 mod store;
+mod theme;
 
 use std::sync::Arc;
 

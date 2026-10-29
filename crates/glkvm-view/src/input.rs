@@ -3,7 +3,7 @@
 use glkvm::hid::{HidCommand, MouseButton, WheelAccumulator, to_abs, wheel_delta};
 use winit::keyboard::KeyCode;
 
-use crate::keymap::{KeyOptions, is_meta, is_modifier, translate};
+use crate::keymap::{KeyOptions, is_meta_code, is_modifier, translate};
 
 /// Where the video is drawn inside the window, in physical pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -91,6 +91,9 @@ pub struct InputMapper {
     /// Non-modifier keys pressed while Cmd was down. macOS drops their key-up while Cmd is
     /// held, so they are released when Cmd goes up.
     under_meta: Vec<&'static str>,
+    /// Physical Cmd (Super) keys currently held. Counted on the physical code so it still
+    /// works under `swap_cmd_ctrl`, where Cmd translates to a `Control*` name.
+    metas_held: u8,
     held_buttons: Vec<MouseButton>,
     inside: bool,
 }
@@ -109,6 +112,7 @@ impl InputMapper {
             },
             held_keys: Vec::new(),
             under_meta: Vec::new(),
+            metas_held: 0,
             held_buttons: Vec::new(),
             inside: false,
         }
@@ -142,8 +146,9 @@ impl InputMapper {
             return;
         };
         // macOS reports Caps Lock as a state toggle (down on enable, up on disable). The
-        // target needs a full press for every toggle.
-        if code == KeyCode::CapsLock {
+        // target needs a full press for every toggle. Other OSes deliver a normal key-down
+        // then key-up, so the shim only applies on macOS.
+        if cfg!(target_os = "macos") && code == KeyCode::CapsLock {
             out.push(HidCommand::Key {
                 code: name,
                 pressed: true,
@@ -154,12 +159,15 @@ impl InputMapper {
             });
             return;
         }
+        let meta = is_meta_code(code);
         if pressed {
             if self.held_keys.contains(&name) {
                 return;
             }
             self.held_keys.push(name);
-            if !is_modifier(name) && self.held_keys.iter().any(|k| is_meta(k)) {
+            if meta {
+                self.metas_held += 1;
+            } else if self.metas_held > 0 && !is_modifier(name) {
                 self.under_meta.push(name);
             }
             out.push(HidCommand::Key {
@@ -176,13 +184,16 @@ impl InputMapper {
                 code: name,
                 pressed: false,
             });
-            if is_meta(name) && !self.held_keys.iter().any(|k| is_meta(k)) {
-                for k in self.under_meta.drain(..) {
-                    self.held_keys.retain(|h| *h != k);
-                    out.push(HidCommand::Key {
-                        code: k,
-                        pressed: false,
-                    });
+            if meta {
+                self.metas_held = self.metas_held.saturating_sub(1);
+                if self.metas_held == 0 {
+                    for k in self.under_meta.drain(..) {
+                        self.held_keys.retain(|h| *h != k);
+                        out.push(HidCommand::Key {
+                            code: k,
+                            pressed: false,
+                        });
+                    }
                 }
             }
         }
@@ -250,6 +261,7 @@ impl InputMapper {
     pub fn focus_lost(&mut self, out: &mut Vec<HidCommand>) {
         self.held_keys.clear();
         self.under_meta.clear();
+        self.metas_held = 0;
         self.held_buttons.clear();
         self.wheel.reset();
         out.push(HidCommand::ReleaseAll);
@@ -391,6 +403,7 @@ mod tests {
         assert_eq!(out, vec![key("KeyA", true), key("KeyA", false)]);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn caps_lock_toggle_is_a_full_press_each_time() {
         let mut m = mapper();
@@ -404,6 +417,41 @@ mod tests {
                 key("CapsLock", false),
                 key("CapsLock", true),
                 key("CapsLock", false)
+            ]
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn caps_lock_is_a_normal_key_off_macos() {
+        let mut m = mapper();
+        let mut out = vec![];
+        m.key(CapsLock, true, false, &mut out);
+        m.key(CapsLock, false, false, &mut out);
+        assert_eq!(out, vec![key("CapsLock", true), key("CapsLock", false)]);
+    }
+
+    #[test]
+    fn keys_under_cmd_are_released_with_cmd_under_swap_cmd_ctrl() {
+        // swap_cmd_ctrl makes Cmd translate to ControlLeft; the release-with-Cmd workaround
+        // must still fire off the physical Super key.
+        let keys = KeyOptions {
+            swap_cmd_ctrl: true,
+            ..Default::default()
+        };
+        let mut m = InputMapper::new(keys, ScrollOptions::default());
+        m.set_layout((1920, 1080), (1920, 1080));
+        let mut out = vec![];
+        m.key(SuperLeft, true, false, &mut out);
+        m.key(KeyC, true, false, &mut out);
+        m.key(SuperLeft, false, false, &mut out);
+        assert_eq!(
+            out,
+            vec![
+                key("ControlLeft", true),
+                key("KeyC", true),
+                key("ControlLeft", false),
+                key("KeyC", false)
             ]
         );
     }

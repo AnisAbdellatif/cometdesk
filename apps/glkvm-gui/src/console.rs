@@ -11,9 +11,10 @@ use std::time::{Duration, Instant};
 use glkvm::api::atx::{AtxButton, PowerAction};
 use glkvm::api::bridge::Health;
 use glkvm::api::capabilities::{Capabilities, Feature};
+use glkvm::api::edid::{self, EdidPreset};
 use glkvm::api::hid::PrintOptions;
 use glkvm::api::streamer::{QualityPreset, SnapshotOptions, StreamerLimits, StreamerParams};
-use glkvm::api::system::VideoMode;
+use glkvm::api::system::{LatencyMode, Orientation, VencMode, VideoMode};
 use glkvm::events::{ConnState, DeviceState, EventOptions, EventSession, HidSender};
 use glkvm::hid::{HidCommand, MouseButton};
 use glkvm::{Session, SystemConfig};
@@ -33,13 +34,18 @@ use crate::actions::{self, HostModifiers, Shortcut};
 use crate::app::UserEvent;
 use crate::clipsync::{BridgeState, ClipBridge, InsertResult, Settings as ClipSettings};
 use crate::gpu::Gpu;
+use crate::media::Media;
 use crate::setup::BridgeSetup;
 use crate::store::{self, ClipDirection, SavedDevice, TargetOs};
+use crate::theme;
 
 const HIDDEN_GRACE: Duration = Duration::from_secs(30);
 const NOTICE_TIME: Duration = Duration::from_secs(4);
 /// Pause after each key event we type ourselves, so the device's HID queue keeps up.
 const KEY_GAP: Duration = Duration::from_millis(5);
+/// Upper bound on waiting for the agent's screenshot reply, so a stalled bridge never hangs
+/// the request forever.
+const CAPTURE_REPLY_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Everything the connect task produces.
 pub struct Connected {
@@ -79,16 +85,57 @@ enum Confirm {
     Click(AtxButton),
     /// Install / update / repair the bridge on the Comet; holds the action's name.
     BridgeSetup(String),
-    VideoMode(VideoMode),
+    Video(VideoChange),
+}
+
+/// A device-wide video setting the user asked to change.
+#[derive(Clone)]
+enum VideoChange {
+    Mode(VideoMode),
     Quality(QualityPreset),
+    Venc(VencMode),
+    Latency(LatencyMode),
+    Orientation(Orientation),
+    Edid(EdidPreset),
 }
 
 /// Device-wide video settings as last read from the device.
 #[derive(Default)]
 struct VideoInfo {
     mode: Option<VideoMode>,
+    venc: Option<VencMode>,
+    latency: Option<LatencyMode>,
+    orientation: Orientation,
+    /// Normalized hex of the EDID the target currently sees.
+    edid: String,
+    edid_presets: Vec<EdidPreset>,
     params: StreamerParams,
     limits: StreamerLimits,
+}
+
+/// Reads the device-wide video settings.
+async fn read_video_info(session: &Session) -> VideoInfo {
+    let (cfg, st, edid, presets) = tokio::join!(
+        session.system_config(),
+        session.streamer_state(),
+        session.edid(),
+        session.edid_presets(),
+    );
+    let cfg = cfg.ok().unwrap_or_default();
+    let st = st.unwrap_or_default();
+    VideoInfo {
+        mode: cfg.video_mode.as_deref().and_then(VideoMode::parse),
+        venc: cfg.venc_mode.as_deref().and_then(VencMode::parse),
+        latency: cfg.video_processing.as_deref().and_then(LatencyMode::parse),
+        orientation: cfg
+            .orientation
+            .and_then(Orientation::from_degrees)
+            .unwrap_or_default(),
+        edid: edid.unwrap_or_default(),
+        edid_presets: presets.unwrap_or_default(),
+        params: st.params,
+        limits: st.limits,
+    }
 }
 
 /// What the UI asks the app to do.
@@ -130,6 +177,8 @@ pub struct Console {
     pub fullscreen: bool,
     pub show_stats: bool,
     toolbar_hover: bool,
+    /// A menu or popup is open (keeps the fullscreen toolbar up; clicks go to egui).
+    menu_open: bool,
     /// Toolbar rectangle in points while it is shown.
     toolbar_rect: Option<egui::Rect>,
     typing: Option<Typing>,
@@ -156,6 +205,10 @@ pub struct Console {
     audio_on: bool,
     video_info: VideoInfo,
     video_info_rx: Option<tokio::sync::oneshot::Receiver<VideoInfo>>,
+    /// Output device names, cached while the audio-output submenu is open (enumerating them
+    /// every frame is slow); with the time they were read, for a short TTL.
+    audio_outputs: Option<(Vec<String>, Instant)>,
+    media: Media,
     /// Last keyboard layout from the agent we applied; a new report is applied again.
     adopted_keyboard: Option<String>,
     /// Last uptime the agent reported and when, to show a running value between reports.
@@ -178,6 +231,7 @@ impl Console {
                 let _ = proxy.send_event(UserEvent::Refresh);
             })
         };
+        let media = Media::new(c.session.clone(), rt.clone(), proxy.clone());
         let mut console = Console {
             hid: events.hid(),
             conn: events.conn_state(),
@@ -198,6 +252,7 @@ impl Console {
             fullscreen: false,
             show_stats: false,
             toolbar_hover: false,
+            menu_open: false,
             toolbar_rect: None,
             typing: None,
             inserting: None,
@@ -216,6 +271,8 @@ impl Console {
             audio_on: false,
             video_info: VideoInfo::default(),
             video_info_rx: None,
+            audio_outputs: None,
+            media,
             adopted_keyboard: None,
             uptime_seen: None,
             last_session: None,
@@ -228,11 +285,25 @@ impl Console {
             .unwrap_or_default();
         console.audio_on = console.device.audio;
         console.refresh_video_info();
+        console.media.refresh();
         console.start_stream();
-        if let Some(secret) = store::clip_secret(&console.device) {
-            console.start_clip(secret);
-        }
+        // The keychain read can block on a macOS ACL prompt: load the pairing secret off the
+        // UI thread and start the bridge when it arrives (see `on_clip_secret`).
+        let device = console.device.clone();
+        let proxy = console.proxy.clone();
+        console.rt.spawn_blocking(move || {
+            if let Some(secret) = store::clip_secret(&device) {
+                let _ = proxy.send_event(UserEvent::ClipSecret(secret));
+            }
+        });
         console
+    }
+
+    /// The stored pairing secret finished loading: start the clipboard bridge with it.
+    pub fn on_clip_secret(&mut self, secret: glkvm_clip::Secret) {
+        if self.clip.is_none() {
+            self.start_clip(secret);
+        }
     }
 
     // ----- clipboard bridge ----------------------------------------------------------------
@@ -261,9 +332,14 @@ impl Console {
     /// on the target with it.
     fn start_target_setup(&mut self) {
         let secret = glkvm_clip::Secret::generate();
-        if let Err(e) = store::set_clip_secret(&self.device, &secret) {
-            return self.notify(format!("Cannot store the pairing code: {e}"));
-        }
+        // The keychain write can block on a macOS ACL prompt: store the new code off the UI
+        // thread. The bridge uses the in-memory copy, so it starts regardless.
+        let (device, stored) = (self.device.clone(), secret.clone());
+        self.rt.spawn_blocking(move || {
+            if let Err(e) = store::set_clip_secret(&device, &stored) {
+                tracing::warn!(%e, "could not store the pairing code");
+            }
+        });
         self.target_setup = Some(secret.to_code());
         self.start_clip(secret);
     }
@@ -351,7 +427,9 @@ impl Console {
     }
 
     fn forget_clipboard_pairing(&mut self) {
-        store::delete_clip_secret(&self.device);
+        let device = self.device.clone();
+        self.rt
+            .spawn_blocking(move || store::delete_clip_secret(&device));
         self.clip = None;
         self.notify("Clipboard pairing removed".into());
     }
@@ -369,16 +447,22 @@ impl Console {
     fn clip_menu(&mut self, ui: &mut egui::Ui) -> ConsoleAction {
         let mut action = ConsoleAction::None;
         let needs_device = self.bridge_action().is_some();
-        let label = match self.clip.as_ref().map(ClipBridge::state) {
-            _ if self.setup.progress().is_some() => "Clipboard: setting up…".to_string(),
-            Some(_) if needs_device => "Clipboard: needs repair".into(),
-            None => "Clipboard: off".into(),
-            Some(_) if self.clip_paused => "Clipboard: paused".into(),
-            Some(BridgeState::Connected(..)) => "Clipboard: synced".into(),
-            Some(_) => "Clipboard: not connected".into(),
+        // The label takes the sync state's color: green synced, amber needs attention.
+        let (state_text, tint) = match self.clip.as_ref().map(ClipBridge::state) {
+            _ if self.setup.progress().is_some() => ("setting up…", Some(theme::WARN)),
+            Some(_) if needs_device => ("needs repair", Some(theme::WARN)),
+            None => ("off", None),
+            Some(_) if self.clip_paused => ("paused", None),
+            Some(BridgeState::Connected(..)) => ("synced", Some(theme::OK)),
+            Some(_) => ("not connected", Some(theme::WARN)),
         };
-        ui.menu_button(label, |ui| {
+        let mut title = egui::RichText::new("Clipboard");
+        if let Some(c) = tint {
+            title = title.color(c);
+        }
+        ui.menu_button(title, |ui| {
             ui.set_min_width(260.0);
+            ui.label(egui::RichText::new(format!("Clipboard: {state_text}")).strong());
             // The Comet side.
             if let Some(p) = self.setup.progress() {
                 ui.horizontal(|ui| {
@@ -399,7 +483,7 @@ impl Console {
                         ui.label(format!("Comet: bridge ready {fw}"));
                     }
                     Some(h) => {
-                        ui.colored_label(egui::Color32::from_rgb(230, 170, 50), health_text(&h));
+                        ui.colored_label(theme::WARN, health_text(&h));
                     }
                 }
                 if let Some(label) = self.bridge_action()
@@ -466,6 +550,7 @@ impl Console {
                 ui.close();
             }
         });
+
         action
     }
 
@@ -484,7 +569,7 @@ impl Console {
         let mut close = false;
         egui::Modal::new(egui::Id::unique("target-setup")).show(ctx, |ui| {
             ui.set_max_width(560.0);
-            ui.heading("Set up the target");
+            ui.label(egui::RichText::new("Set up the target").size(17.0).strong());
             ui.horizontal(|ui| {
                 ui.label("The target runs:");
                 for os in [TargetOs::Linux, TargetOs::Windows, TargetOs::MacOs] {
@@ -493,7 +578,7 @@ impl Console {
             });
             if connected {
                 ui.colored_label(
-                    egui::Color32::from_rgb(90, 180, 110),
+                    theme::OK,
                     "The agent is connected: the clipboard is shared now.",
                 );
             }
@@ -512,7 +597,7 @@ impl Console {
             };
             if missing_agent {
                 ui.colored_label(
-                    egui::Color32::from_rgb(230, 170, 50),
+                    theme::WARN,
                     "The Comet has no agent program for this system yet: build it with \
                      scripts/build-agents.sh, then update the Comet's bridge.",
                 );
@@ -635,13 +720,29 @@ impl Console {
     }
 
     fn set_audio(&mut self, on: bool) {
+        if self.device.audio != on {
+            self.device.audio = on;
+            self.target_changed = true;
+        }
         self.audio_on = on;
-        self.device.audio = on;
-        self.target_changed = true;
         let audio = if on { self.start_audio() } else { None };
         if let Some(s) = &mut self.stream {
             s.audio = audio;
         }
+    }
+
+    /// Audio output device names, re-enumerated at most once per [`AUDIO_OUTPUTS_TTL`] so the
+    /// submenu doesn't query the OS every frame it is open.
+    fn audio_outputs(&mut self) -> Vec<String> {
+        const AUDIO_OUTPUTS_TTL: Duration = Duration::from_secs(2);
+        let fresh = self
+            .audio_outputs
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() < AUDIO_OUTPUTS_TTL);
+        if !fresh {
+            self.audio_outputs = Some((glkvm_media::audio::output_devices(), Instant::now()));
+        }
+        self.audio_outputs.as_ref().unwrap().0.clone()
     }
 
     fn set_transport(&mut self, transport: Transport) {
@@ -663,38 +764,55 @@ impl Console {
         let session = self.session.clone();
         let proxy = self.proxy.clone();
         self.rt.spawn(async move {
-            let mode = session.video_mode().await.ok().flatten();
-            let st = session.streamer_state().await.unwrap_or_default();
-            let _ = tx.send(VideoInfo {
-                mode,
-                params: st.params,
-                limits: st.limits,
-            });
+            let _ = tx.send(read_video_info(&session).await);
             let _ = proxy.send_event(UserEvent::Refresh);
         });
     }
 
-    /// Writes a device-wide video setting, then re-reads the state.
-    fn apply_video(&mut self, confirm: Confirm) {
+    /// Writes a device-wide video setting, then re-reads the state. The read must follow the
+    /// write inside one task: as separate tasks they race and the menu shows the old value.
+    fn apply_video(&mut self, change: VideoChange) {
         let session = self.session.clone();
         let proxy = self.proxy.clone();
         let limits = self.video_info.limits;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.video_info_rx = Some(rx);
         self.rt.spawn(async move {
-            let msg = match confirm {
-                Confirm::VideoMode(m) => match session.set_video_mode(m).await {
-                    Ok(()) => format!("Video mode: {}", m.wire_name()),
-                    Err(e) => format!("Cannot set video mode: {e}"),
-                },
-                Confirm::Quality(p) => match session.set_streamer_params(p.update(&limits)).await {
-                    Ok(_) => "Encoder quality changed".to_string(),
-                    Err(e) => format!("Cannot set quality: {e}"),
-                },
-                _ => return,
+            let msg = match change {
+                VideoChange::Mode(m) => session
+                    .set_video_mode(m)
+                    .await
+                    .map(|()| format!("Video mode: {}", m.wire_name()))
+                    .map_err(|e| format!("Cannot set video mode: {e}")),
+                VideoChange::Quality(p) => session
+                    .set_streamer_params(p.update(&limits))
+                    .await
+                    .map(|_| "Encoder quality changed".to_string())
+                    .map_err(|e| format!("Cannot set quality: {e}")),
+                VideoChange::Venc(m) => session
+                    .set_venc_mode(m)
+                    .await
+                    .map(|()| format!("Encoder mode: {}", m.wire_name()))
+                    .map_err(|e| format!("Cannot set encoder mode: {e}")),
+                VideoChange::Latency(m) => session
+                    .set_latency_mode(m)
+                    .await
+                    .map(|()| "Latency mode changed".to_string())
+                    .map_err(|e| format!("Cannot set latency mode: {e}")),
+                VideoChange::Orientation(o) => session
+                    .set_orientation(o)
+                    .await
+                    .map(|()| format!("Orientation: {}°", o.degrees()))
+                    .map_err(|e| format!("Cannot set orientation: {e}")),
+                VideoChange::Edid(p) => session
+                    .set_edid(&p.content)
+                    .await
+                    .map(|()| format!("Display: {}", p.label))
+                    .map_err(|e| format!("Cannot set the display: {e}")),
             };
-            let _ = proxy.send_event(UserEvent::Notice(msg));
+            let _ = tx.send(read_video_info(&session).await);
+            let _ = proxy.send_event(UserEvent::Notice(msg.unwrap_or_else(|e| e)));
         });
-        // The write is quick; the read is queued behind it on the same session.
-        self.refresh_video_info();
     }
 
     fn video_menu(&mut self, ui: &mut egui::Ui) {
@@ -723,36 +841,98 @@ impl Console {
             self.set_audio(audio);
         }
         if self.audio_on {
+            let devices = self.audio_outputs();
             let mut chosen = None;
             ui.menu_button("Audio output", |ui| {
                 let current = &self.device.audio_output;
                 if ui.radio(current.is_empty(), "System default").clicked() {
                     chosen = Some(String::new());
                 }
-                for name in glkvm_media::audio::output_devices() {
-                    if ui.radio(*current == name, &name).clicked() {
-                        chosen = Some(name);
+                for name in &devices {
+                    if ui.radio(current == name, name).clicked() {
+                        chosen = Some(name.clone());
                     }
                 }
             });
             if let Some(name) = chosen {
                 self.device.audio_output = name;
+                self.target_changed = true;
                 self.set_audio(true);
                 ui.close();
             }
         }
         ui.separator();
         ui.label("Device-wide (affects every viewer)");
-        ui.label("Video mode");
-        for m in VideoMode::ALL {
-            let on = self.video_info.mode == Some(m);
-            if ui.radio(on, m.wire_name()).clicked() && !on {
-                self.confirm = Some(Confirm::VideoMode(m));
-                ui.close();
+        let info = &self.video_info;
+        let mut change = None;
+        ui.menu_button("Video mode", |ui| {
+            for m in VideoMode::ALL {
+                let on = info.mode == Some(m);
+                if ui.radio(on, m.wire_name()).clicked() && !on {
+                    change = Some(VideoChange::Mode(m));
+                }
             }
-        }
+        });
+        ui.menu_button("Encoder mode", |ui| {
+            for (m, label) in [(VencMode::Smart, "Smart"), (VencMode::Normal, "Normal")] {
+                let on = info.venc == Some(m);
+                if ui
+                    .radio(on, label)
+                    .on_hover_text("Smart mode reduces bandwidth")
+                    .clicked()
+                    && !on
+                {
+                    change = Some(VideoChange::Venc(m));
+                }
+            }
+        });
+        ui.menu_button("Latency mode", |ui| {
+            for (m, label) in [
+                (LatencyMode::LowestLatency, "Lowest latency"),
+                (LatencyMode::SmoothDisplay, "Smooth display"),
+            ] {
+                let on = info.latency == Some(m);
+                if ui.radio(on, label).clicked() && !on {
+                    change = Some(VideoChange::Latency(m));
+                }
+            }
+        });
+        ui.menu_button("Orientation", |ui| {
+            for o in Orientation::ALL {
+                let on = info.orientation == o;
+                if ui.radio(on, format!("{}°", o.degrees())).clicked() && !on {
+                    change = Some(VideoChange::Orientation(o));
+                }
+            }
+        });
+        ui.add_enabled_ui(!info.edid_presets.is_empty(), |ui| {
+            ui.menu_button("Display (EDID)", |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(360.0)
+                    .show(ui, |ui| {
+                        let current = info
+                            .edid_presets
+                            .iter()
+                            .find(|p| edid::normalize(&p.content) == info.edid);
+                        if current.is_none() {
+                            let _ = ui.radio(true, "Custom");
+                        }
+                        for p in &info.edid_presets {
+                            let on = current.is_some_and(|c| c.key == p.key);
+                            let label = if p.audio {
+                                p.label.clone()
+                            } else {
+                                format!("{} (no audio)", p.label)
+                            };
+                            if ui.radio(on, label).clicked() && !on {
+                                change = Some(VideoChange::Edid(p.clone()));
+                            }
+                        }
+                    });
+            });
+        });
         ui.separator();
-        let p = &self.video_info.params;
+        let p = &info.params;
         ui.label(format!(
             "Encoder: {} fps, {} kbit/s",
             p.desired_fps.map_or("?".into(), |v| v.to_string()),
@@ -765,9 +945,12 @@ impl Console {
             ("Max", QualityPreset::Max),
         ] {
             if ui.button(label).clicked() {
-                self.confirm = Some(Confirm::Quality(preset));
-                ui.close();
+                change = Some(VideoChange::Quality(preset));
             }
+        }
+        if let Some(c) = change {
+            self.confirm = Some(Confirm::Video(c));
+            ui.close();
         }
     }
 
@@ -869,6 +1052,16 @@ impl Console {
             return Some(self.show_stats || first);
         }
         Some(first)
+    }
+
+    /// Clockwise degrees the renderer must rotate frames: only Direct frames arrive
+    /// unrotated, the device rotates WebRTC video itself.
+    pub fn video_rotation(&self) -> i32 {
+        if self.transport == Transport::Direct {
+            self.video_info.orientation.degrees()
+        } else {
+            0
+        }
     }
 
     /// Video rectangle in physical pixels, letterboxed inside the video area.
@@ -1029,6 +1222,10 @@ impl Console {
         self.toolbar_rect.is_some_and(|r| r.contains(pos))
     }
 
+    pub fn menu_open(&self) -> bool {
+        self.menu_open
+    }
+
     pub fn has_modal(&self) -> bool {
         self.confirm.is_some() || self.target_setup.is_some()
     }
@@ -1181,8 +1378,8 @@ impl Console {
         ))
     }
 
-    fn save_notice(what: &str, path: &std::path::Path, bytes: &[u8]) -> String {
-        match std::fs::write(path, bytes) {
+    async fn save_notice(what: &str, path: &std::path::Path, bytes: &[u8]) -> String {
+        match tokio::fs::write(path, bytes).await {
             Ok(()) => format!("{what} saved to {}", path.display()),
             Err(e) => format!("Cannot save {what}: {e}"),
         }
@@ -1195,7 +1392,7 @@ impl Console {
         let path = self.download_path("jpg");
         self.rt.spawn(async move {
             let msg = match session.snapshot(SnapshotOptions::default()).await {
-                Ok(jpeg) => Self::save_notice("Snapshot", &path, &jpeg),
+                Ok(jpeg) => Self::save_notice("Snapshot", &path, &jpeg).await,
                 Err(e) => format!("Snapshot failed: {e}"),
             };
             let _ = proxy.send_event(UserEvent::Notice(msg));
@@ -1210,10 +1407,11 @@ impl Console {
         let proxy = self.proxy.clone();
         let path = self.download_path("png");
         self.rt.spawn(async move {
-            let msg = match rx.await {
-                Ok(Ok(png)) => Self::save_notice("Screenshot", &path, &png),
-                Ok(Err(e)) => format!("Screenshot failed: {e}"),
-                Err(_) => "Screenshot failed: the agent did not answer".into(),
+            let msg = match tokio::time::timeout(CAPTURE_REPLY_TIMEOUT, rx).await {
+                Ok(Ok(Ok(png))) => Self::save_notice("Screenshot", &path, &png).await,
+                Ok(Ok(Err(e))) => format!("Screenshot failed: {e}"),
+                Ok(Err(_)) => "Screenshot failed: the agent did not answer".into(),
+                Err(_) => "Screenshot failed: the agent timed out".into(),
             };
             let _ = proxy.send_event(UserEvent::Notice(msg));
         });
@@ -1254,8 +1452,8 @@ impl Console {
                     .map_err(|e| format!("Snapshot failed: {e}"))
             };
             let image = match exact {
-                Some(rx) => match rx.await {
-                    Ok(Ok(png)) => Ok(png),
+                Some(rx) => match tokio::time::timeout(CAPTURE_REPLY_TIMEOUT, rx).await {
+                    Ok(Ok(Ok(png))) => Ok(png),
                     _ => from_device().await,
                 },
                 None => from_device().await,
@@ -1385,7 +1583,9 @@ impl Console {
         });
     }
 
-    pub fn disconnect(mut self) {
+    /// Tears the console down and logs out in the background; the returned handle completes
+    /// when the logout does, so a quitting caller can wait for it.
+    pub fn disconnect(mut self) -> JoinHandle<()> {
         self.release_all();
         if let Some(w) = self.watcher.take() {
             w.abort();
@@ -1395,6 +1595,7 @@ impl Console {
         if let Some(t) = self.typing.take() {
             t.task.abort();
         }
+        self.media.shutdown();
         let session = self.session.clone();
         let events = self.events.take();
         self.rt.spawn(async move {
@@ -1402,7 +1603,7 @@ impl Console {
                 e.close().await;
             }
             let _ = session.logout().await;
-        });
+        })
     }
 
     // ----- ui --------------------------------------------------------------------------
@@ -1417,6 +1618,17 @@ impl Console {
 
     pub fn ui(&mut self, ui: &mut egui::Ui) -> ConsoleAction {
         let mut action = ConsoleAction::None;
+        self.media.poll();
+        let dropped: Vec<_> = ui.ctx().input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| f.path().to_owned())
+                .collect()
+        });
+        if !dropped.is_empty() && self.caps.supports(Feature::Msd) {
+            self.media.dropped(dropped);
+        }
         if let Some(rx) = self.inserting.as_mut() {
             match rx.try_recv() {
                 Ok(Ok(msg)) => {
@@ -1437,8 +1649,16 @@ impl Console {
         if let Some(rx) = self.video_info_rx.as_mut() {
             match rx.try_recv() {
                 Ok(info) => {
+                    // WebRTC sources get the angle in their handshake: restart to apply it.
+                    let rotated = info.orientation != self.video_info.orientation
+                        && self.video_info.mode.is_some()
+                        && self.transport != Transport::Direct;
                     self.video_info = info;
                     self.video_info_rx = None;
+                    if rotated {
+                        self.stream = None;
+                        self.start_stream();
+                    }
                     // The mode picks the audio source, so a saved "on" waits for it.
                     if self.audio_on && self.stream.as_ref().is_some_and(|s| s.audio.is_none()) {
                         self.set_audio(true);
@@ -1467,9 +1687,22 @@ impl Console {
             }
         }
         let pointer = ui.ctx().pointer_latest_pos();
-        if self.toolbar_visible(pointer) {
-            let resp = egui::Panel::top("toolbar").show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| action = self.toolbar(ui));
+        // The popups of a menu are outside the toolbar: while one is open the pointer is
+        // not over the toolbar, which must not hide it (and the menu with it).
+        self.menu_open = egui::Popup::is_any_open(ui.ctx());
+        if self.menu_open || self.toolbar_visible(pointer) {
+            let frame = egui::Frame::NONE
+                .fill(theme::PANEL)
+                .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                .inner_margin(egui::Margin::symmetric(12, 6));
+            let resp = egui::Panel::top("toolbar").frame(frame).show(ui, |ui| {
+                // Flat buttons: only hover and open states get a background.
+                let w = &mut ui.visuals_mut().widgets;
+                for s in [&mut w.inactive, &mut w.noninteractive] {
+                    s.weak_bg_fill = egui::Color32::TRANSPARENT;
+                    s.bg_stroke = egui::Stroke::NONE;
+                }
+                ui.horizontal_centered(|ui| action = self.toolbar(ui));
             });
             self.toolbar_hover = self.fullscreen && resp.response.contains_pointer();
             self.toolbar_rect = Some(resp.response.rect);
@@ -1486,15 +1719,18 @@ impl Console {
         self.video_area = central.response.rect;
         self.dialogs(ui.ctx());
         self.adopt_agent_os();
-        if std::mem::take(&mut self.target_changed) && action == ConsoleAction::None {
+        // Only clear the flag when it is actually propagated: another action this frame must
+        // not drop a pending save.
+        if self.target_changed && action == ConsoleAction::None {
+            self.target_changed = false;
             action = ConsoleAction::TargetChanged;
         }
         action
     }
 
     fn status(&self) -> (String, egui::Color32) {
-        let red = egui::Color32::from_rgb(220, 80, 70);
-        let amber = egui::Color32::from_rgb(230, 170, 50);
+        let red = theme::ERR;
+        let amber = theme::WARN;
         match &*self.conn.borrow() {
             ConnState::Connected => {}
             ConnState::Kicked => return ("Disconnected by the device".into(), red),
@@ -1513,19 +1749,26 @@ impl Console {
         if state.hid().is_some_and(|h| !h.online) {
             return ("Keyboard/mouse offline".into(), amber);
         }
-        ("Connected".into(), egui::Color32::from_rgb(90, 180, 110))
+        ("Connected".into(), theme::OK)
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) -> ConsoleAction {
         let mut action = ConsoleAction::None;
-        if ui.button("< Devices").clicked() {
+
+        // Left: where am I, and is it working.
+        if ui.button("‹ Devices").clicked() {
             action = ConsoleAction::Disconnect;
         }
-        ui.strong(self.device.display_name());
+        ui.label(
+            egui::RichText::new(self.device.display_name())
+                .size(15.0)
+                .strong(),
+        );
         let (text, color) = self.status();
-        ui.colored_label(color, text);
+        theme::status_pill(ui, color, &text);
         ui.separator();
 
+        // Middle: things to do on the target.
         ui.menu_button("Keys", |ui| {
             for (label, keys) in actions::COMBOS {
                 if ui.button(*label).clicked() {
@@ -1542,25 +1785,23 @@ impl Console {
                 }
             });
         });
-        let (label, hint) = if self.inserts_via_agent() {
-            (
-                "Insert clipboard",
-                "Right Cmd + V. Inserted in one step through the agent on the target.",
-            )
+        let hint = if self.inserts_via_agent() {
+            "Insert the clipboard in one step through the agent on the target (Right Cmd + V)"
         } else {
-            (
-                "Type clipboard",
-                "Right Cmd + V. Typed key by key (no agent connected on the target).",
-            )
+            "Type the clipboard key by key: no agent connected on the target (Right Cmd + V)"
         };
-        if ui.button(label).on_hover_text(hint).clicked() {
+        if ui
+            .add(theme::primary("Paste"))
+            .on_hover_text(hint)
+            .clicked()
+        {
             self.request_type_clipboard();
         }
         if self.clip_menu(ui) != ConsoleAction::None {
             action = ConsoleAction::TargetChanged;
         }
         let agent_up = self.inserts_via_agent();
-        ui.menu_button("Snapshot", |ui| {
+        ui.menu_button("Capture", |ui| {
             if ui
                 .button("Save device snapshot")
                 .on_hover_text("JPEG from the KVM capture, saved to ~/Downloads")
@@ -1589,7 +1830,6 @@ impl Console {
                 ui.close();
             }
         });
-        self.info_menu(ui);
         if self.caps.supports(Feature::Atx) {
             ui.menu_button("Power", |ui| {
                 let items = [
@@ -1607,73 +1847,102 @@ impl Console {
                 }
             });
         }
-        ui.separator();
-        let before = self.device.target;
-        egui::ComboBox::from_id_salt("target")
-            .selected_text(format!("Target: {}", self.device.target.label()))
-            .show_ui(ui, |ui| {
+        if self.caps.supports(Feature::Msd) {
+            self.media.menu(ui);
+        }
+        self.info_menu(ui);
+
+        // Right: the viewer itself.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let (icon, tip) = if self.fullscreen {
+                ("Exit fullscreen", "Right Cmd + F")
+            } else {
+                ("Fullscreen", "Right Cmd + F")
+            };
+            if ui.button(icon).on_hover_text(tip).clicked() {
+                action = ConsoleAction::ToggleFullscreen;
+            }
+            if self.settings_menu(ui) {
+                action = ConsoleAction::TargetChanged;
+            }
+            ui.menu_button("Video", |ui| self.video_menu(ui));
+        });
+        action
+    }
+
+    /// Target OS, keyboard layout, stats and the device's web interface. True when the saved
+    /// device changed.
+    fn settings_menu(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        ui.menu_button("Settings", |ui| {
+            ui.set_min_width(200.0);
+            let before = self.device.target;
+            ui.menu_button(format!("Target OS: {}", before.label()), |ui| {
                 for os in TargetOs::ALL {
-                    ui.selectable_value(&mut self.device.target, os, os.label());
+                    if ui
+                        .radio_value(&mut self.device.target, os, os.label())
+                        .clicked()
+                    {
+                        ui.close();
+                    }
                 }
             });
-        if self.device.target != before {
-            let iso = self.mapper.keys.iso_fix;
-            self.mapper.keys = self.device.target.key_options(iso);
-            action = ConsoleAction::TargetChanged;
-        }
-        let current = self.keymap().unwrap_or_else(|| "default".into());
-        let on_target: Vec<&'static str> = self
-            .agent()
-            .map(|(_, i)| {
-                i.layouts
-                    .iter()
-                    .filter_map(|l| glkvm::layout::keymap_from_native(l))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let before = self.device.keymap.clone();
-        egui::ComboBox::from_id_salt("keymap")
-            .selected_text(format!("Layout: {current}"))
-            .show_ui(ui, |ui| {
-                for k in &self.keymaps {
-                    let label = if on_target.contains(&k.as_str()) {
-                        format!("{k} (on target)")
-                    } else {
-                        k.clone()
-                    };
-                    ui.selectable_value(&mut self.device.keymap, Some(k.clone()), label);
-                }
+            if self.device.target != before {
+                let iso = self.mapper.keys.iso_fix;
+                self.mapper.keys = self.device.target.key_options(iso);
+                changed = true;
+            }
+
+            let current = self.keymap().unwrap_or_else(|| "default".into());
+            let on_target: Vec<&'static str> = self
+                .agent()
+                .map(|(_, i)| {
+                    i.layouts
+                        .iter()
+                        .filter_map(|l| glkvm::layout::keymap_from_native(l))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let before = self.device.keymap.clone();
+            ui.menu_button(format!("Keyboard layout: {current}"), |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(320.0)
+                    .show(ui, |ui| {
+                        for k in &self.keymaps {
+                            let label = if on_target.contains(&k.as_str()) {
+                                format!("{k} (on target)")
+                            } else {
+                                k.clone()
+                            };
+                            if ui
+                                .radio_value(&mut self.device.keymap, Some(k.clone()), label)
+                                .clicked()
+                            {
+                                ui.close();
+                            }
+                        }
+                    });
             })
             .response
-            .on_hover_text("Keyboard layout of the target, used by Type clipboard");
-        if self.device.keymap != before {
-            action = ConsoleAction::TargetChanged;
-        }
-        ui.menu_button("Video", |ui| self.video_menu(ui));
-        ui.toggle_value(&mut self.show_stats, "Stats")
-            .on_hover_text("Right Cmd + S");
-        if ui
-            .button(if self.fullscreen {
-                "Exit fullscreen"
-            } else {
-                "Fullscreen"
-            })
-            .on_hover_text("Right Cmd + F")
-            .clicked()
-        {
-            action = ConsoleAction::ToggleFullscreen;
-        }
-        if ui
-            .button("Device settings...")
-            .on_hover_text("Opens the device's web interface")
-            .clicked()
-        {
-            let url = format!("https://{}/", self.session.host());
-            if let Err(e) = open::that(&url) {
-                self.notify(format!("Cannot open {url}: {e}"));
+            .on_hover_text("Keyboard layout of the target, used by Paste when typing");
+            changed |= self.device.keymap != before;
+
+            ui.separator();
+            ui.checkbox(&mut self.show_stats, "Show stats")
+                .on_hover_text("Right Cmd + S");
+            if ui
+                .button("Device web interface…")
+                .on_hover_text("Opens the device's web interface in the browser")
+                .clicked()
+            {
+                let url = format!("https://{}/", self.session.host());
+                if let Err(e) = open::that(&url) {
+                    self.notify(format!("Cannot open {url}: {e}"));
+                }
+                ui.close();
             }
-        }
-        action
+        });
+        changed
     }
 
     fn overlays(&mut self, ui: &mut egui::Ui) {
@@ -1691,11 +1960,7 @@ impl Console {
         if let Some(msg) = center_msg {
             ui.put(
                 rect,
-                egui::Label::new(
-                    egui::RichText::new(msg)
-                        .size(18.0)
-                        .color(egui::Color32::LIGHT_GRAY),
-                ),
+                egui::Label::new(egui::RichText::new(msg).size(18.0).color(theme::MUTED)),
             );
         }
         if self.show_stats && !self.stats.shown.is_empty() {
@@ -1766,27 +2031,50 @@ impl Console {
                  the target's keyboard and mouse disconnect for a moment. Takes about 20 seconds."
                     .into(),
             ),
-            Confirm::VideoMode(m) => (
-                format!("Switch the video mode to {}?", m.wire_name()),
-                "This is saved on the device and affects every viewer, including the web \
-                 interface. Other viewers may need to reconnect."
-                    .into(),
-            ),
-            Confirm::Quality(p) => (
-                format!("Change the encoder quality to {p:?}?"),
-                "This is saved on the device and affects every viewer's bitrate and frame rate."
-                    .into(),
-            ),
+            Confirm::Video(c) => match c {
+                VideoChange::Mode(m) => (
+                    format!("Switch the video mode to {}?", m.wire_name()),
+                    "This is saved on the device and affects every viewer, including the web \
+                     interface. Other viewers may need to reconnect."
+                        .into(),
+                ),
+                VideoChange::Quality(p) => (
+                    format!("Change the encoder quality to {p:?}?"),
+                    "This is saved on the device and affects every viewer's bitrate and frame rate."
+                        .into(),
+                ),
+                VideoChange::Venc(m) => (
+                    format!("Switch the encoder to {} mode?", m.wire_name()),
+                    "This is saved on the device and affects every viewer.".into(),
+                ),
+                VideoChange::Latency(m) => (
+                    format!("Switch to {}?", m.wire_name().replace('_', " ")),
+                    "This is saved on the device and affects every viewer.".into(),
+                ),
+                VideoChange::Orientation(o) => (
+                    format!("Rotate the picture to {}°?", o.degrees()),
+                    "This is saved on the device and affects every viewer, including the web \
+                     interface."
+                        .into(),
+                ),
+                VideoChange::Edid(p) => (
+                    format!("Present the target a {} display?", p.label),
+                    "The target sees a monitor change and may rearrange its windows or \
+                     resolution. This is saved on the device and affects every viewer."
+                        .into(),
+                ),
+            },
         };
         let mut decision = None;
         egui::Modal::new(egui::Id::unique("confirm")).show(ctx, |ui| {
-            ui.heading(title);
-            ui.label(body);
+            ui.set_width(380.0);
+            ui.label(egui::RichText::new(title).size(17.0).strong());
+            ui.label(egui::RichText::new(body).color(theme::MUTED));
             ui.horizontal(|ui| {
                 if ui.button("Cancel").clicked() {
                     decision = Some(false);
                 }
-                if ui.button("Continue").clicked() {
+                if ui.add(theme::primary("Continue")).clicked() {
                     decision = Some(true);
                 }
             });
@@ -1795,7 +2083,7 @@ impl Console {
             Some(true) => match self.confirm.take() {
                 Some(Confirm::Type { text, .. }) => self.deliver_text(text),
                 Some(Confirm::BridgeSetup(_)) => self.setup.run(),
-                Some(c @ (Confirm::VideoMode(_) | Confirm::Quality(_))) => self.apply_video(c),
+                Some(Confirm::Video(c)) => self.apply_video(c),
                 Some(c) => self.atx(c),
                 None => {}
             },

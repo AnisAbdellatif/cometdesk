@@ -57,7 +57,9 @@ fi
 
 /etc/init.d/S99glkvm-bridge restart >/dev/null
 nginx -t -q -p /etc/kvmd/nginx -c /etc/kvmd/nginx-kvmd.conf
-kill -HUP "$(cat /run/kvmd/nginx.pid)"
+if [ -s /run/kvmd/nginx.pid ]; then
+	kill -HUP "$(cat /run/kvmd/nginx.pid)"
+fi
 
 for _ in 1 2 3 4 5 6 7 8 9 10; do
 	[ -S /run/kvmd/glkvm-bridge.sock ] && break

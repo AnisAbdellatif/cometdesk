@@ -26,8 +26,14 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct RootShell {
     ws: WsStream,
     out: String,
+    /// Raw bytes received but not yet decoded: a UTF-8 character can be split across two
+    /// WebSocket frames, so the trailing incomplete bytes wait here for the next frame.
+    buf: Vec<u8>,
     seq: u64,
     tag: String,
+    /// A command timed out: its output and the still-running command would corrupt any later
+    /// command, so the shell refuses further use.
+    poisoned: bool,
 }
 
 /// Output and exit status of one command.
@@ -54,8 +60,10 @@ impl Session {
         let mut sh = RootShell {
             ws,
             out: String::new(),
+            buf: Vec::new(),
             seq: 0,
             tag: format!("{nanos:08x}"),
+            poisoned: false,
         };
         let init = r#"{"AuthToken":"","columns":250,"rows":50}"#;
         sh.ws
@@ -74,6 +82,11 @@ impl RootShell {
     }
 
     pub async fn run_timeout(&mut self, cmd: &str, timeout: Duration) -> Result<Output> {
+        if self.poisoned {
+            return Err(Error::Protocol(
+                "shell is unusable after an earlier command timed out".into(),
+            ));
+        }
         if cmd.len() > MAX_LINE || cmd.contains('\n') {
             return Err(Error::Protocol(
                 "shell command too long or multi-line".into(),
@@ -88,9 +101,17 @@ impl RootShell {
         msg.push(b'0');
         msg.extend_from_slice(input.as_bytes());
         self.ws.send(Message::Binary(msg.into())).await?;
-        tokio::time::timeout(timeout, self.read_until(&marker))
-            .await
-            .map_err(|_| Error::Protocol(format!("shell command timed out: {cmd:.60}")))?
+        match tokio::time::timeout(timeout, self.read_until(&marker)).await {
+            Ok(result) => result,
+            Err(_) => {
+                // The command is still running on the device and its late output would be
+                // read as the next command's; the shell can no longer be trusted.
+                self.poisoned = true;
+                Err(Error::Protocol(format!(
+                    "shell command timed out: {cmd:.60}"
+                )))
+            }
+        }
     }
 
     async fn read_until(&mut self, marker: &str) -> Result<Output> {
@@ -105,13 +126,47 @@ impl RootShell {
             }
             match self.ws.next().await {
                 Some(Ok(Message::Binary(b))) if b.first() == Some(&b'0') => {
-                    self.out.push_str(&String::from_utf8_lossy(&b[1..]));
+                    self.push_output(&b[1..]);
                 }
                 Some(Ok(Message::Close(_))) | None => {
                     return Err(Error::Protocol("device closed the shell".into()));
                 }
                 Some(Ok(_)) => {}
                 Some(Err(e)) => return Err(e.into()),
+            }
+        }
+    }
+
+    /// Appends decoded terminal output, carrying any incomplete trailing UTF-8 bytes over to
+    /// the next frame instead of corrupting a character split across frames.
+    fn push_output(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+        loop {
+            match std::str::from_utf8(&self.buf) {
+                Ok(s) => {
+                    self.out.push_str(s);
+                    self.buf.clear();
+                    return;
+                }
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    if valid > 0 {
+                        self.out
+                            .push_str(std::str::from_utf8(&self.buf[..valid]).unwrap());
+                    }
+                    match e.error_len() {
+                        // Genuinely invalid bytes: emit one replacement char and continue.
+                        Some(len) => {
+                            self.out.push('\u{FFFD}');
+                            self.buf.drain(..valid + len);
+                        }
+                        // Incomplete tail: keep it and wait for the next frame.
+                        None => {
+                            self.buf.drain(..valid);
+                            return;
+                        }
+                    }
+                }
             }
         }
     }

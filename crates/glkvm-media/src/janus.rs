@@ -158,11 +158,18 @@ async fn negotiate(session: Session, kind: MediaKind) -> Result<Negotiated> {
         _ => None,
     })
     .await?;
+    // The device rotates the picture for WebRTC; a failed read just means no rotation.
+    let orientation = session
+        .system_config()
+        .await
+        .ok()
+        .and_then(|c| c.orientation)
+        .unwrap_or(0);
     ws.send(msg(json!({
         "janus": "message", "session_id": session_id, "handle_id": handle_id,
         "transaction": tx.next(),
         "body": {"request": "watch", "params": {
-            "orientation": 0, "audio": !video, "video": video, "mic": false, "camera": false,
+            "orientation": orientation, "audio": !video, "video": video, "mic": false, "camera": false,
         }},
     })))
     .await?;
