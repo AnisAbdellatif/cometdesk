@@ -14,7 +14,7 @@ it is counted for whichever client was running alone.
 
 | Client | Run | App CPU | Decoder CPU | **Total CPU** | **Total energy** |
 |---|---|---|---|---|---|
-| glkvm viewer (zero-copy) | 1 | 9.3 % | 4.6 % | **13.9 %** | **14.1** |
+| cometdesk viewer (zero-copy) | 1 | 9.3 % | 4.6 % | **13.9 %** | **14.1** |
 | | 2 | 8.5 % | 4.4 % | **12.9 %** | **13.1** |
 | | 3 | 8.6 % | 4.5 % | **13.1 %** | **13.3** |
 | Web app, Brave, Direct mode (WebCodecs) | 1 | 61.8 % | 5.4 % | **67.2 %** | **71.4** |
@@ -24,8 +24,8 @@ it is counted for whichever client was running alone.
 
 Ratios (means):
 
-- glkvm vs web Direct: **19 %** of the CPU, **19 %** of the energy impact (~5× less).
-- glkvm vs web WebRTC: **24 %** of the CPU, **23 %** of the energy impact (~4× less).
+- cometdesk vs web Direct: **19 %** of the CPU, **19 %** of the energy impact (~5× less).
+- cometdesk vs web WebRTC: **24 %** of the CPU, **23 %** of the energy impact (~4× less).
 
 ## Against the targets
 
@@ -56,17 +56,17 @@ Impact; M1 still needs the camera measurement before Phase 0 is formally closed.
 - To get watts:
   `sudo powermetrics --samplers cpu_power,gpu_power -i 1000 -n 20` while each client runs.
 
-## Phase 2 console app (glkvm-gui)
+## Phase 2 console app (cometdesk-gui)
 
 Same method, 2026-10-28, window visible, mostly static target screen.
 
 | Client | Run | App CPU | Decoder CPU | **Total CPU** | **Total energy** |
 |---|---|---|---|---|---|
-| glkvm-gui, windowed (toolbar shown), before buffer fix | 1 | 11.5 % | 5.2 % | **16.7 %** | **16.9** |
+| cometdesk-gui, windowed (toolbar shown), before buffer fix | 1 | 11.5 % | 5.2 % | **16.7 %** | **16.9** |
 | | 2 | 12.1 % | 5.3 % | **17.4 %** | **17.4** |
-| glkvm-gui, windowed, egui buffers uploaded only on change | 1 | 8.7 % | 4.7 % | **13.4 %** | **13.4** |
+| cometdesk-gui, windowed, egui buffers uploaded only on change | 1 | 8.7 % | 4.7 % | **13.4 %** | **13.4** |
 | | 2 | 9.9 % | 5.4 % | **15.3 %** | **15.4** |
-| glkvm-gui, fullscreen, toolbar hidden | 1 | 7.4 % | 3.6 % | **11.0 %** | **11.4** |
+| cometdesk-gui, fullscreen, toolbar hidden | 1 | 7.4 % | 3.6 % | **11.0 %** | **11.4** |
 | | 2 | 7.5 % | 3.8 % | **11.3 %** | **11.5** |
 
 - The egui toolbar adds ~1–2 % over the bare CLI viewer (13–14 %) once its vertex buffers
@@ -79,8 +79,8 @@ Same method, 2026-10-28, window visible, mostly static target screen.
 ## M7: Pion + FlexFEC under loss
 
 2026-10-29, Comet on Tailscale (direct path, ~25 ms RTT, no measurable loss of its own),
-`cargo test -p glkvm-media --test device pion_video_survives_loss -- --ignored`, 2560×1440
-at 60 fps, mostly static screen. Loss is injected in the receiver (`GLKVM_TEST_RX_LOSS=<percent>`
+`cargo test -p cometdesk-media --test device pion_video_survives_loss -- --ignored`, 2560×1440
+at 60 fps, mostly static screen. Loss is injected in the receiver (`COMETDESK_TEST_RX_LOSS=<percent>`
 drops that share of incoming RTP datagrams before the WebRTC engine sees them; dummynet/pfctl
 need root and were not used). Pass = ≥ 30 fps and no gap between frames above 500 ms.
 

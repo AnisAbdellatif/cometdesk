@@ -1,4 +1,4 @@
-// Usage: swift tools/gen_h264_fixtures.swift crates/glkvm-media/tests/data
+// Usage: swift tools/gen_h264_fixtures.swift crates/cometdesk-media/tests/data
 // Generates tiny Annex B H.264 test fixtures (Constrained Baseline) with VideoToolbox.
 import Foundation
 import VideoToolbox

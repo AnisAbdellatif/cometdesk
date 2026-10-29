@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Measure CPU time and macOS energy impact of an app's processes over a fixed window.
 
-Works for any app without sudo, so the web app in a browser and the glkvm viewer can be
+Works for any app without sudo, so the web app in a browser and the cometdesk viewer can be
 compared the same way. Each --group is a regex matched against full process command lines;
 all matching processes (e.g. a browser's GPU, renderer and main processes) are summed.
 
-    python3 tools/bench_app.py --group viewer='glkvm-cli view' \\
+    python3 tools/bench_app.py --group viewer='cometdesk-cli view' \\
         --group decoder=VTDecoderXPCService --group windowserver=WindowServer --duration 20
 
 CPU% is total CPU time / wall time (100% = one core). Energy impact is the `top` POWER column

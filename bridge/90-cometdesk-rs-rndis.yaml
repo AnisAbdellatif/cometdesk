@@ -1,0 +1,10 @@
+# cometdesk-rs: USB network (RNDIS) for the clipboard bridge. Installed by bridge/setup.sh,
+# removed by bridge/remove.sh.
+otg:
+    devices:
+        ethernet:
+            enabled: true
+            driver: rndis
+            start: true
+            host_mac: "02:47:4b:56:4d:01"
+            kvm_mac: "02:47:4b:56:4d:02"

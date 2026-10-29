@@ -1,20 +1,32 @@
 #!/bin/sh
-# Installs, updates or repairs glkvm-bridge on a Comet. Idempotent: running it again only
+# Installs, updates or repairs cometdesk-bridge on a Comet. Idempotent: running it again only
 # replaces what differs, so it is also the repair after a firmware upgrade.
 #
-# Run on the device from a directory holding the bridge files (glkvm-gui and `glkvm bridge
-# setup` stage them in /tmp/glkvm-setup through the web terminal). Prints one line per
-# change, and GLKVM_SETUP_OK <version> on success.
+# Run on the device from a directory holding the bridge files (cometdesk-gui and `cometdesk bridge
+# setup` stage them in /tmp/cometdesk-setup through the web terminal). Prints one line per
+# change, and COMETDESK_SETUP_OK <version> on success.
 #
 # Restarting kvmd-otg (only when the RNDIS function is missing or its config changed)
 # re-enumerates USB: the target's keyboard and mouse drop for a moment.
 set -eu
 SRC=$(cd "$(dirname "$0")" && pwd)
-BASE=/usr/local/lib/glkvm-bridge
-EXTRA=/usr/share/kvmd/extras/glkvm-bridge
-OVERRIDE=/etc/kvmd/override.d/90-glkvm-rs-rndis.yaml
+BASE=/usr/local/lib/cometdesk-bridge
+EXTRA=/usr/share/kvmd/extras/cometdesk-bridge
+OVERRIDE=/etc/kvmd/override.d/90-cometdesk-rs-rndis.yaml
 
-mkdir -p "$BASE/target" "$BASE/agents" "$EXTRA" /etc/glkvm-bridge /etc/kvmd/override.d
+# Remove what the app's former name (glkvm) installed: two bridges would fight for the port.
+if [ -e /etc/init.d/S99glkvm-bridge ]; then
+	/etc/init.d/S99glkvm-bridge stop >/dev/null 2>&1
+	echo "removed glkvm-bridge"
+fi
+rm -rf /etc/init.d/S99glkvm-bridge /usr/local/lib/glkvm-bridge /usr/share/kvmd/extras/glkvm-bridge \
+	/etc/glkvm-bridge /run/kvmd/glkvm-bridge.sock
+if [ -f /etc/kvmd/override.d/90-glkvm-rs-rndis.yaml ]; then
+	rm /etc/kvmd/override.d/90-glkvm-rs-rndis.yaml
+	echo "removed old USB network override"
+fi
+
+mkdir -p "$BASE/target" "$BASE/agents" "$EXTRA" /etc/cometdesk-bridge /etc/kvmd/override.d
 
 # put <src> <dest> <mode>: replace dest only if it differs
 put() {
@@ -26,20 +38,20 @@ put() {
 	fi
 }
 
-put "$SRC/glkvm_bridge.py" "$BASE/glkvm_bridge.py" 755
+put "$SRC/cometdesk_bridge.py" "$BASE/cometdesk_bridge.py" 755
 put "$SRC/install.sh" "$BASE/target/install.sh" 644
 put "$SRC/install.ps1" "$BASE/target/install.ps1" 644
 for f in manifest.yaml nginx.ctx-http.conf nginx.ctx-server.conf; do
 	put "$SRC/$f" "$EXTRA/$f" 644
 done
-put "$SRC/udhcpd.conf" /etc/glkvm-bridge/udhcpd.conf 644
-put "$SRC/S99glkvm-bridge" /etc/init.d/S99glkvm-bridge 755
-# Identifies the app build that installed these files (glkvm::api::bridge::bundle_id).
+put "$SRC/udhcpd.conf" /etc/cometdesk-bridge/udhcpd.conf 644
+put "$SRC/S99cometdesk-bridge" /etc/init.d/S99cometdesk-bridge 755
+# Identifies the app build that installed these files (cometdesk::api::bridge::bundle_id).
 [ -f "$SRC/bundle" ] && put "$SRC/bundle" "$BASE/bundle" 644
 
 restart_otg=0
-if ! cmp -s "$SRC/90-glkvm-rs-rndis.yaml" "$OVERRIDE"; then
-	put "$SRC/90-glkvm-rs-rndis.yaml" "$OVERRIDE" 644
+if ! cmp -s "$SRC/90-cometdesk-rs-rndis.yaml" "$OVERRIDE"; then
+	put "$SRC/90-cometdesk-rs-rndis.yaml" "$OVERRIDE" 644
 	restart_otg=1
 fi
 if ! ls /sys/kernel/config/usb_gadget/*/configs/*/rndis.usb0 >/dev/null 2>&1; then
@@ -55,15 +67,15 @@ if [ "$restart_otg" = 1 ]; then
 	done
 fi
 
-/etc/init.d/S99glkvm-bridge restart >/dev/null
+/etc/init.d/S99cometdesk-bridge restart >/dev/null
 nginx -t -q -p /etc/kvmd/nginx -c /etc/kvmd/nginx-kvmd.conf
 if [ -s /run/kvmd/nginx.pid ]; then
 	kill -HUP "$(cat /run/kvmd/nginx.pid)"
 fi
 
 for _ in 1 2 3 4 5 6 7 8 9 10; do
-	[ -S /run/kvmd/glkvm-bridge.sock ] && break
+	[ -S /run/kvmd/cometdesk-bridge.sock ] && break
 	sleep 1
 done
-version=$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' "$BASE/glkvm_bridge.py")
-echo "GLKVM_SETUP_OK $version"
+version=$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' "$BASE/cometdesk_bridge.py")
+echo "COMETDESK_SETUP_OK $version"

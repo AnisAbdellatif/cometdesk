@@ -1,4 +1,4 @@
-// Draws the GLKVM logo (a monitor with a pointer) and writes the app icon assets:
+// Draws the CometDesk logo (a monitor with a pointer) and writes the app icon assets:
 //   swift tools/gen_icon.swift <out-dir>
 // -> <out-dir>/AppIcon.iconset/*.png (run `iconutil -c icns` on it) and <out-dir>/logo-256.png.
 import AppKit

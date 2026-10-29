@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/glkvm", "crates/glkvm-media", "crates/glkvm-cli", "apps/glkvm-gui", "crates/glkvm-view", "crates/glkvm-clip", "apps/glkvm-agent"]
+members = ["crates/cometdesk", "crates/cometdesk-media", "crates/cometdesk-cli", "apps/cometdesk-gui", "crates/cometdesk-view", "crates/cometdesk-clip", "apps/cometdesk-agent"]
 
 [workspace.package]
 edition = "2024"
@@ -20,6 +20,6 @@ opt-level = 2
 overflow-checks = false
 
 # str0m with two hooks for FlexFEC-03: FEC packets are delivered as raw packets, and
-# recovered media packets can be injected. See vendor/str0m/GLKVM.md.
+# recovered media packets can be injected. See vendor/str0m/CometDesk.md.
 [patch.crates-io]
 str0m = { path = "vendor/str0m" }

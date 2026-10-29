@@ -1,28 +1,28 @@
 #!/bin/sh
-# Packages the console as dist/GLKVM-<version>-<arch>.dmg: a GLKVM.app bundle (with the
-# agent programs from dist/agents in Resources, built by scripts/build-agents.sh if missing)
+# Packages the console as dist/CometDesk-<version>-<arch>.dmg: a CometDesk.app bundle (with the
+# agent programs from dist/agents in Resources, rebuilt by scripts/build-agents.sh)
 # ad-hoc signed, inside a disk image with an Applications shortcut.
 # Set CODESIGN_IDENTITY to a Developer ID to sign for distribution instead of ad-hoc.
 set -eu
 cd "$(dirname "$0")/.."
 
-NAME=GLKVM
-ID=rs.glkvm.console
+NAME=CometDesk
+ID=rs.cometdesk.console
 VERSION=$(cargo metadata --no-deps --format-version 1 |
-	python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="glkvm-gui"))')
+	python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="cometdesk-gui"))')
 ARCH=$(uname -m)
 OUT=dist/$NAME-$VERSION-$ARCH.dmg
 STAGE=target/dmg
 APP=$STAGE/dmg-root/$NAME.app
 
-ls dist/agents/* >/dev/null 2>&1 || scripts/build-agents.sh
-cargo build --release -q -p glkvm-gui
+scripts/build-agents.sh
+cargo build --release -q -p cometdesk-gui
 
 rm -rf "$STAGE"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp target/release/glkvm-gui "$APP/Contents/MacOS/$NAME"
+cp target/release/cometdesk-gui "$APP/Contents/MacOS/$NAME"
 cp -R dist/agents "$APP/Contents/Resources/agents"
-[ -f apps/glkvm-gui/AppIcon.icns ] && cp apps/glkvm-gui/AppIcon.icns "$APP/Contents/Resources/"
+[ -f apps/cometdesk-gui/AppIcon.icns ] && cp apps/cometdesk-gui/AppIcon.icns "$APP/Contents/Resources/"
 
 cat >"$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Minimal client-side test for glkvm-bridge (stdlib only).
+"""Minimal client-side test for cometdesk-bridge (stdlib only).
 
-Connects to wss://<comet>/glkvm-bridge/ws with a kvmd session cookie, sends one
+Connects to wss://<comet>/cometdesk-bridge/ws with a kvmd session cookie, sends one
 message, and prints whatever the agent side sends back within --wait seconds.
 
     python3 bridge/test_client.py --host 192.168.8.174 --cookie-file <netscape cookie jar>
@@ -78,7 +78,7 @@ def main() -> None:
     cookie = "" if args.no_auth else "Cookie: auth_token=%s\r\n" % auth_token(args.cookie_file)
     key = base64.b64encode(os.urandom(16)).decode()
     sock.sendall((
-        "GET /glkvm-bridge/ws HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+        "GET /cometdesk-bridge/ws HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
         "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n%s\r\n" % (args.host, key, cookie)
     ).encode())
     head = b""

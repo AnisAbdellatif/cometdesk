@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Generates crates/glkvm/src/layout/data.rs: keyboard layouts for typing text over HID.
+"""Generates crates/cometdesk/src/layout/data.rs: keyboard layouts for typing text over HID.
 
 Source: Unicode CLDR release-43 keyboard data (keyboards/windows, keyboards/osx), under the
-Unicode License v3 (copied to crates/glkvm/src/layout/CLDR-LICENSE). Windows layouts also
+Unicode License v3 (copied to crates/cometdesk/src/layout/CLDR-LICENSE). Windows layouts also
 serve Linux targets: for the keys we type, xkb's layouts match them.
 
 For each layout and each character it records the physical key (as a KeyboardEvent.code,
@@ -23,7 +23,7 @@ TAG = "release-43"
 BASE = f"https://raw.githubusercontent.com/unicode-org/cldr/{TAG}/keyboards"
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 CACHE = os.path.join(ROOT, "target", "cldr-cache")
-OUT_DIR = os.path.join(ROOT, "crates", "glkvm", "src", "layout")
+OUT_DIR = os.path.join(ROOT, "crates", "cometdesk", "src", "layout")
 
 # Device keymap name (kvmd) -> CLDR locale of the standard layout.
 LAYOUTS = {

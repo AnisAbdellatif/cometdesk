@@ -135,11 +135,11 @@ pub(crate) struct Session {
 
     raw_packets: Option<VecDeque<Box<RawPacket>>>,
 
-    /// glkvm patch: payload type of FlexFEC repair packets, if the application decodes them.
+    /// cometdesk patch: payload type of FlexFEC repair packets, if the application decodes them.
     fec_pt: Option<Pt>,
-    /// glkvm patch: SRTP rollover state of the repair stream (SSRC, highest seq, ROC).
+    /// cometdesk patch: SRTP rollover state of the repair stream (SSRC, highest seq, ROC).
     fec_roll: Option<(Ssrc, u16, u32)>,
-    /// glkvm patch: media and repair packets queued for the application.
+    /// cometdesk patch: media and repair packets queued for the application.
     fec_taps: VecDeque<Box<crate::FecRtp>>,
 
     // Pending application-specific feedback (PSFB FMT=15) messages to emit as events.
@@ -612,7 +612,7 @@ impl Session {
         }
     }
 
-    /// glkvm patch: decrypts a FlexFEC repair packet and queues it for the application. The
+    /// cometdesk patch: decrypts a FlexFEC repair packet and queues it for the application. The
     /// repair stream has no `Media` of its own, so its SRTP rollover is tracked here.
     fn handle_fec_rtp(&mut self, header: RtpHeader, buf: &[u8]) {
         let Some(srtp) = self.srtp_rx.as_mut() else {
@@ -661,7 +661,7 @@ impl Session {
         }));
     }
 
-    /// glkvm patch: delivers a media packet rebuilt from FEC as if it had arrived. Does
+    /// cometdesk patch: delivers a media packet rebuilt from FEC as if it had arrived. Does
     /// nothing if the stream is unknown or the packet was received after all.
     pub(crate) fn inject_rtp(&mut self, now: Instant, header: RtpHeader, payload: &[u8]) {
         let Some((mid, ssrc)) = self.streams.mid_ssrc_rx_by_ssrc_or_rtx(now, header.ssrc) else {
@@ -697,7 +697,7 @@ impl Session {
         );
     }
 
-    /// glkvm patch.
+    /// cometdesk patch.
     pub(crate) fn set_fec_pt(&mut self, pt: Option<Pt>) {
         self.fec_pt = pt;
     }

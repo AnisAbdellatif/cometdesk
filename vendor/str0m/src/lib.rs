@@ -939,7 +939,7 @@ struct SendAddr {
     destination: SocketAddr,
 }
 
-/// glkvm patch: a received RTP packet handed out for application-level FEC.
+/// cometdesk patch: a received RTP packet handed out for application-level FEC.
 #[derive(Debug)]
 pub struct FecRtp {
     /// The parsed header (SSRC, sequence number, timestamp, marker, payload type).
@@ -1065,7 +1065,7 @@ pub enum Event {
     /// Should not be enabled outside of tests and troubleshooting.
     RawPacket(Box<RawPacket>),
 
-    /// glkvm patch: a media packet (`repair == false`) or a FlexFEC repair packet, for an
+    /// cometdesk patch: a media packet (`repair == false`) or a FlexFEC repair packet, for an
     /// application that decodes FEC itself. See [`Rtc::set_fec_payload_type`].
     FecRtp(Box<FecRtp>),
 
@@ -2289,7 +2289,7 @@ pub mod unversioned {
     };
 }
 
-/// glkvm patch: application-level FEC support.
+/// cometdesk patch: application-level FEC support.
 impl Rtc {
     /// Delivers packets of this payload type, decrypted, as [`Event::FecRtp`] with
     /// `repair == true`, and every media packet as `repair == false`. `None` turns it off.

@@ -3,12 +3,12 @@
 Scripts and agents can drive the GUI over a local control socket.
 
 ```
-GLKVM_CONTROL=1 GLKVM_AUTOCONNECT=1 cargo run -p glkvm-gui   # or GLKVM_CONTROL=/path/to.sock
-tools/glkvmctl.py status
+COMETDESK_CONTROL=1 COMETDESK_AUTOCONNECT=1 cargo run -p cometdesk-gui   # or COMETDESK_CONTROL=/path/to.sock
+tools/cometdeskctl.py status
 ```
 
-The socket (`<config dir>/glkvm/control.sock` for `1`, mode 0600, Unix only) gives full
-control of the target's keyboard and mouse: it is off unless `GLKVM_CONTROL` is set.
+The socket (`<config dir>/cometdesk/control.sock` for `1`, mode 0600, Unix only) gives full
+control of the target's keyboard and mouse: it is off unless `COMETDESK_CONTROL` is set.
 
 Protocol: one JSON object per line in, one per line out. An optional `"id"` is echoed.
 Replies are `{"ok":true,...}` or `{"ok":false,"error":"..."}`.
@@ -30,7 +30,7 @@ Replies are `{"ok":true,...}` or `{"ok":false,"error":"..."}`.
 | `release_all` | | |
 | `ui_click`, `ui_text` | `x`,`y` window points; `text` | drives the app's own UI |
 
-Python: `from glkvmctl import Client; c = Client(); c.call("click", x=.5, y=.5)`.
+Python: `from cometdeskctl import Client; c = Client(); c.call("click", x=.5, y=.5)`.
 
 Notes: `screenshot` needs the window visible (a hidden window never draws, so it times out).
 Not yet covered: an accessibility tree of the egui UI, and returning pixels of the decoded

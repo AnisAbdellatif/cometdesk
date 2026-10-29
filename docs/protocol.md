@@ -1,8 +1,8 @@
 # Protocol notes (verified on the device)
 
 Device: GL-RM1 "Comet", firmware V1.10.1, kvmd 4.82, Rockchip RV1126, encoder `RV1126-H264`.
-Verified 2026-10-28 with `glkvm-cli probe` and the ignored device tests
-(`cargo test -p glkvm-media --test device -- --ignored`). Answers PLAN.md §1.1.
+Verified 2026-10-28 with `cometdesk-cli probe` and the ignored device tests
+(`cargo test -p cometdesk-media --test device -- --ignored`). Answers PLAN.md §1.1.
 
 ## Login
 
@@ -10,7 +10,7 @@ Verified 2026-10-28 with `glkvm-cli probe` and the ignored device tests
   with the same fields is rejected with 403 `Forbidden`.
 - Response: `{"ok": true, "result": {"token": "…", "failed_since_last_success": N}}` plus an
   `auth_token` cookie. Failed attempts are counted per client and rate-limited (429).
-- Passwords may contain `$`; `.env` values must be read literally (`glkvm::env`).
+- Passwords may contain `$`; `.env` values must be read literally (`cometdesk::env`).
 - **2FA**: no separate endpoint. The 6-digit TOTP code is appended to `passwd`;
   `GET /api/2fa/is_enabled` (no auth) tells whether it is needed.
 - **Two-step approval**: login answers `{"two_step_required": true, "two_step_token": …,
@@ -52,8 +52,8 @@ Binary message = `[event type][payload]`:
 | 6 touch | `[touching][x i16 BE][y i16 BE]` |
 
 - 115 key names are accepted; notably **no F13–F19** (F20 only) and no `NumpadEqual`.
-  `crates/glkvm-cli/src/keymap.rs` only emits accepted names (checked by a test when
-  `GLKVM_FIRMWARE_SRC` points at the firmware source).
+  `crates/cometdesk-cli/src/keymap.rs` only emits accepted names (checked by a test when
+  `COMETDESK_FIRMWARE_SRC` points at the firmware source).
 - Keepalive: JSON `{"event_type":"ping","event":{}}` → `pong` event.
 - Mouse + keyboard verified working end to end (absolute mouse, clicks, wheel, typing,
   modifiers, Caps Lock, ISO key swap on a German Mac keyboard).
@@ -121,7 +121,7 @@ Device in `video_mode = webrtc`, Mac and Comet on a tailnet (direct path, ~25 ms
     covers the transport-cc value and the payload; the length field counts everything after the
     12-byte header; P/X/CC, M/PT, timestamp are plain XORs.
   Media packets carry a 4-byte one-byte-header extension with only transport-cc (8 bytes with
-  padding). `glkvm-media/src/flexfec.rs` rebuilds one loss per repair packet, iterating.
+  padding). `cometdesk-media/src/flexfec.rs` rebuilds one loss per repair packet, iterating.
 - **Keyframes.** On a static screen the device sends an IDR every 2 s at best and sometimes
   none for 12+ s; it answered the first PLI of a session within 85 ms and later ones not at
   all. A 60 fps stream of ~100 B delta frames (one packet each) is ~60-330 kbps; IDRs are
@@ -133,7 +133,7 @@ Device in `video_mode = webrtc`, Mac and Comet on a tailnet (direct path, ~25 ms
   target was apparently silent; it started delivering once sound was playing and the web app's
   audio toggle had been turned on. Which of the two mattered is unknown (the toggle is client
   state in the web app, so most likely the target was silent). The web app picks the audio
-  transport by `video_mode`: Janus in `webrtc`, Pion in `flex_fec`, none in Direct.
+  transport by `video_mode`: Janus in `webrtc`, Pion in `flex_fec`, in `direct_h264` the media socket has no audio, so Pion's audio-only connection is tried (untested on the device).
 - `opus-decoder` 0.1.1 can panic on some packets (`celt/vq.rs`: `1 << i` on a `u8` with more
   than 8 blocks), only with overflow checks on. The player catches it and recreates the decoder.
 
@@ -155,7 +155,7 @@ Device in `video_mode = webrtc`, Mac and Comet on a tailnet (direct path, ~25 ms
 | Viewer while hidden | idle: decoding stops, main thread blocked |
 | RSS | ~120–145 MB |
 
-Render paths, measured with `glkvm-cli view --render <path> --bench 20` (process CPU via
+Render paths, measured with `cometdesk-cli view --render <path> --bench 20` (process CPU via
 `getrusage` over 20 s after a 3 s warm-up, window visible, 60 fps, mostly static screen;
 two runs each, plus one extra zero-copy run at 4.6 %):
 

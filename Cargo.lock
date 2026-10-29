@@ -922,6 +922,145 @@ dependencies = [
 ]
 
 [[package]]
+name = "cometdesk"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "hex",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "cometdesk-agent"
+version = "0.1.0"
+dependencies = [
+ "arboard",
+ "cometdesk-clip",
+ "windows-sys 0.61.2",
+ "x11rb",
+]
+
+[[package]]
+name = "cometdesk-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "bytes",
+ "clap",
+ "cometdesk",
+ "cometdesk-media",
+ "cometdesk-view",
+ "libc",
+ "pollster",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
+name = "cometdesk-clip"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "png",
+ "postcard",
+ "serde",
+ "sha2 0.11.1",
+ "snow",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "cometdesk-gui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "cometdesk",
+ "cometdesk-clip",
+ "cometdesk-media",
+ "cometdesk-view",
+ "egui",
+ "egui-wgpu",
+ "egui-winit",
+ "futures-util",
+ "keyring",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "objc2-vision",
+ "open",
+ "png",
+ "pollster",
+ "rfd",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
+name = "cometdesk-media"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "cometdesk",
+ "cpal",
+ "futures-util",
+ "objc2-core-foundation",
+ "objc2-core-media",
+ "objc2-core-video",
+ "objc2-video-toolbox",
+ "opus-decoder",
+ "serde_json",
+ "str0m",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+]
+
+[[package]]
+name = "cometdesk-view"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "cometdesk",
+ "cometdesk-media",
+ "objc2 0.6.5",
+ "objc2-core-foundation",
+ "objc2-core-video",
+ "objc2-metal 0.3.2",
+ "pollster",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
 name = "compression-codecs"
 version = "0.4.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1912,145 +2051,6 @@ dependencies = [
  "skrifa",
  "smallvec",
  "vello_common",
-]
-
-[[package]]
-name = "glkvm"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "futures-util",
- "hex",
- "rcgen",
- "reqwest",
- "rustls",
- "serde",
- "serde_json",
- "sha2 0.11.1",
- "thiserror 2.0.21",
- "tokio",
- "tokio-rustls",
- "tokio-tungstenite",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "glkvm-agent"
-version = "0.1.0"
-dependencies = [
- "arboard",
- "glkvm-clip",
- "windows-sys 0.61.2",
- "x11rb",
-]
-
-[[package]]
-name = "glkvm-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytemuck",
- "bytes",
- "clap",
- "glkvm",
- "glkvm-media",
- "glkvm-view",
- "libc",
- "pollster",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "wgpu",
- "winit",
-]
-
-[[package]]
-name = "glkvm-clip"
-version = "0.1.0"
-dependencies = [
- "getrandom 0.4.3",
- "png",
- "postcard",
- "serde",
- "sha2 0.11.1",
- "snow",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "glkvm-gui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arboard",
- "egui",
- "egui-wgpu",
- "egui-winit",
- "futures-util",
- "glkvm",
- "glkvm-clip",
- "glkvm-media",
- "glkvm-view",
- "keyring",
- "objc2 0.6.5",
- "objc2-app-kit 0.3.2",
- "objc2-foundation 0.3.2",
- "objc2-vision",
- "open",
- "png",
- "pollster",
- "rfd",
- "serde",
- "serde_json",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "tracing-subscriber",
- "wgpu",
- "winit",
-]
-
-[[package]]
-name = "glkvm-media"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "bytes",
- "cpal",
- "futures-util",
- "glkvm",
- "objc2-core-foundation",
- "objc2-core-media",
- "objc2-core-video",
- "objc2-video-toolbox",
- "opus-decoder",
- "serde_json",
- "str0m",
- "thiserror 2.0.21",
- "tokio",
- "tokio-tungstenite",
- "tracing",
-]
-
-[[package]]
-name = "glkvm-view"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "glkvm",
- "glkvm-media",
- "objc2 0.6.5",
- "objc2-core-foundation",
- "objc2-core-video",
- "objc2-metal 0.3.2",
- "pollster",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
- "wgpu",
- "winit",
 ]
 
 [[package]]

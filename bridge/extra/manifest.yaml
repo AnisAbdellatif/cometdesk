@@ -1,5 +1,5 @@
-name: glkvm-bridge
-description: Clipboard bridge relay between the target agent and glkvm-gui
-path: /usr/local/lib/glkvm-bridge/glkvm_bridge.py
-daemon: glkvm-bridge
+name: cometdesk-bridge
+description: Clipboard bridge relay between the target agent and cometdesk-gui
+path: /usr/local/lib/cometdesk-bridge/cometdesk_bridge.py
+daemon: cometdesk-bridge
 place: -1

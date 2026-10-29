@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""On-device test of the relay's session rules. Run on the Comet while glkvm-bridge runs:
+"""On-device test of the relay's session rules. Run on the Comet while cometdesk-bridge runs:
 
     ssh root@<comet> python3 - < bridge/selftest.py
 
@@ -10,7 +10,7 @@ import asyncio
 
 import aiohttp
 
-SOCK = "/run/kvmd/glkvm-bridge.sock"
+SOCK = "/run/kvmd/cometdesk-bridge.sock"
 AGENT = ("192.168.5.1", 47474)
 
 

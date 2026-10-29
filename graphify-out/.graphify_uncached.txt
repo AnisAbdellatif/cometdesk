@@ -1,0 +1,13 @@
+/Users/anisabdellatif/dev/glkvm-rs/AGENTS.md
+/Users/anisabdellatif/dev/glkvm-rs/PLAN.md
+/Users/anisabdellatif/dev/glkvm-rs/bench/results.md
+/Users/anisabdellatif/dev/glkvm-rs/crates/glkvm/tests/fixtures/README.md
+/Users/anisabdellatif/dev/glkvm-rs/docs/automation.md
+/Users/anisabdellatif/dev/glkvm-rs/docs/clipboard-bridge.md
+/Users/anisabdellatif/dev/glkvm-rs/docs/protocol.md
+/Users/anisabdellatif/dev/glkvm-rs/vendor/str0m/CHANGELOG.md
+/Users/anisabdellatif/dev/glkvm-rs/vendor/str0m/GLKVM.md
+/Users/anisabdellatif/dev/glkvm-rs/vendor/str0m/LICENSE-MIT.txt
+/Users/anisabdellatif/dev/glkvm-rs/vendor/str0m/README.md
+/Users/anisabdellatif/dev/glkvm-rs/vendor/str0m/src/packet/LICENSE-APACHE.txt
+/Users/anisabdellatif/dev/glkvm-rs/apps/glkvm-gui/assets/logo-256.png

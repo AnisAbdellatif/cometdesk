@@ -1,4 +1,4 @@
-# glkvm-rs: native console for GL.iNet GLKVM devices
+# cometdesk-rs: native console for GL.iNet GLKVM devices
 
 Goal: a native, hardware-accelerated **console** for GLKVM devices (video + keyboard/mouse
 + power) that beats the official web app on latency and power, built on a Rust SDK that
@@ -78,16 +78,16 @@ Cargo workspace, async on `tokio`, all TLS via `rustls`. Four crates; split furt
 when compile times or a second consumer demand it.
 
 ```
-glkvm-rs/
+cometdesk-rs/
   crates/
-    glkvm/          SDK: proto types (serde), REST client, /api/ws events + HID. Light deps.
-    glkvm-media/    Video/audio sources (Direct, Pion), decoders (VideoToolbox). Heavy deps.
-    glkvm-cli/      `glkvm` CLI: dogfoods the SDK (view, snapshot, power, wake, type).
+    cometdesk/          SDK: proto types (serde), REST client, /api/ws events + HID. Light deps.
+    cometdesk-media/    Video/audio sources (Direct, Pion), decoders (VideoToolbox). Heavy deps.
+    cometdesk-cli/      `cometdesk` CLI: dogfoods the SDK (view, snapshot, power, wake, type).
   apps/
-    glkvm-gui/      eframe/egui desktop app.
+    cometdesk-gui/      eframe/egui desktop app.
 ```
 
-### 2.1 `glkvm::client` (REST)
+### 2.1 `cometdesk::client` (REST)
 
 - `reqwest` with cookie store, rustls, gzip.
 - **TLS**: one shared `rustls::ClientConfig` with a trust-on-first-use verifier (pin the
@@ -107,7 +107,7 @@ glkvm-rs/
   and lives behind an explicit method name (`set_device_video_mode`, never a side effect of
   something else). See §4.
 
-### 2.2 `glkvm::events` (`/api/ws`)
+### 2.2 `cometdesk::events` (`/api/ws`)
 
 - `tokio-tungstenite`. Typed `enum Event { Info, Hid, Atx, Streamer, Kickout, ... }`
   (unknown event types are kept as `Event::Other(serde_json::Value)`, not errors).
@@ -139,7 +139,7 @@ glkvm-rs/
 - Pass `stream=0` when the session only needs HID and events (Overlook's flag is ignored,
   so its HID socket keeps the streamer alive).
 
-### 2.3 `glkvm-media` (sources)
+### 2.3 `cometdesk-media` (sources)
 
 Sources are an enum, not a trait object (`async fn` in traits isn't dyn-compatible, and
 there are only two):
@@ -201,18 +201,18 @@ Rules for every source:
 `/lws/ws` (Native) is out of scope: proprietary, and it disables Janus.
 
 **Status (branch `phase3-webrtc`)**: all three sources exist behind one switch,
-`glkvm_media::start(session, SourceOptions { transport, .. })` with `Transport::{Direct,
-Pion, Janus}` (CLI: `view --transport direct|pion|janus`; GUI: `GLKVM_TRANSPORT`). Pion and
+`cometdesk_media::start(session, SourceOptions { transport, .. })` with `Transport::{Direct,
+Pion, Janus}` (CLI: `view --transport direct|pion|janus`; GUI: `COMETDESK_TRANSPORT`). Pion and
 Janus share a str0m engine (`rtc.rs`): H.264 only, host candidates only (str0m has no
 STUN/TURN, so the device must be reachable over UDP: LAN or VPN), NACK/RTX, PLI for keyframes.
 Pion also receives **FlexFEC-03**: the offer is munged like the web app's, repair packets reach
-`flexfec.rs` through a small patch of str0m (`vendor/str0m/GLKVM.md`), and rebuilt packets are
+`flexfec.rs` through a small patch of str0m (`vendor/str0m/CometDesk.md`), and rebuilt packets are
 injected into the receive path. gl-pion's repair layout is documented in `docs/protocol.md`.
 Verified against the Comet over Tailscale on 2026-10-29: handshakes work (Pion SDPs are base64
 JSON), every group XORs to zero. Without FEC the stream does not survive loss (gl-pion sends
 unpaced bursts and never answers NACK); Janus mode has no FEC, so Direct stays the choice for lossy links
 in `webrtc` mode. **M7** (`pion_video_survives_loss`, 1 % of incoming RTP dropped in-process,
-`GLKVM_TEST_RX_LOSS=1`; dummynet needs root): see `bench/results.md`. On unrecovered loss the
+`COMETDESK_TEST_RX_LOSS=1`; dummynet needs root): see `bench/results.md`. On unrecovered loss the
 source keeps decoding (artifacts until the next IDR) rather than freezing, because the device
 sends keyframes rarely on a static screen. TURN credentials (`/api/turn/get_turn`) are not
 used: str0m has no STUN/TURN client, so relayed paths are out of scope.
@@ -222,7 +222,7 @@ and plays through `cpal` with a 40 ms prebuffer and a 150 ms latency cap. CLI: `
 pion --audio`; GUI: Video menu → "Play audio". Unit-tested for the decoder glue and buffer
 behavior. On the device (2026-10-29) both Pion and Janus audio deliver Opus once the target
 plays sound, and decode and reach the output callback; the source follows the device's video
-mode (`audio::start`).
+mode (`audio::start`); `direct_h264` falls back to Pion audio (untested).
 
 ### 2.4 Decode
 
@@ -251,7 +251,7 @@ pub enum DecodedFrame {
 
 Opus from Pion, decoded with `audiopus`, played with `cpal`. Microphone: backlog.
 
-## 3. GUI (`apps/glkvm-gui`)
+## 3. GUI (`apps/cometdesk-gui`)
 
 **eframe + egui on the wgpu backend.** The video is a wgpu texture drawn through an egui
 paint callback, not an egui widget.
@@ -272,7 +272,7 @@ stop decoding immediately; after a **30 s grace period**, drop the video stream 
 avoids a streamer cold start (seconds) on quick app switches.
 
 Input (v1):
-- winit key and mouse events → `glkvm::events`. **Map mode** only: send the physical key
+- winit key and mouse events → `cometdesk::events`. **Map mode** only: send the physical key
   position (`KeyboardEvent.code`). Correct when layouts match, and the only mode that works
   in BIOS/bootloaders.
 - Per-device **target OS profile** (Windows / macOS / Linux / BIOS) drives modifier
@@ -354,7 +354,7 @@ The SDK enforces naming (§2.1); the GUI enforces confirmation.
 
 **Baseline (B)**: the official GL web app in current stable Chrome, Direct mode, same
 1080p60 source, same Mac, same network, measured at the start of Phase 0. Every number
-below is recorded for both B and glkvm-gui in `bench/results.md`.
+below is recorded for both B and cometdesk-gui in `bench/results.md`.
 
 | ID | Metric | Method | Target |
 |---|---|---|---|
@@ -374,8 +374,8 @@ when hidden), not M1. A result of "same latency, half the power" is a pass.
 
 | Phase | Deliverable | Done when |
 |---|---|---|
-| **0. Baseline + spike** (≤ 2 wk) | Measure B (M1–M6). Answer U1–U8. `glkvm-cli view`: login, Direct, VideoToolbox, NV12 shader in a minimal winit + wgpu window, map-mode keyboard + absolute mouse. | `bench/results.md` has B and spike numbers; `docs/protocol.md` answers U1–U8. **Go** if M1 and M2 pass. If M1 passes but M2 doesn't, profile once; if still failing, keep SDK + CLI and stop the GUI. |
-| **1. SDK core** | `glkvm` (auth incl. 2FA/two-step, info, capability, clients, streamer state, snapshot, hid incl. print, atx, wol, events), Direct source in `glkvm-media`, CLI | CLI can log in (incl. 2FA), view, snapshot, power-cycle, wake, type text. Fixture tests green, `cargo-deny` green. |
+| **0. Baseline + spike** (≤ 2 wk) | Measure B (M1–M6). Answer U1–U8. `cometdesk-cli view`: login, Direct, VideoToolbox, NV12 shader in a minimal winit + wgpu window, map-mode keyboard + absolute mouse. | `bench/results.md` has B and spike numbers; `docs/protocol.md` answers U1–U8. **Go** if M1 and M2 pass. If M1 passes but M2 doesn't, profile once; if still failing, keep SDK + CLI and stop the GUI. |
+| **1. SDK core** | `cometdesk` (auth incl. 2FA/two-step, info, capability, clients, streamer state, snapshot, hid incl. print, atx, wol, events), Direct source in `cometdesk-media`, CLI | CLI can log in (incl. 2FA), view, snapshot, power-cycle, wake, type text. Fixture tests green, `cargo-deny` green. |
 | **2. Console MVP** | GUI per §3: device list + keychain, console window, map mode + OS profiles, special keys, type clipboard, snapshot, ATX, WoL, stats, HDMI state, viewer count, reactive repaint, hidden-window rule, "Open device settings" | M1–M6 pass. Used as the daily console for 2 weeks without falling back to the web app for viewing. |
 | **3. Remote** | First: a Pion spike answering "does gl-pion accept plain RTP without FlexFEC?". Then the Pion source (str0m) + Opus playback. Janus only if the spike fails. | M7 passes over the shaped link and over the real VPN. Audio plays. |
 
@@ -386,14 +386,14 @@ done-criterion written when it's pulled.
 
 - **Fixtures**: record real JSON responses/events from the Comet for every route the SDK
   implements (scrub tokens and serials), store per firmware version, deserialize in unit
-  tests. Every `glkvm` proto type gets a round-trip test. Mutating routes (ATX, upgrade,
+  tests. Every `cometdesk` proto type gets a round-trip test. Mutating routes (ATX, upgrade,
   reset) are recorded from captured web-app traffic, not by calling them.
 - **Firmware testenv**: the glkvm repo ships a Docker test environment (`testenv/`,
   `make run`) running kvmd against fake hardware. Use it in CI for upstream-kvmd endpoints
   only (auth, info, hid, atx, streamer state, `/api/ws`). GL-specific endpoints call into
   real system scripts and are covered by fixtures and device tests.
-- **Real-device tests**: `#[ignore]` integration tests gated on `GLKVM_HOST` and
-  `GLKVM_PASSWORD`, covering login, video start (first keyframe decoded), HID round-trip.
+- **Real-device tests**: `#[ignore]` integration tests gated on `COMETDESK_HOST` and
+  `COMETDESK_PASSWORD`, covering login, video start (first keyframe decoded), HID round-trip.
   Nothing destructive.
 - **Compat watch**: a CI job that diffs the route list in `gl-inet/glkvm`
   `kvmd/apps/kvmd/api/` against Appendix A, plus a manual script that probes the live
@@ -513,7 +513,7 @@ and recorded as fixtures.
 | Single ordered HID queue; 120 Hz latest-wins abs moves; ±127 relative splitting | §2.2 |
 | Wheel accumulation and scaling; `release_all()`; drop auto-repeat; Caps Lock; lone Meta | §2.2, §3 |
 | Pause input capture under overlays; aspect-locked window; fit to guest; hover toolbar | §3 |
-| GLKVM fingerprint for manual add; `192.168.200.1` suggestion | §3 |
+| CometDesk fingerprint for manual add; `192.168.200.1` suggestion | §3 |
 | `hid/set_connected` and whole-object `set_config` are device-wide | §4, U8 |
 | Client preferences stay local, seeded from device config | §4 |
 | TURN from `/api/turn/get_turn` instead of a hardcoded public STUN | §2.3 |
