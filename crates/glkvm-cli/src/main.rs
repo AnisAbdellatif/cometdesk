@@ -62,6 +62,9 @@ enum Cmd {
         /// How video reaches us: direct (`/api/media/ws`), pion (WebRTC FEC), janus (WebRTC).
         #[arg(long, value_enum, default_value_t = TransportArg::Direct)]
         transport: TransportArg,
+        /// Play the target's audio (pion transport only; opens a second WebRTC connection).
+        #[arg(long)]
+        audio: bool,
         /// How decoded frames reach the GPU.
         #[arg(long, value_enum, default_value_t = RenderArg::Auto)]
         render: RenderArg,
@@ -278,6 +281,7 @@ fn main() -> Result<()> {
             scroll_rate,
             codec,
             transport,
+            audio,
             render,
             bench,
         } => {
@@ -291,7 +295,7 @@ fn main() -> Result<()> {
                 &rt,
                 session,
                 input,
-                (codec, transport),
+                (codec, transport, audio),
                 render,
                 bench.map(Duration::from_secs),
             )
@@ -391,7 +395,7 @@ fn view(
     rt: &tokio::runtime::Runtime,
     session: Session,
     (swap_cmd_ctrl, iso_fix, scroll_rate): (bool, Toggle, Option<u32>),
-    (codec, transport): (CodecArg, TransportArg),
+    (codec, transport, audio): (CodecArg, TransportArg, bool),
     render: RenderPath,
     bench: Option<Duration>,
 ) -> Result<()> {
@@ -442,6 +446,22 @@ fn view(
         TransportArg::Janus => Transport::Janus,
     };
     let media = glkvm_media::start(session.clone(), SourceOptions { transport, prefer });
+    // Kept alive until the viewer closes.
+    let _audio = if !audio {
+        None
+    } else if transport != Transport::Pion {
+        tracing::warn!("audio needs --transport pion; continuing without it");
+        None
+    } else {
+        let (packets, session) = glkvm_media::pion::start_audio(session.clone()).take_packets();
+        match glkvm_media::audio::Player::start(packets) {
+            Ok(player) => Some((player, session)),
+            Err(e) => {
+                tracing::warn!(%e, "audio disabled");
+                None
+            }
+        }
+    };
 
     let parts = viewer::ViewerParts {
         media,

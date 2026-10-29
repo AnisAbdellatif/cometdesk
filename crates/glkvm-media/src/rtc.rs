@@ -14,11 +14,12 @@ use str0m::media::{KeyframeRequestKind, MediaKind, Mid};
 use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, sleep, sleep_until};
 
 use crate::annexb;
+use crate::audio::AudioState;
 use crate::source::{Control, Ends, MediaStats, SourceState};
 use crate::{Codec, EncodedFrame};
 
@@ -31,7 +32,7 @@ pub(crate) fn proto(e: impl std::fmt::Display) -> Error {
     Error::Protocol(e.to_string())
 }
 
-/// A video-only H.264 receiver. Playout is "on arrival": str0m releases a frame as soon as
+/// An H.264 (or, on its own connection, Opus) receiver. Playout is "on arrival": str0m releases a frame as soon as
 /// it is complete.
 pub(crate) struct Peer {
     pub rtc: Rtc,
@@ -61,6 +62,7 @@ impl Peer {
         let mut rtc = RtcConfig::new()
             .clear_codecs()
             .enable_h264(true)
+            .enable_opus(true, false)
             .set_stats_interval(None)
             .build(Instant::now());
         let cand = Candidate::host(local, "udp").map_err(proto)?;
@@ -305,6 +307,114 @@ async fn pump(neg: Negotiated, ends: &mut Ends, stats: &mut MediaStats) -> Ended
         };
         if let Err(e) = rtc.handle_input(input) {
             end!(e);
+        }
+    }
+}
+
+/// Reconnect loop for an audio-only connection: Opus payloads out, nothing in. There is no
+/// stall watchdog, because a silent target may legitimately send nothing (DTX); loss of the
+/// connection itself is detected by ICE.
+pub(crate) async fn supervise_audio<F, Fut>(
+    name: &'static str,
+    packets: mpsc::Sender<Bytes>,
+    state: watch::Sender<AudioState>,
+    connect: F,
+) where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<Negotiated>>,
+{
+    let mut backoff = BACKOFF_MIN;
+    loop {
+        if packets.is_closed() {
+            state.send_replace(AudioState::Closed);
+            return;
+        }
+        state.send_replace(AudioState::Connecting);
+        let reason = match connect().await {
+            Ok(neg) => {
+                let (reason, streamed) = pump_audio(neg, &packets, &state).await;
+                if streamed {
+                    backoff = BACKOFF_MIN;
+                }
+                reason
+            }
+            Err(e) => e.to_string(),
+        };
+        if packets.is_closed() {
+            state.send_replace(AudioState::Closed);
+            return;
+        }
+        tracing::warn!(%reason, retry_in = ?backoff, "{name} audio connection lost");
+        state.send_replace(AudioState::Disconnected(reason));
+        sleep(backoff).await;
+        backoff = (backoff * 2).min(BACKOFF_MAX);
+    }
+}
+
+/// Returns why the connection ended and whether any audio arrived.
+async fn pump_audio(
+    neg: Negotiated,
+    packets: &mpsc::Sender<Bytes>,
+    state: &watch::Sender<AudioState>,
+) -> (String, bool) {
+    let Negotiated {
+        peer: Peer {
+            mut rtc,
+            socket,
+            local,
+        },
+        mut remote,
+        _signaling,
+    } = neg;
+    tracing::info!(%local, "webrtc audio peer up");
+    let mut buf = vec![0u8; 2048];
+    let mut got_any = false;
+    loop {
+        let deadline = loop {
+            match rtc.poll_output() {
+                Err(e) => return (e.to_string(), got_any),
+                Ok(Output::Timeout(t)) => break t,
+                Ok(Output::Transmit(t)) => {
+                    let _ = socket.send_to(&t.contents, t.destination).await;
+                }
+                Ok(Output::Event(Event::IceConnectionStateChange(
+                    IceConnectionState::Disconnected,
+                ))) => return ("ICE disconnected".into(), got_any),
+                Ok(Output::Event(Event::MediaData(d))) => {
+                    if !got_any {
+                        got_any = true;
+                        state.send_replace(AudioState::Streaming);
+                    }
+                    match packets.try_send(Bytes::copy_from_slice(&d.data)) {
+                        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            return ("consumer closed".into(), got_any);
+                        }
+                    }
+                }
+                Ok(Output::Event(_)) => {}
+            }
+        };
+        let input = tokio::select! {
+            biased;
+            cand = remote.recv() => {
+                if let Some(c) = cand { rtc.add_remote_candidate(c); }
+                continue;
+            },
+            r = socket.recv_from(&mut buf) => match r {
+                Ok((n, source)) => match (&buf[..n]).try_into() {
+                    Ok(contents) => Input::Receive(Instant::now(), Receive {
+                        proto: Protocol::Udp, source, destination: local, contents,
+                    }),
+                    Err(_) => continue,
+                },
+                Err(e) => return (e.to_string(), got_any),
+            },
+            _ = sleep_until(tokio::time::Instant::from_std(deadline)) => Input::Timeout(Instant::now()),
+            _ = packets.closed() => return ("consumer closed".into(), got_any),
+        };
+        if let Err(e) = rtc.handle_input(input) {
+            return (e.to_string(), got_any);
         }
     }
 }

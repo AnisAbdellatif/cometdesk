@@ -208,7 +208,12 @@ STUN/TURN, so the device must be reachable over UDP: LAN or VPN), NACK/RTX but n
 PLI for keyframes. The Pion and Janus handshakes follow the notes above and are covered by
 parser unit tests only; they are **not yet verified against a device** (ignored tests
 `pion_delivers_a_keyframe` / `janus_delivers_a_keyframe` in `glkvm-media/tests/device.rs`).
-No audio yet.
+Audio (Pion only): `pion::start_audio` opens a second, audio-only connection (`speaker: true`,
+Opus recv-only); `audio::Player` decodes with the pure-Rust `opus-decoder` (no libopus/cmake)
+and plays through `cpal` with a 40 ms prebuffer and a 150 ms latency cap. CLI: `view --transport
+pion --audio`; GUI: Video menu → "Play audio". Unit-tested for the decoder glue and buffer
+behavior; the device test `pion_delivers_audio` has **not been run** (device unreachable when
+written), nor has M7.
 
 ### 2.4 Decode
 

@@ -18,6 +18,7 @@ use glkvm::events::{ConnState, DeviceState, EventOptions, EventSession, HidSende
 use glkvm::hid::{HidCommand, MouseButton};
 use glkvm::{Session, SystemConfig};
 use glkvm_clip::{Hello, Info, PastePref, SessionState};
+use glkvm_media::audio::{AudioSession, Player};
 use glkvm_media::direct::{MediaSession, SourceState};
 use glkvm_media::{SourceOptions, Transport};
 use glkvm_view::pipeline::FramePipeline;
@@ -53,6 +54,14 @@ pub struct Connected {
 struct Stream {
     media: MediaSession,
     pipeline: FramePipeline,
+    audio: Option<Audio>,
+}
+
+/// Target audio: its own WebRTC connection plus the output stream. Lives and dies with the
+/// video stream, so a hidden window plays and fetches nothing.
+struct Audio {
+    _player: Player,
+    _session: AudioSession,
 }
 
 struct Typing {
@@ -144,6 +153,7 @@ pub struct Console {
     /// The target OS changed outside the toolbar (dialog, agent report): save the device.
     target_changed: bool,
     transport: Transport,
+    audio_on: bool,
     video_info: VideoInfo,
     video_info_rx: Option<tokio::sync::oneshot::Receiver<VideoInfo>>,
     /// Last keyboard layout from the agent we applied; a new report is applied again.
@@ -203,6 +213,7 @@ impl Console {
             repair_noticed: false,
             target_changed: false,
             transport: Transport::default(),
+            audio_on: false,
             video_info: VideoInfo::default(),
             video_info_rx: None,
             adopted_keyboard: None,
@@ -580,10 +591,46 @@ impl Console {
         match FramePipeline::spawn(video, media.control.clone(), move || {
             let _ = proxy.send_event(UserEvent::Frame);
         }) {
-            Ok(pipeline) => self.stream = Some(Stream { media, pipeline }),
+            Ok(pipeline) => {
+                let audio = self.start_audio();
+                self.stream = Some(Stream {
+                    media,
+                    pipeline,
+                    audio,
+                });
+            }
             Err(e) => self.notify(format!("cannot start decoder: {e}")),
         }
         self.restart_watcher();
+    }
+
+    /// Audio runs on the Pion source only, and only while the user has it switched on.
+    fn start_audio(&mut self) -> Option<Audio> {
+        if !self.audio_on || self.transport != Transport::Pion {
+            return None;
+        }
+        let _guard = self.rt.enter();
+        let (packets, session) =
+            glkvm_media::pion::start_audio(self.session.clone()).take_packets();
+        match Player::start(packets) {
+            Ok(player) => Some(Audio {
+                _player: player,
+                _session: session,
+            }),
+            Err(e) => {
+                self.audio_on = false;
+                self.notify(format!("Audio unavailable: {e}"));
+                None
+            }
+        }
+    }
+
+    fn set_audio(&mut self, on: bool) {
+        self.audio_on = on;
+        let audio = if on { self.start_audio() } else { None };
+        if let Some(s) = &mut self.stream {
+            s.audio = audio;
+        }
     }
 
     fn set_transport(&mut self, transport: Transport) {
@@ -651,6 +698,15 @@ impl Console {
                 self.set_transport(t);
                 ui.close();
             }
+        }
+        let mut audio = self.audio_on;
+        let enabled = self.transport == Transport::Pion;
+        if ui
+            .add_enabled(enabled, egui::Checkbox::new(&mut audio, "Play audio"))
+            .on_disabled_hover_text("Audio needs the WebRTC (FEC) source")
+            .changed()
+        {
+            self.set_audio(audio);
         }
         ui.separator();
         ui.label("Device-wide (affects every viewer)");

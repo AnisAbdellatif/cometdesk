@@ -1,6 +1,7 @@
 //! Video sources and hardware decoding for GLKVM devices.
 
 pub mod annexb;
+pub mod audio;
 pub mod direct;
 pub mod janus;
 pub mod pion;

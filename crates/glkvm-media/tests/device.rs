@@ -136,3 +136,19 @@ async fn pion_delivers_a_keyframe() {
 async fn janus_delivers_a_keyframe() {
     first_keyframe(glkvm_media::Transport::Janus).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a device and an audio source on the target"]
+async fn pion_delivers_audio() {
+    let session = login().await;
+    let _events = EventSession::spawn(session.clone(), EventOptions::default());
+    let audio = glkvm_media::pion::start_audio(session);
+    let (mut packets, audio) = audio.take_packets();
+    let first = tokio::time::timeout(Duration::from_secs(10), packets.recv())
+        .await
+        .unwrap_or_else(|_| panic!("no audio: {:?}", *audio.state.borrow()))
+        .expect("audio source ended");
+    let mut dec = opus_decoder::OpusDecoder::new(48_000, 2).unwrap();
+    let mut pcm = vec![0f32; 5760 * 2];
+    assert!(dec.decode_float(&first, &mut pcm, false).unwrap() > 0);
+}

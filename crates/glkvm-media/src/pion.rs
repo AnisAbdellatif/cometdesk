@@ -21,6 +21,7 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::audio::AudioSession;
 use crate::rtc::{self, AbortOnDrop, Negotiated, Peer, proto};
 use crate::source::MediaSession;
 
@@ -28,7 +29,21 @@ const SIGNALING_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Starts the Pion source on the current tokio runtime.
 pub fn start(session: Session) -> MediaSession {
-    MediaSession::spawn(|ends| rtc::supervise("pion", ends, move || negotiate(session.clone())))
+    MediaSession::spawn(|ends| {
+        rtc::supervise("pion", ends, move || {
+            negotiate(session.clone(), MediaKind::Video)
+        })
+    })
+}
+
+/// Starts the audio-only source: a second connection next to the video one, because sharing
+/// a peer connection makes the receiver hold video back for A/V sync.
+pub fn start_audio(session: Session) -> AudioSession {
+    AudioSession::spawn(|packets, state| {
+        rtc::supervise_audio("pion", packets, state, move || {
+            negotiate(session.clone(), MediaKind::Audio)
+        })
+    })
 }
 
 #[derive(Debug, PartialEq)]
@@ -63,12 +78,13 @@ pub fn parse_signal(text: &str) -> Signal {
     }
 }
 
-fn config_message() -> Message {
+fn config_message(kind: MediaKind) -> Message {
+    let video = kind == MediaKind::Video;
     Message::text(
         json!({
             "type": "config",
-            "video": true,
-            "speaker": false,
+            "video": video,
+            "speaker": !video,
             "mic": false,
             "hid": false,
             "offerer": true,
@@ -80,18 +96,18 @@ fn config_message() -> Message {
     )
 }
 
-async fn negotiate(session: Session) -> Result<Negotiated> {
+async fn negotiate(session: Session, kind: MediaKind) -> Result<Negotiated> {
     let ws = session.ws_connect("pion/ws").await?;
     let (mut sink, mut stream) = ws.split();
     let mut peer = Peer::new(session.host()).await?;
 
     let mut api = peer.rtc.sdp_api();
-    api.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
+    api.add_media(kind, Direction::RecvOnly, None, None, None);
     let (offer, pending) = api
         .apply()
         .ok_or_else(|| Error::Protocol("no offer produced".into()))?;
     tracing::debug!(sdp = %offer.to_sdp_string(), "pion offer");
-    sink.send(config_message()).await?;
+    sink.send(config_message(kind)).await?;
     sink.send(Message::text(
         json!({"type": "offer", "sdp": offer.to_sdp_string()}).to_string(),
     ))
