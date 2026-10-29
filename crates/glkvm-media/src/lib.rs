@@ -3,6 +3,7 @@
 pub mod annexb;
 pub mod audio;
 pub mod direct;
+mod flexfec;
 pub mod janus;
 pub mod pion;
 mod rtc;

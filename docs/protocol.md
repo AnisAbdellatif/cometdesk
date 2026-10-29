@@ -101,8 +101,31 @@ Device in `video_mode = webrtc`, Mac and Comet on a tailnet (direct path, ~25 ms
   5 s, so str0m's incomplete frames stall the decoder until the watchdog reconnects. Removing
   the transport-cc extension changed nothing. Janus behaved the same (connects, intermittent
   frames, same loss) but the connection survives longer.
-- Consequence: Pion/Janus work only on a clean link (LAN) until FlexFEC-03 is decoded or the
-  server honors NACK. Over Tailscale use Direct (TCP): 1.0 s to first keyframe, 60 fps.
+- Consequence: Pion without FEC works only on a clean link. Janus (device mode `webrtc`)
+  has no FEC at all, so the same holds there; use Direct over a lossy VPN.
+- **FlexFEC-03 (Pion, solves the above).** The web app munges its offer: the first free
+  dynamic PT in 96..127 (then 35..65) is appended to the `m=video` line, plus
+  `a=rtpmap:PT flexfec-03/90000` and `a=fmtp:PT repair-window=10000000` at the end of the
+  section; config carries `flexfecLevel` = its `fec_packets` setting (default 20). The answer
+  then has `a=rtpmap:PT flexfec-03/90000`, `a=ssrc-group:FEC-FR media_ssrc fec_ssrc` and a
+  second SSRC with that PT. Layout of the repair packets, found by checking that every group
+  XORs to zero against the media packets (0 mismatches in 400+ groups), differs from a plain
+  reading of RFC 8627 in two places:
+  - groups are **16 media packets**, 4 repair packets per group, **interleaved**: repair `c`
+    covers offsets `c, c+4, c+8, c+12`; a repair packet follows after its group (on a static
+    screen that is ~270 ms: one packet per frame at 60 fps);
+  - the mask is the 15-bit word + 31-bit word, but the `k` bits are wrong: column 3 reaches
+    offset 15 (second word `0xC0000000`) while the first word says "no more words", and then
+    4 extra zero bytes precede the repair payload;
+  - the XOR over payload bytes starts after the 4-byte extension preamble (`BE DE len`), so it
+    covers the transport-cc value and the payload; the length field counts everything after the
+    12-byte header; P/X/CC, M/PT, timestamp are plain XORs.
+  Media packets carry a 4-byte one-byte-header extension with only transport-cc (8 bytes with
+  padding). `glkvm-media/src/flexfec.rs` rebuilds one loss per repair packet, iterating.
+- **Keyframes.** On a static screen the device sends an IDR every 2 s at best and sometimes
+  none for 12+ s; it answered the first PLI of a session within 85 ms and later ones not at
+  all. A 60 fps stream of ~100 B delta frames (one packet each) is ~60-330 kbps; IDRs are
+  60-135 KB (50-120 packets).
 - **Audio** (own connection, as the web app does it): works on **both** Pion
   (`speaker: true`, video false; base64 SDPs, `client-ice-complete`) and Janus (second handle,
   `watch {audio: true, video: false, mic: false, camera: false}`). Opus 48k/2, ~50 packets/s,

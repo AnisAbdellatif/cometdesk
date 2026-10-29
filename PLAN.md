@@ -175,8 +175,8 @@ Implementations:
    `{type: config, video, speaker, mic, hid, offerer: true, flexfecLevel, orientation,
    camera}`, then offer/answer/candidate JSON. WebRTC via
    **[str0m](https://github.com/algesten/str0m)** (sans-IO, H.264 + Opus, NACK/RTX). str0m
-   has no FlexFEC, so we offer plain RTP + NACK; whether gl-pion accepts that is
-   **unverified** and is the first task of Phase 3.
+   has no FlexFEC, so the FlexFEC-03 repair stream is decoded by us (§2.3 status; a small
+   patch of str0m hands over the packets). gl-pion accepts plain RTP but only FEC survives loss.
 3. **Janus** (`/janus/ws`): only if Pion fails. Requires `gl_webrtc=false`, which is a
    device-wide change (§4). Signaling details are in §10 (the `janus-protocol`
    subprotocol and `Origin` header are required; Janus is the offerer).
@@ -204,13 +204,18 @@ Rules for every source:
 `glkvm_media::start(session, SourceOptions { transport, .. })` with `Transport::{Direct,
 Pion, Janus}` (CLI: `view --transport direct|pion|janus`; GUI: `GLKVM_TRANSPORT`). Pion and
 Janus share a str0m engine (`rtc.rs`): H.264 only, host candidates only (str0m has no
-STUN/TURN, so the device must be reachable over UDP: LAN or VPN), NACK/RTX but no FlexFEC,
-PLI for keyframes. Verified against the Comet over Tailscale on 2026-10-29 (details in `docs/protocol.md`): the
-Pion and Janus handshakes work (Pion SDPs are base64 JSON), ICE/DTLS connect and video flows,
-but **plain RTP without FlexFEC is not usable on a lossy path**: gl-pion sends unpaced bursts,
-loses part of each, and never answers NACK or PLI. So the spike's answer is "accepts it, but only
-good on a clean LAN". Next for remote: a FlexFEC-03 decoder (str0m has none, so we would receive
-raw RTP ourselves), or Direct over the VPN, which works (60 fps, 1.0 s to first frame). M7 not run.
+STUN/TURN, so the device must be reachable over UDP: LAN or VPN), NACK/RTX, PLI for keyframes.
+Pion also receives **FlexFEC-03**: the offer is munged like the web app's, repair packets reach
+`flexfec.rs` through a small patch of str0m (`vendor/str0m/GLKVM.md`), and rebuilt packets are
+injected into the receive path. gl-pion's repair layout is documented in `docs/protocol.md`.
+Verified against the Comet over Tailscale on 2026-10-29: handshakes work (Pion SDPs are base64
+JSON), every group XORs to zero. Without FEC the stream does not survive loss (gl-pion sends
+unpaced bursts and never answers NACK); Janus mode has no FEC, so Direct stays the choice for lossy links
+in `webrtc` mode. **M7** (`pion_video_survives_loss`, 1 % of incoming RTP dropped in-process,
+`GLKVM_TEST_RX_LOSS=1`; dummynet needs root): see `bench/results.md`. On unrecovered loss the
+source keeps decoding (artifacts until the next IDR) rather than freezing, because the device
+sends keyframes rarely on a static screen. TURN credentials (`/api/turn/get_turn`) are not
+used: str0m has no STUN/TURN client, so relayed paths are out of scope.
 Audio: `pion::start_audio` or `janus::start_audio` opens a second, audio-only connection (`speaker: true`,
 Opus recv-only); `audio::Player` decodes with the pure-Rust `opus-decoder` (no libopus/cmake)
 and plays through `cpal` with a 40 ms prebuffer and a 150 ms latency cap. CLI: `view --transport

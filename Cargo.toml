@@ -18,3 +18,8 @@ opt-level = 2
 # Its CELT band mask shifts a u8 past its width; harmless when it wraps, a panic when checked.
 [profile.dev.package.opus-decoder]
 overflow-checks = false
+
+# str0m with two hooks for FlexFEC-03: FEC packets are delivered as raw packets, and
+# recovered media packets can be injected. See vendor/str0m/GLKVM.md.
+[patch.crates-io]
+str0m = { path = "vendor/str0m" }

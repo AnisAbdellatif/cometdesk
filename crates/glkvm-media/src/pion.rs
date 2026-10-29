@@ -7,8 +7,9 @@
 //!   base64 of the JSON `{"type":"offer"|"answer","sdp":"v=0…"}` (as the web app does it);
 //! - either side → `{"type":"candidate","candidate":"candidate:…"}`.
 //!
-//! The reply parser is lenient on purpose (see [`parse_signal`]). We offer plain RTP + NACK, no FlexFEC (str0m has
-//! none); whether gl-pion accepts that is what `glkvm-cli view --transport pion` shows.
+//! The reply parser is lenient on purpose (see [`parse_signal`]). The video offer carries a
+//! FlexFEC-03 payload type like the web app's (see [`add_flexfec`]); `flexfecLevel` in the
+//! config asks the server to send repair packets, which `rtc` decodes.
 
 use std::time::Duration;
 
@@ -107,27 +108,81 @@ fn config_message(kind: MediaKind) -> Message {
     });
     if video {
         // As the web app does: these only exist on the video connection.
-        config["flexfecLevel"] = 0.into();
+        config["flexfecLevel"] = fec_level().into();
         config["orientation"] = 0.into();
         config["camera"] = false.into();
     }
     Message::text(config.to_string())
 }
 
+/// FEC packets per frame group requested from the device: the web app's default (its
+/// `fec_packets` setting). 0 turns FlexFEC off; `GLKVM_FEC` overrides it for experiments.
+fn fec_level() -> u32 {
+    std::env::var("GLKVM_FEC")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20)
+}
+
+/// Adds a FlexFEC-03 payload type to the video section of an offer, as the web app does:
+/// the first free dynamic payload type, `rtpmap` and `fmtp` at the end of the section.
+/// Returns the new SDP and the payload type.
+fn add_flexfec(sdp: &str) -> Option<(String, u8)> {
+    let mut lines: Vec<&str> = sdp.split("\r\n").collect();
+    if lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    let start = lines.iter().position(|l| l.starts_with("m=video"))?;
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| l.starts_with("m="))
+        .map_or(lines.len(), |i| start + 1 + i);
+    let used: Vec<u8> = lines[start]
+        .split(' ')
+        .skip(3)
+        .filter_map(|p| p.parse().ok())
+        .collect();
+    let pt = (96..=127).chain(35..=65).find(|p| !used.contains(p))?;
+    let m_line = format!("{} {pt}", lines[start]);
+    let rtpmap = format!("a=rtpmap:{pt} flexfec-03/90000");
+    let fmtp = format!("a=fmtp:{pt} repair-window=10000000");
+    lines[start] = &m_line;
+    lines.insert(end, &fmtp);
+    lines.insert(end, &rtpmap);
+    Some((lines.join("\r\n") + "\r\n", pt))
+}
+
 async fn negotiate(session: Session, kind: MediaKind) -> Result<Negotiated> {
     let ws = session.ws_connect("pion/ws").await?;
     let (mut sink, mut stream) = ws.split();
-    let mut peer = Peer::new(session.host()).await?;
+    let mut peer = Peer::new(
+        session.host(),
+        if fec_level() > 0 {
+            rtc::REORDERING_FEC
+        } else {
+            rtc::REORDERING_PLAIN
+        },
+    )
+    .await?;
 
     let mut api = peer.rtc.sdp_api();
     api.add_media(kind, Direction::RecvOnly, None, None, None);
     let (offer, pending) = api
         .apply()
         .ok_or_else(|| Error::Protocol("no offer produced".into()))?;
-    tracing::debug!(sdp = %offer.to_sdp_string(), "pion offer");
+    let mut offer_sdp = offer.to_sdp_string();
+    let mut fec = None;
+    if kind == MediaKind::Video
+        && fec_level() > 0
+        && let Some((sdp, pt)) = add_flexfec(&offer_sdp)
+    {
+        offer_sdp = sdp;
+        fec = Some(pt);
+    }
+    tracing::debug!(sdp = %offer_sdp, "pion offer");
     sink.send(config_message(kind)).await?;
     sink.send(Message::text(
-        json!({"type": "offer", "sdp": encode_sdp("offer", &offer.to_sdp_string())}).to_string(),
+        json!({"type": "offer", "sdp": encode_sdp("offer", &offer_sdp)}).to_string(),
     ))
     .await?;
 
@@ -181,6 +236,7 @@ async fn negotiate(session: Session, kind: MediaKind) -> Result<Negotiated> {
         }
         tracing::debug!("pion signaling socket closed");
     });
+    peer.rtc.set_fec_payload_type(fec);
     Ok(Negotiated {
         peer,
         remote,

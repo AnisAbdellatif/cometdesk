@@ -172,7 +172,7 @@ async fn negotiate(session: Session, kind: MediaKind) -> Result<Negotiated> {
     })
     .await?;
 
-    let mut peer = Peer::new(session.host()).await?;
+    let mut peer = Peer::new(session.host(), rtc::REORDERING_PLAIN).await?;
     let offer = SdpOffer::from_sdp_string(&offer).map_err(proto)?;
     let answer = peer.rtc.sdp_api().accept_offer(offer).map_err(proto)?;
     ws.send(msg(json!({

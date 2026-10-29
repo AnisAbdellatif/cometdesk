@@ -162,3 +162,60 @@ async fn audio_arrives(start: fn(Session) -> glkvm_media::audio::AudioSession) {
     let mut pcm = vec![0f32; 5760 * 2];
     assert!(dec.decode_float(&first, &mut pcm, false).unwrap() > 0);
 }
+
+/// M7: video over Pion/FlexFEC under loss. `GLKVM_TEST_RX_LOSS=1` drops 1 % of the incoming
+/// RTP datagrams before the engine sees them (a clean link with dummynet-style loss would
+/// need root); `M7_SECONDS` sets the duration (default 60, the milestone says 300).
+/// Passes with at least 30 fps and no gap between frames above 500 ms.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a device"]
+async fn pion_video_survives_loss() {
+    use glkvm_media::source::{self, SourceOptions, Transport};
+
+    let seconds: u64 = std::env::var("M7_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+    let session = login().await;
+    let _events = EventSession::spawn(session.clone(), EventOptions::default());
+    let media = source::start(
+        session,
+        SourceOptions {
+            transport: Transport::Pion,
+            ..Default::default()
+        },
+    );
+    let (mut video, media) = media.take_video();
+
+    let warmup = Duration::from_secs(3);
+    let start = Instant::now();
+    let mut last: Option<Instant> = None;
+    let (mut frames, mut worst) = (0u64, Duration::ZERO);
+    let mut measured_from = None;
+    while start.elapsed() < warmup + Duration::from_secs(seconds) {
+        let Ok(Some(frame)) = tokio::time::timeout(Duration::from_secs(10), video.recv()).await
+        else {
+            panic!("no video for 10 s: {:?}", *media.state.borrow());
+        };
+        if start.elapsed() < warmup {
+            continue;
+        }
+        measured_from.get_or_insert(frame.received_at);
+        if let Some(prev) = last {
+            let gap = frame.received_at.duration_since(prev);
+            if gap > worst {
+                worst = gap;
+            }
+        }
+        last = Some(frame.received_at);
+        frames += 1;
+    }
+    let span = last
+        .unwrap()
+        .duration_since(measured_from.unwrap())
+        .as_secs_f64();
+    let fps = frames as f64 / span;
+    eprintln!("M7: {frames} frames in {span:.1} s = {fps:.1} fps, worst gap {worst:?}");
+    assert!(fps >= 30.0, "{fps:.1} fps");
+    assert!(worst <= Duration::from_millis(500), "freeze of {worst:?}");
+}

@@ -99,6 +99,9 @@ pub struct MediaStats {
     pub kbps: f32,
     pub frames_total: u64,
     pub dropped_total: u64,
+    /// Times packets were lost for good (WebRTC sources): the picture may show artifacts
+    /// until the next keyframe.
+    pub gaps_total: u64,
 }
 
 pub(crate) enum Control {

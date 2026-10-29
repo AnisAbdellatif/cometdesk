@@ -75,3 +75,23 @@ Same method, 2026-10-28, window visible, mostly static target screen.
 - Still ~1/5 of the web app (67–69 % Direct, ~54 % WebRTC).
 - A hidden window stops decoding immediately and drops the stream after 30 s (seen in the
   logs during these runs: covered windows measured ~0–2 %).
+
+## M7: Pion + FlexFEC under loss
+
+2026-10-29, Comet on Tailscale (direct path, ~25 ms RTT, no measurable loss of its own),
+`cargo test -p glkvm-media --test device pion_video_survives_loss -- --ignored`, 2560×1440
+at 60 fps, mostly static screen. Loss is injected in the receiver (`GLKVM_TEST_RX_LOSS=<percent>`
+drops that share of incoming RTP datagrams before the WebRTC engine sees them; dummynet/pfctl
+need root and were not used). Pass = ≥ 30 fps and no gap between frames above 500 ms.
+
+| Injected loss | Duration | fps | Worst gap between frames | Result |
+|---|---|---|---|---|
+| 1 % | 300 s | 60.0 | 285 ms | pass |
+| 5 % | 60 s | 59.3 | 399 ms | pass |
+
+- Without FEC the same link stalled and reconnected within seconds (see `docs/protocol.md`).
+- The first 300 s run failed with a 2.0 s worst gap: str0m waits 2 s for missing packets by
+  default. A 250 ms deadline (`REORDERING_TIMEOUT`) fixed it, together with keyframe
+  requests after 300 ms without frames.
+- Unrecovered loss shows as artifacts until the next IDR rather than a freeze; the device sends
+  an IDR every ~2 s on a moving screen and answers keyframe requests only sometimes.

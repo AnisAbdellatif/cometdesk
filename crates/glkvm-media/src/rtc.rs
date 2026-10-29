@@ -2,7 +2,8 @@
 //! socket, H.264 frames out, PLI in. Signaling lives in `pion` and `janus`.
 //!
 //! str0m has no STUN/TURN client, so only host candidates are offered: the device must be
-//! reachable over UDP (LAN, VPN). FlexFEC is not implemented; loss is repaired with NACK/RTX.
+//! reachable over UDP (LAN, VPN). Loss on the Pion video is repaired by FlexFEC-03 (see
+//! `flexfec`; str0m only hands us the packets through the patch in `vendor/str0m`).
 
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket as StdUdp};
@@ -12,6 +13,7 @@ use bytes::Bytes;
 use glkvm::{Error, Result};
 use str0m::media::{KeyframeRequestKind, MediaKind, Mid};
 use str0m::net::{Protocol, Receive};
+use str0m::rtp::{ExtensionValues, RtpHeader};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
@@ -20,13 +22,53 @@ use tokio::time::{MissedTickBehavior, interval, sleep, sleep_until};
 
 use crate::annexb;
 use crate::audio::AudioState;
+use crate::flexfec;
 use crate::source::{Control, Ends, MediaStats, SourceState};
 use crate::{Codec, EncodedFrame};
 
+/// Keyframe requests after lost packets are spaced at least this far apart.
+const PLI_INTERVAL: Duration = Duration::from_millis(500);
+/// A repair packet follows its group of 16 media packets by up to 4 packets, so a gap can
+/// still be filled by FEC for that long; hold the next frames back just that much.
+pub(crate) const REORDERING_FEC: usize = 20;
+/// How long a frame may wait for missing packets. The engine's default is 2 s, which showed
+/// up as 2 s freezes after every loss FEC could not repair; FEC or a retransmission has
+/// arrived long before this.
+const REORDERING_TIMEOUT: Duration = Duration::from_millis(250);
+/// Without FEC a gap is only ever filled by a retransmission or not at all.
+pub(crate) const REORDERING_PLAIN: usize = 30;
+/// No frame for this long: ask for a keyframe (the engine drops frames behind a broken
+/// keyframe until the next one).
+const IDLE_KEY_REQUEST: Duration = Duration::from_millis(300);
 const STALL_KEY_REQUEST: Duration = Duration::from_secs(3);
 const STALL_RECONNECT: Duration = Duration::from_secs(5);
 const BACKOFF_MIN: Duration = Duration::from_millis(250);
 const BACKOFF_MAX: Duration = Duration::from_secs(10);
+
+/// Test hook: `GLKVM_TEST_RX_LOSS=<percent>` drops that share of incoming video datagrams
+/// (before the engine sees them), to exercise loss recovery on a clean link.
+struct RxLoss {
+    threshold: u64,
+    state: u64,
+}
+
+impl RxLoss {
+    fn from_env() -> Option<RxLoss> {
+        let pct: f64 = std::env::var("GLKVM_TEST_RX_LOSS").ok()?.parse().ok()?;
+        (pct > 0.0).then(|| RxLoss {
+            threshold: (pct / 100.0 * u64::MAX as f64) as u64,
+            state: 0x9e37_79b9_7f4a_7c15,
+        })
+    }
+
+    fn drops(&mut self) -> bool {
+        // xorshift64*
+        self.state ^= self.state >> 12;
+        self.state ^= self.state << 25;
+        self.state ^= self.state >> 27;
+        self.state.wrapping_mul(0x2545_f491_4f6c_dd1d) < self.threshold
+    }
+}
 
 pub(crate) fn proto(e: impl std::fmt::Display) -> Error {
     Error::Protocol(e.to_string())
@@ -43,7 +85,10 @@ pub(crate) struct Peer {
 impl Peer {
     /// Binds a UDP socket on the interface that routes to `host` and registers it as the
     /// only local candidate.
-    pub async fn new(host: &str) -> Result<Peer> {
+    ///
+    /// `reordering`: packets the receiver holds back behind a gap before giving up on it.
+    /// Each one costs 1/60 s of added delay at 60 fps when something is lost.
+    pub async fn new(host: &str, reordering: usize) -> Result<Peer> {
         let target = host_addr(host)?;
         let ip = tokio::task::spawn_blocking(move || -> std::io::Result<IpAddr> {
             let probe = StdUdp::bind(if target.is_ipv4() {
@@ -63,6 +108,8 @@ impl Peer {
             .clear_codecs()
             .enable_h264(true)
             .enable_opus(true, false)
+            .set_reordering_size_video(reordering)
+            .set_reordering_timeout_video(Some(REORDERING_TIMEOUT))
             .set_stats_interval(Some(Duration::from_secs(1)))
             .build(Instant::now());
         let cand = Candidate::host(local, "udp").map_err(proto)?;
@@ -174,9 +221,13 @@ async fn pump(neg: Negotiated, ends: &mut Ends, stats: &mut MediaStats) -> Ended
     let mut key_requested = false;
     let mut waiting_for_key = true;
     let mut window = (Instant::now(), 0u32, 0usize);
-    let mut watchdog = interval(Duration::from_millis(500));
+    let mut watchdog = interval(Duration::from_millis(100));
     watchdog.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut got_any = false;
+    let mut last_key: Option<Instant> = None;
+    let mut last_pli: Option<Instant> = None;
+    let mut fec = flexfec::Decoder::new();
+    let mut loss = RxLoss::from_env();
     macro_rules! end {
         ($r:expr) => {
             return if got_any {
@@ -219,6 +270,41 @@ async fn pump(neg: Negotiated, ends: &mut Ends, stats: &mut MediaStats) -> Ended
                     Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
                         end!("ICE disconnected")
                     }
+                    Event::FecRtp(f) => {
+                        let h = &f.header;
+                        let out = if f.repair {
+                            fec.repair(&f.payload)
+                        } else {
+                            fec.media(
+                                (h.has_padding as u8) << 5
+                                    | (h.has_extension as u8) << 4
+                                    | h.csrc_count as u8,
+                                (h.marker as u8) << 7 | *h.payload_type,
+                                h.sequence_number,
+                                h.timestamp,
+                                &f.tail,
+                                &f.payload,
+                            )
+                        };
+                        for r in out {
+                            let header = RtpHeader {
+                                version: 2,
+                                has_padding: false,
+                                has_extension: false,
+                                csrc_count: 0,
+                                marker: r.marker,
+                                payload_type: r.payload_type.into(),
+                                sequence_number: r.sequence_number,
+                                timestamp: r.timestamp,
+                                ssrc: r.ssrc.into(),
+                                csrc: [0; 15],
+                                ext_vals: ExtensionValues::default(),
+                                header_len: 12,
+                            };
+                            tracing::trace!(seq = r.sequence_number, "packet rebuilt from FEC");
+                            rtc.inject_rtp(Instant::now(), header, &r.payload);
+                        }
+                    }
                     Event::MediaAdded(m) if m.kind == MediaKind::Video => {
                         mid = Some(m.mid);
                         pli!();
@@ -227,13 +313,24 @@ async fn pump(neg: Negotiated, ends: &mut Ends, stats: &mut MediaStats) -> Ended
                         mid = Some(d.mid);
                         let now = Instant::now();
                         let key = is_keyframe(&d.data);
-                        if !d.contiguous && !key {
+                        if key {
                             tracing::debug!(
-                                len = d.data.len(),
-                                "gap in the video stream, asking for a keyframe"
-                            );
-                            waiting_for_key = true;
-                            pli!();
+                                since_last = ?last_key.map(|t| now.duration_since(t)),
+                                len = d.data.len(), "keyframe");
+                            last_key = Some(now);
+                        }
+                        if !d.contiguous && !key {
+                            // Packets are missing that FEC could not rebuild. The device
+                            // answers keyframe requests slowly or not at all and a static
+                            // screen can go many seconds without one, so keep decoding (the
+                            // picture may show artifacts where the lost frame changed
+                            // something) instead of freezing until the next keyframe.
+                            stats.gaps_total += 1;
+                            if last_pli.is_none_or(|t| t.elapsed() >= PLI_INTERVAL) {
+                                last_pli = Some(Instant::now());
+                                pli!();
+                            }
+                            tracing::debug!(len = d.data.len(), "gap in the video stream");
                         }
                         if waiting_for_key && !key {
                             stats.dropped_total += 1;
@@ -248,6 +345,11 @@ async fn pump(neg: Negotiated, ends: &mut Ends, stats: &mut MediaStats) -> Ended
                             });
                         }
                         key_requested = false;
+                        if let Some(prev) = last_frame
+                            && now.duration_since(prev) > Duration::from_millis(300)
+                        {
+                            tracing::debug!(gap = ?now.duration_since(prev), key, contiguous = d.contiguous, len = d.data.len(), "late frame");
+                        }
                         last_frame = Some(now);
                         stats.frames_total += 1;
                         window.1 += 1;
@@ -273,7 +375,15 @@ async fn pump(neg: Negotiated, ends: &mut Ends, stats: &mut MediaStats) -> Ended
                             stats.fps = window.1 as f32 / secs;
                             stats.kbps = window.2 as f32 * 8.0 / 1000.0 / secs;
                             ends.stats.send_replace(*stats);
-                            tracing::debug!(fps = stats.fps, kbps = stats.kbps, "rtc video stats");
+                            let f = fec.stats();
+                            tracing::debug!(
+                                fps = stats.fps,
+                                kbps = stats.kbps,
+                                fec_repair = f.repair,
+                                fec_recovered = f.recovered,
+                                fec_inconsistent = f.inconsistent,
+                                "rtc video stats"
+                            );
                             window = (now, 0, 0);
                         }
                     }
@@ -294,6 +404,9 @@ async fn pump(neg: Negotiated, ends: &mut Ends, stats: &mut MediaStats) -> Ended
             },
             r = socket.recv_from(&mut buf) => match r {
                 Ok((n, source)) => match (&buf[..n]).try_into() {
+                    // Keep the handshake (STUN, DTLS) intact; only RTP-looking datagrams
+                    // (first byte 0x80..0xbf) are dropped.
+                    Ok(_) if buf[0] >> 6 == 2 && loss.as_mut().is_some_and(RxLoss::drops) => continue,
                     Ok(contents) => Input::Receive(Instant::now(), Receive {
                         proto: Protocol::Udp, source, destination: local, contents,
                     }),
@@ -304,6 +417,14 @@ async fn pump(neg: Negotiated, ends: &mut Ends, stats: &mut MediaStats) -> Ended
             _ = sleep_until(tokio::time::Instant::from_std(deadline)) => Input::Timeout(Instant::now()),
             _ = watchdog.tick() => {
                 let idle = last_frame.unwrap_or(started).elapsed();
+                if got_any
+                    && idle >= IDLE_KEY_REQUEST
+                    && last_pli.is_none_or(|t| t.elapsed() >= PLI_INTERVAL)
+                {
+                    last_pli = Some(Instant::now());
+                    pli!();
+                    tracing::debug!(?idle, "no frames, asking for a keyframe");
+                }
                 if idle >= STALL_RECONNECT {
                     end!(if got_any { "stalled" } else { "no frames" });
                 }
