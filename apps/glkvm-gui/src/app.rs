@@ -297,6 +297,8 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         };
+        #[cfg(target_os = "macos")]
+        hide_menu_bar_in_fullscreen(&window);
         let gpu = match pollster::block_on(Gpu::new(window.clone(), RenderPath::Auto)) {
             Ok(g) => g,
             Err(e) => {
@@ -385,6 +387,14 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
             WindowEvent::Resized(size) => {
+                // Fullscreen can also be toggled outside the app (the macOS green button).
+                if let (Some(w), Some(c)) = (&self.window, &mut self.console) {
+                    let fullscreen = w.fullscreen().is_some();
+                    if c.fullscreen != fullscreen {
+                        c.fullscreen = fullscreen;
+                        self.egui_dirty = true;
+                    }
+                }
                 if let Some(gpu) = &mut self.gpu {
                     gpu.resize(size.width, size.height);
                 }
@@ -503,4 +513,57 @@ fn map_button(b: winit::event::MouseButton) -> Option<MouseButton> {
         winit::event::MouseButton::Forward => MouseButton::Forward,
         winit::event::MouseButton::Other(_) => return None,
     })
+}
+
+/// In fullscreen macOS slides its menu bar down at the top edge, over the toolbar that appears
+/// there too. The options macOS applies for a native fullscreen window come from the window
+/// delegate (winit's, which asks for an auto-hiding menu bar; setting them on the app instead
+/// is overwritten), so replace its answer with one that hides the menu bar.
+#[cfg(target_os = "macos")]
+fn hide_menu_bar_in_fullscreen(window: &Window) {
+    use objc2::ffi::class_replaceMethod;
+    use objc2::runtime::{AnyClass, AnyObject, Imp, Sel};
+    use objc2::{msg_send, sel};
+    use objc2_app_kit::NSApplicationPresentationOptions as Opts;
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    unsafe extern "C" fn options(
+        _: *mut AnyObject,
+        _: Sel,
+        _: *mut AnyObject,
+        _: usize,
+    ) -> usize {
+        (Opts::FullScreen | Opts::HideDock | Opts::HideMenuBar).bits()
+    }
+
+    let Ok(handle) = window.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::AppKit(h) = handle.as_raw() else {
+        return;
+    };
+    // SAFETY: `ns_view` is the live NSView of `window`; it, its window and the delegate are
+    // only messaged here, on the main thread, and the replacement matches the delegate
+    // method's signature (`NSApplicationPresentationOptions` and `NSUInteger` are both usize).
+    unsafe {
+        let view = h.ns_view.as_ptr().cast::<AnyObject>();
+        let ns_window: *mut AnyObject = msg_send![view, window];
+        if ns_window.is_null() {
+            return;
+        }
+        let delegate: *mut AnyObject = msg_send![ns_window, delegate];
+        if delegate.is_null() {
+            return;
+        }
+        let class: *const AnyClass = (*delegate).class();
+        let imp: Imp = std::mem::transmute(
+            options as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject, usize) -> usize,
+        );
+        class_replaceMethod(
+            class.cast_mut(),
+            sel!(window:willUseFullScreenPresentationOptions:),
+            imp,
+            c"Q@:@Q".as_ptr(),
+        );
+    }
 }

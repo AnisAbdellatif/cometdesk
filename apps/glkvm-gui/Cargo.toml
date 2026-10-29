@@ -29,7 +29,7 @@ wgpu = "30.0.1"
 winit = "0.30.13"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSPasteboard"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSPasteboard", "NSApplication"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSString", "NSData", "NSDictionary", "NSError", "NSGeometry"] }
 objc2 = "0.6"
 objc2-vision = { version = "0.3", default-features = false, features = ["std", "VNRequest", "VNRequestHandler", "VNObservation", "VNRecognizeTextRequest", "VNTypes", "VNGeometry", "objc2-core-foundation"] }

@@ -250,6 +250,7 @@ fn load(device: &SavedDevice) -> keyring::Result<Credentials> {
     if let Some(c) = CACHE.lock().unwrap().get(&account) {
         return Ok(c.clone());
     }
+    tracing::debug!(%account, "keychain read");
     let mut creds = match entry(&account)?.get_password() {
         Ok(raw) => Credentials::parse(&raw),
         Err(keyring::Error::NoEntry) => Credentials::default(),
@@ -271,6 +272,7 @@ fn load(device: &SavedDevice) -> keyring::Result<Credentials> {
 
 fn save(device: &SavedDevice, creds: &Credentials) -> keyring::Result<()> {
     let account = device.keychain_account();
+    tracing::debug!(%account, "keychain write");
     if *creds == Credentials::default() {
         match entry(&account)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => {}

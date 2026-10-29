@@ -7,3 +7,4 @@
 
 # tokenade — legacy per-project embedding model cache (now global)
 .fastembed_cache/
+.DS_Store
