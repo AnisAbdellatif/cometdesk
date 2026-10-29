@@ -47,71 +47,13 @@ fn paste_key(pref: PastePref) -> PasteKey {
         PastePref::CtrlV => PasteKey::CtrlV,
         PastePref::CtrlShiftV => PasteKey::CtrlShiftV,
         PastePref::Auto => {
-            if focused_is_terminal() == Some(true) {
+            if crate::info::focus().is_some_and(|f| f.terminal) {
                 PasteKey::CtrlShiftV
             } else {
                 PasteKey::CtrlV
             }
         }
     }
-}
-
-/// Linux terminals paste with Ctrl+Shift+V. X11 (and XWayland) tell us the active window's
-/// class; native Wayland windows don't, so `None` there.
-#[cfg(all(unix, not(target_os = "macos")))]
-fn focused_is_terminal() -> Option<bool> {
-    use x11rb::connection::Connection;
-    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt};
-
-    const TERMINALS: &[&str] = &[
-        "terminal",
-        "konsole",
-        "xterm",
-        "kitty",
-        "alacritty",
-        "terminator",
-        "tilix",
-        "wezterm",
-        "foot",
-        "urxvt",
-        "rxvt",
-        "st-256color",
-        "termite",
-        "guake",
-        "yakuake",
-        "tilda",
-        "ptyxis",
-        "blackbox",
-        "contour",
-        "ghostty",
-    ];
-    let (conn, screen) = x11rb::connect(None).ok()?;
-    let root = conn.setup().roots.get(screen)?.root;
-    let atom = |name: &[u8]| -> Option<u32> {
-        Some(conn.intern_atom(true, name).ok()?.reply().ok()?.atom)
-    };
-    let active = atom(b"_NET_ACTIVE_WINDOW")?;
-    let win = conn
-        .get_property(false, root, active, AtomEnum::WINDOW, 0, 1)
-        .ok()?
-        .reply()
-        .ok()?
-        .value32()?
-        .next()
-        .filter(|&w| w != 0)?;
-    let class = conn
-        .get_property(false, win, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 256)
-        .ok()?
-        .reply()
-        .ok()?
-        .value;
-    let class = String::from_utf8_lossy(&class).to_lowercase();
-    Some(TERMINALS.iter().any(|t| class.contains(t)))
-}
-
-#[cfg(not(all(unix, not(target_os = "macos"))))]
-fn focused_is_terminal() -> Option<bool> {
-    None
 }
 
 #[cfg(windows)]

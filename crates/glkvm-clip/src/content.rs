@@ -59,23 +59,7 @@ impl Content {
         else {
             unreachable!("to_png on text");
         };
-        if rgba.len() != (*width as usize) * (*height as usize) * 4 {
-            return Err(Error::Image(
-                "pixel buffer size does not match dimensions".into(),
-            ));
-        }
-        let mut out = Vec::new();
-        let mut enc = png::Encoder::new(&mut out, *width, *height);
-        enc.set_color(png::ColorType::Rgba);
-        enc.set_depth(png::BitDepth::Eight);
-        enc.set_compression(png::Compression::Fast);
-        let mut w = enc
-            .write_header()
-            .map_err(|e| Error::Image(e.to_string()))?;
-        w.write_image_data(rgba)
-            .map_err(|e| Error::Image(e.to_string()))?;
-        w.finish().map_err(|e| Error::Image(e.to_string()))?;
-        Ok(out)
+        encode_png(*width, *height, rgba)
     }
 
     pub(crate) fn from_png(data: &[u8]) -> Result<Content> {
@@ -143,6 +127,27 @@ impl Dedup {
     pub fn reset(&mut self) {
         self.last = None;
     }
+}
+
+/// 8-bit RGBA to PNG.
+pub fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>> {
+    if rgba.len() != (width as usize) * (height as usize) * 4 {
+        return Err(Error::Image(
+            "pixel buffer size does not match dimensions".into(),
+        ));
+    }
+    let mut out = Vec::new();
+    let mut enc = png::Encoder::new(&mut out, width, height);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.set_compression(png::Compression::Fast);
+    let mut w = enc
+        .write_header()
+        .map_err(|e| Error::Image(e.to_string()))?;
+    w.write_image_data(rgba)
+        .map_err(|e| Error::Image(e.to_string()))?;
+    w.finish().map_err(|e| Error::Image(e.to_string()))?;
+    Ok(out)
 }
 
 #[cfg(test)]

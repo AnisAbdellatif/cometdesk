@@ -20,11 +20,11 @@ mod pairing;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub use content::{Content, ContentKey, Dedup};
+pub use content::{Content, ContentKey, Dedup, encode_png};
 pub use pairing::Secret;
 
 /// Bumped on incompatible protocol changes; both ends refuse a different major.
-pub const PROTOCOL: u16 = 2;
+pub const PROTOCOL: u16 = 4;
 /// Longest text for one [`Endpoint::send_insert`] (one Noise message).
 pub const MAX_INSERT: usize = 60 * 1024;
 /// Largest clipboard item (encoded: UTF-8 text or PNG).
@@ -89,6 +89,74 @@ impl Hello {
     }
 }
 
+/// What the agent knows about the target, sent after `Hello` and whenever it changes.
+/// Every field is best effort: `None` or empty when the OS does not say.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Info {
+    /// Active keyboard layout, tagged by source: `xkb:de+nodeadkeys`, `win:0407`,
+    /// `mac:com.apple.keylayout.German`. The GUI maps it to a device keymap.
+    pub keyboard: Option<String>,
+    /// Every layout installed on the target, same tagging; the active one is not marked.
+    pub layouts: Vec<String>,
+    /// OS name and version for display (`Ubuntu 24.04 LTS`, `macOS 15.1`).
+    pub os_version: Option<String>,
+    pub session: SessionState,
+    /// The monitors of the target, in desktop coordinates.
+    pub displays: Vec<Display>,
+    /// An input method editor (CJK, …) is on: key-by-key typing may be composed into
+    /// something else.
+    pub ime: Option<bool>,
+    /// What has the keyboard focus. Only the application, never window titles.
+    pub focus: Option<Focus>,
+    /// Account the agent runs as.
+    pub user: Option<String>,
+    /// Seconds since the target booted. Not compared when deciding whether to resend.
+    pub uptime_secs: Option<u64>,
+    pub battery: Option<Battery>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionState {
+    #[default]
+    Unknown,
+    Active,
+    /// Lock screen or secure desktop: typed text goes to a password field, not an app.
+    Locked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Display {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    /// Percent: 100, 125, 150, 200.
+    pub scale: u32,
+    pub primary: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Focus {
+    /// Executable or window class (`notepad.exe`, `gnome-terminal-server`).
+    pub app: String,
+    pub terminal: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Battery {
+    pub percent: u8,
+    pub charging: bool,
+}
+
+impl Info {
+    /// Equality for deciding whether to resend: uptime always moves.
+    pub fn same_as(&self, other: &Info) -> bool {
+        let mut a = self.clone();
+        a.uptime_secs = other.uptime_secs;
+        a == *other
+    }
+}
+
 /// Sent by the GUI; the agent must not send its clipboard unless allowed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Policy {
@@ -128,6 +196,8 @@ pub enum InsertReply {
 enum Kind {
     Text,
     Png,
+    /// A screenshot answering a capture request; `id` is the request's.
+    Screenshot,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -158,6 +228,16 @@ enum Msg {
     InsertPasted {
         id: u32,
     },
+    Info(Info),
+    Capture {
+        id: u32,
+        /// Index into `Info::displays`; `None`: all of them.
+        display: Option<u32>,
+    },
+    CaptureFailed {
+        id: u32,
+        reason: String,
+    },
 }
 
 /// Something the caller must act on.
@@ -179,6 +259,14 @@ pub enum Event {
     InsertReply { id: u32, reply: InsertReply },
     /// The GUI sent the paste keystroke (agent only).
     InsertPasted { id: u32 },
+    /// The agent's view of the target changed (GUI only).
+    Info(Info),
+    /// Take a screenshot and send it back with [`Endpoint::send_screenshot`] (agent only).
+    Capture { id: u32, display: Option<u32> },
+    /// A screenshot as PNG bytes, answering `Capture` `id` (GUI only).
+    Screenshot { id: u32, png: Vec<u8> },
+    /// The agent could not capture (GUI only).
+    CaptureFailed { id: u32, reason: String },
 }
 
 enum Noise {
@@ -305,6 +393,26 @@ impl Endpoint {
         self.send(&Msg::InsertPasted { id })
     }
 
+    pub fn send_info(&mut self, info: &Info) -> Result<()> {
+        self.send(&Msg::Info(info.clone()))
+    }
+
+    pub fn send_capture(&mut self, display: Option<u32>) -> Result<u32> {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.send(&Msg::Capture { id, display })?;
+        Ok(id)
+    }
+
+    pub fn send_capture_failed(&mut self, id: u32, reason: String) -> Result<()> {
+        self.send(&Msg::CaptureFailed { id, reason })
+    }
+
+    /// Answers a capture request with PNG bytes (see [`encode_png`]).
+    pub fn send_screenshot(&mut self, id: u32, png: &[u8]) -> Result<()> {
+        self.send_item(id, Kind::Screenshot, png)
+    }
+
     pub fn ping(&mut self) -> Result<()> {
         self.send(&Msg::Ping)
     }
@@ -318,16 +426,20 @@ impl Endpoint {
             Content::Text(t) => (Kind::Text, t.as_bytes().to_vec()),
             Content::Image { .. } => (Kind::Png, content.to_png()?),
         };
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.send_item(id, kind, &wire)
+    }
+
+    fn send_item(&mut self, id: u32, kind: Kind, wire: &[u8]) -> Result<()> {
         if wire.len() > MAX_ITEM {
             return Err(Error::TooLarge(wire.len()));
         }
-        let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
         self.send(&Msg::Start {
             id,
             kind,
             len: wire.len() as u32,
-            sha256: Sha256::digest(&wire).into(),
+            sha256: Sha256::digest(wire).into(),
         })?;
         for data in wire.chunks(CHUNK) {
             self.send(&Msg::Chunk {
@@ -400,6 +512,20 @@ impl Endpoint {
                 self.peer = Some(h.clone());
                 events.push(Event::Ready(h));
             }
+            Msg::Info(i) => {
+                if self.role == Role::Client {
+                    events.push(Event::Info(i));
+                }
+            }
+            Msg::Capture { id, display } if self.role == Role::Agent => {
+                events.push(Event::Capture { id, display });
+            }
+            Msg::CaptureFailed { id, reason } if self.role == Role::Client => {
+                events.push(Event::CaptureFailed { id, reason });
+            }
+            Msg::Capture { .. } | Msg::CaptureFailed { .. } => {
+                return Err(Error::Message("capture message for the wrong role".into()));
+            }
             Msg::Policy(p) => {
                 if self.role == Role::Agent {
                     events.push(Event::Policy(p));
@@ -461,12 +587,20 @@ impl Endpoint {
         if <[u8; 32]>::from(Sha256::digest(&inc.data)) != inc.sha256 {
             return Err(Error::Message("item checksum mismatch".into()));
         }
+        if inc.kind == Kind::Screenshot {
+            events.push(Event::Screenshot {
+                id: inc.id,
+                png: inc.data,
+            });
+            return Ok(());
+        }
         let content = match inc.kind {
             Kind::Text => Content::Text(
                 String::from_utf8(inc.data)
                     .map_err(|_| Error::Message("text is not UTF-8".into()))?,
             ),
             Kind::Png => Content::from_png(&inc.data)?,
+            Kind::Screenshot => unreachable!(),
         };
         events.push(Event::Clip(content));
         Ok(())
@@ -514,6 +648,54 @@ mod tests {
             }
         }
         Ok((ce, ae))
+    }
+
+    #[test]
+    fn info_goes_from_agent_to_gui_only() {
+        let s = Secret::generate();
+        let (mut c, mut a) = pair(&s, &s);
+        pump(&mut c, &mut a).unwrap();
+        let info = Info {
+            keyboard: Some("xkb:de".into()),
+            os_version: Some("Ubuntu 24.04".into()),
+            session: SessionState::Locked,
+            uptime_secs: Some(5),
+            ..Info::default()
+        };
+        a.send_info(&info).unwrap();
+        c.send_info(&info).unwrap();
+        let (ce, ae) = pump(&mut c, &mut a).unwrap();
+        assert_eq!(ce, vec![Event::Info(info)]);
+        assert!(ae.is_empty());
+    }
+
+    #[test]
+    fn screenshot_round_trip_and_failure() {
+        let s = Secret::generate();
+        let (mut c, mut a) = pair(&s, &s);
+        pump(&mut c, &mut a).unwrap();
+        let id = c.send_capture(Some(1)).unwrap();
+        let (_, ae) = pump(&mut c, &mut a).unwrap();
+        assert_eq!(
+            ae,
+            vec![Event::Capture {
+                id,
+                display: Some(1)
+            }]
+        );
+        let png: Vec<u8> = (0..150_000u32).map(|i| i as u8).collect();
+        a.send_screenshot(id, &png).unwrap();
+        let (ce, _) = pump(&mut c, &mut a).unwrap();
+        assert_eq!(ce, vec![Event::Screenshot { id, png }]);
+        a.send_capture_failed(id, "locked".into()).unwrap();
+        let (ce, _) = pump(&mut c, &mut a).unwrap();
+        assert_eq!(
+            ce,
+            vec![Event::CaptureFailed {
+                id,
+                reason: "locked".into()
+            }]
+        );
     }
 
     #[test]

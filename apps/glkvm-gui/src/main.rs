@@ -6,6 +6,7 @@ mod clipsync;
 mod console;
 mod devices;
 mod gpu;
+mod ocr;
 mod setup;
 mod store;
 

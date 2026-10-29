@@ -2,8 +2,10 @@
 //!
 //! Passwords never touch the JSON file. Auth tokens are kept in memory only.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use glkvm_view::KeyOptions;
 use serde::{Deserialize, Serialize};
@@ -104,7 +106,7 @@ impl SavedDevice {
         format!("{}@{}", self.user, self.host)
     }
 
-    fn clip_keychain_account(&self) -> String {
+    fn legacy_clip_keychain_account(&self) -> String {
         format!("clipboard-bridge:{}@{}", self.user, self.host)
     }
 
@@ -195,45 +197,136 @@ impl Store {
     }
 }
 
+/// Everything kept in the keychain for one device. One item per device means one access prompt
+/// per device (macOS asks per item), not one for the password and another for the pairing secret.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct Credentials {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    password: Option<String>,
+    /// Pairing secret of the clipboard agent on the target, as `Secret::to_code`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    clip: Option<String>,
+}
+
+/// Marks the JSON form; an item without it is a bare password from before the merge.
+const BLOB_PREFIX: &str = "glkvm:v1:";
+
+impl Credentials {
+    fn parse(raw: &str) -> Credentials {
+        match raw.strip_prefix(BLOB_PREFIX) {
+            Some(json) => serde_json::from_str(json).unwrap_or_default(),
+            None => Credentials {
+                password: Some(raw.to_owned()),
+                clip: None,
+            },
+        }
+    }
+
+    fn encode(&self) -> String {
+        format!(
+            "{BLOB_PREFIX}{}",
+            serde_json::to_string(self).unwrap_or_default()
+        )
+    }
+}
+
+/// Keychain reads per account, so one process prompts at most once per device however many
+/// times the password and the pairing secret are asked for. Only successful reads are cached:
+/// a denied prompt must never be mistaken for "nothing stored" and overwrite the item.
+static CACHE: Mutex<BTreeMap<String, Credentials>> = Mutex::new(BTreeMap::new());
+
+fn entry(account: &str) -> keyring::Result<keyring::Entry> {
+    keyring::Entry::new(KEYCHAIN_SERVICE, account)
+}
+
+fn load(device: &SavedDevice) -> keyring::Result<Credentials> {
+    let account = device.keychain_account();
+    if let Some(c) = CACHE.lock().unwrap().get(&account) {
+        return Ok(c.clone());
+    }
+    let mut creds = match entry(&account)?.get_password() {
+        Ok(raw) => Credentials::parse(&raw),
+        Err(keyring::Error::NoEntry) => Credentials::default(),
+        Err(e) => return Err(e),
+    };
+    // Pairing secret stored in its own item by earlier versions: fold it in.
+    if creds.clip.is_none()
+        && let Ok(legacy) = entry(&device.legacy_clip_keychain_account())
+        && let Ok(code) = legacy.get_password()
+    {
+        creds.clip = Some(code);
+        if save(device, &creds).is_ok() {
+            let _ = legacy.delete_credential();
+        }
+    }
+    CACHE.lock().unwrap().insert(account, creds.clone());
+    Ok(creds)
+}
+
+fn save(device: &SavedDevice, creds: &Credentials) -> keyring::Result<()> {
+    let account = device.keychain_account();
+    if *creds == Credentials::default() {
+        match entry(&account)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => {}
+            Err(e) => return Err(e),
+        }
+    } else {
+        entry(&account)?.set_password(&creds.encode())?;
+    }
+    CACHE.lock().unwrap().insert(account, creds.clone());
+    Ok(())
+}
+
+fn update(device: &SavedDevice, f: impl FnOnce(&mut Credentials)) -> Result<(), String> {
+    let mut creds = load(device).map_err(|e| e.to_string())?;
+    f(&mut creds);
+    save(device, &creds).map_err(|e| e.to_string())
+}
+
 pub fn password(device: &SavedDevice) -> Option<String> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &device.keychain_account()).ok()?;
-    entry.get_password().ok()
+    load(device).ok()?.password
 }
 
 pub fn set_password(device: &SavedDevice, password: &str) -> Result<(), String> {
-    keyring::Entry::new(KEYCHAIN_SERVICE, &device.keychain_account())
-        .and_then(|e| e.set_password(password))
-        .map_err(|e| e.to_string())
+    update(device, |c| c.password = Some(password.to_owned()))
 }
 
+/// Removes the device's password and pairing secret.
 pub fn delete_password(device: &SavedDevice) {
-    if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, &device.keychain_account()) {
-        let _ = entry.delete_credential();
+    let _ = save(device, &Credentials::default());
+    if let Ok(legacy) = entry(&device.legacy_clip_keychain_account()) {
+        let _ = legacy.delete_credential();
     }
-    delete_clip_secret(device);
 }
 
 /// Pairing secret of the clipboard agent on this device's target.
 pub fn clip_secret(device: &SavedDevice) -> Option<glkvm_clip::Secret> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &device.clip_keychain_account()).ok()?;
-    glkvm_clip::Secret::from_code(&entry.get_password().ok()?)
+    glkvm_clip::Secret::from_code(&load(device).ok()?.clip?)
 }
 
 pub fn set_clip_secret(device: &SavedDevice, secret: &glkvm_clip::Secret) -> Result<(), String> {
-    keyring::Entry::new(KEYCHAIN_SERVICE, &device.clip_keychain_account())
-        .and_then(|e| e.set_password(&secret.to_code()))
-        .map_err(|e| e.to_string())
+    update(device, |c| c.clip = Some(secret.to_code()))
 }
 
 pub fn delete_clip_secret(device: &SavedDevice) {
-    if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, &device.clip_keychain_account()) {
-        let _ = entry.delete_credential();
-    }
+    let _ = update(device, |c| c.clip = None);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credentials_round_trip_and_read_legacy_password() {
+        let c = Credentials {
+            password: Some("pw".into()),
+            clip: Some("code".into()),
+        };
+        assert_eq!(Credentials::parse(&c.encode()), c);
+        let legacy = Credentials::parse("{not: json}");
+        assert_eq!(legacy.password.as_deref(), Some("{not: json}"));
+        assert_eq!(legacy.clip, None);
+    }
 
     fn device(host: &str) -> SavedDevice {
         SavedDevice {
