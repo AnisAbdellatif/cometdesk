@@ -27,7 +27,10 @@ use crate::gpu::Gpu;
 use crate::store::{SavedDevice, Store};
 use crate::theme;
 
+pub mod control;
+
 pub enum UserEvent {
+    Control(control::Request),
     /// A decoded video frame is waiting.
     Frame,
     /// Something shown in the UI changed.
@@ -351,8 +354,9 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
+            UserEvent::Control(req) => self.control(event_loop, req),
             UserEvent::Frame => {
                 let (Some(console), Some(gpu)) = (&mut self.console, &mut self.gpu) else {
                     return;
@@ -439,8 +443,11 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Focused(focused) => {
                 self.focused = *focused;
-                if !focused && let Some(c) = &mut self.console {
-                    c.release_all();
+                if let Some(c) = &mut self.console {
+                    c.set_window_focused(*focused);
+                    if !focused {
+                        c.release_all();
+                    }
                 }
             }
             WindowEvent::KeyboardInput {

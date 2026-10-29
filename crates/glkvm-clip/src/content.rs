@@ -13,6 +13,9 @@ pub enum Content {
         height: u32,
         rgba: Vec<u8>,
     },
+    /// Files copied in a file manager. Never sent as clipboard items: they travel as file
+    /// transfers and are put on the other clipboard once they have all arrived.
+    Files(Vec<std::path::PathBuf>),
 }
 
 impl std::fmt::Debug for Content {
@@ -20,6 +23,7 @@ impl std::fmt::Debug for Content {
         match self {
             Content::Text(t) => write!(f, "Text({} chars)", t.chars().count()),
             Content::Image { width, height, .. } => write!(f, "Image({width}x{height})"),
+            Content::Files(p) => write!(f, "Files({})", p.len()),
         }
     }
 }
@@ -46,6 +50,13 @@ impl Content {
                 h.update(height.to_be_bytes());
                 h.update(rgba);
             }
+            Content::Files(paths) => {
+                h.update(b"f");
+                for p in paths {
+                    h.update(p.as_os_str().as_encoded_bytes());
+                    h.update(b"\0");
+                }
+            }
         }
         h.finalize().into()
     }
@@ -57,7 +68,7 @@ impl Content {
             rgba,
         } = self
         else {
-            unreachable!("to_png on text");
+            unreachable!("to_png on something that is not an image");
         };
         encode_png(*width, *height, rgba)
     }

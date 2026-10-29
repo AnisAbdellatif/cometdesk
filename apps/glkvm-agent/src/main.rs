@@ -7,6 +7,7 @@
 //!
 //! ```text
 //! glkvm-agent pair <code>     store the pairing code shown by glkvm-gui
+//! glkvm-agent notify <title> [body]   show a notification on the Mac (for scripts)
 //! glkvm-agent [run] [--relay HOST:PORT] [--log FILE]
 //! glkvm-agent unpair          forget the pairing
 //! glkvm-agent uninstall       forget the pairing and remove autostart
@@ -18,8 +19,11 @@
 mod capture;
 mod clipboard;
 mod config;
+mod filesend;
 mod info;
 mod insert;
+mod notify;
+mod power;
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -27,7 +31,7 @@ use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use glkvm_clip::{Endpoint, Error, Event, Hello, Policy, Role, Secret};
+use glkvm_clip::{Content, Endpoint, Error, Event, FileReceiver, Hello, Policy, Role, Secret};
 
 use clipboard::{ClipCommand, Local};
 
@@ -40,6 +44,8 @@ const MISMATCH_BACKOFF: Duration = Duration::from_secs(30);
 /// The GUI pings every 15 s once the session is up.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const READ_SLICE: Duration = Duration::from_millis(100);
+/// Notify the user when an unplugged target drops to this percentage.
+const BATTERY_LOW: u8 = 15;
 
 /// Local port held while `run` is active, so a second instance (autostart plus a manual
 /// start) refuses to run instead of fighting over the clipboard.
@@ -88,12 +94,16 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         ["uninstall"] => uninstall(),
+        ["notify", title, body @ ..] => match notify::send(title, &body.join(" ")) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&format!("cannot notify: {e}")),
+        },
         ["run", opts @ ..] | opts => match run_options(opts) {
             Some((relay, log)) => run(relay, log),
             None => {
                 eprintln!(
                     "usage: glkvm-agent pair <code> | glkvm-agent [run] [--relay HOST:PORT] [--log FILE]\n       \
-                     glkvm-agent unpair | glkvm-agent uninstall"
+                     glkvm-agent unpair | glkvm-agent uninstall | glkvm-agent notify <title> [body]"
                 );
                 ExitCode::from(2)
             }
@@ -162,8 +172,10 @@ fn run(relay: &str, log_file: Option<&str>) -> ExitCode {
         }
         detach_console();
     }
-    let _instance = match std::net::TcpListener::bind(("127.0.0.1", INSTANCE_PORT)) {
-        Ok(l) => l,
+    let (note_tx, note_rx) = mpsc::channel();
+    match std::net::TcpListener::bind(("127.0.0.1", INSTANCE_PORT)) {
+        // Held for as long as the process lives, by the thread that answers `notify`.
+        Ok(l) => notify::serve(l, note_tx),
         Err(_) => {
             log!("another glkvm-agent is already running for this user; exiting");
             return ExitCode::SUCCESS;
@@ -187,7 +199,7 @@ fn run(relay: &str, log_file: Option<&str>) -> ExitCode {
     let hello = Hello::local(VERSION, config::host_name());
     let mut backoff = BACKOFF_MIN;
     loop {
-        let wait = match session(addr, &secret, &hello, &cmd_tx, &local_rx) {
+        let wait = match session(addr, &secret, &hello, &cmd_tx, &local_rx, &note_rx) {
             Ok(()) => BACKOFF_MIN,
             Err(SessionEnd::Mismatch) => {
                 log!("pairing mismatch: the GUI uses a different code; re-pair this agent");
@@ -229,6 +241,7 @@ fn session(
     hello: &Hello,
     cmd_tx: &mpsc::Sender<ClipCommand>,
     local_rx: &mpsc::Receiver<Local>,
+    note_rx: &mpsc::Receiver<notify::Note>,
 ) -> Result<(), SessionEnd> {
     let lost = |e: std::io::Error, up| SessionEnd::Lost(e.to_string(), up);
     let mut stream =
@@ -244,6 +257,10 @@ fn session(
     };
     let mut last_rx = Instant::now();
     let mut probe = info::Probe::new();
+    let mut files = FileReceiver::new(std::env::temp_dir().join("glkvm-clip"));
+    let mut outbox = filesend::Outbox::default();
+    let mut fast_read = false;
+    let mut battery_low = false;
     let mut buf = vec![0u8; 64 * 1024];
     // Changes seen before the session was up are not sent: only what changes while connected.
     while local_rx.try_recv().is_ok() {}
@@ -299,7 +316,59 @@ fn session(
                             };
                             sent.map_err(|e| SessionEnd::Lost(e.to_string(), true))?;
                         }
-                        Event::InsertReply { .. }
+                        Event::Power { id, action } => {
+                            let result = power::run(action);
+                            log!("power {action:?}: {result:?}");
+                            ep.send_ack(id, result)
+                                .map_err(|e| SessionEnd::Lost(e.to_string(), true))?;
+                        }
+                        Event::FileOffer {
+                            id,
+                            name,
+                            size,
+                            purpose,
+                        } => {
+                            log!("file offered: {size} bytes ({purpose:?})");
+                            if let Err(e) = files.offer(id, &name, size, purpose) {
+                                log!("file refused: {e}");
+                                ep.send_file_result(id, Err(e))
+                                    .map_err(|e| SessionEnd::Lost(e.to_string(), true))?;
+                            }
+                        }
+                        Event::FileData { id, data } => {
+                            if let Err(e) = files.data(id, &data) {
+                                log!("file failed: {e}");
+                                ep.send_file_result(id, Err(e))
+                                    .map_err(|e| SessionEnd::Lost(e.to_string(), true))?;
+                            }
+                        }
+                        Event::FileResult { id, result } => outbox.result(&mut ep, id, result),
+                        Event::FileEnd { id, intact } => {
+                            let result = files.end(id, intact);
+                            log!("file done: {result:?}");
+                            ep.send_file_result(id, result)
+                                .map_err(|e| SessionEnd::Lost(e.to_string(), true))?;
+                        }
+                        Event::FileCancel { id } => files.cancel(id),
+                        Event::FilesReady { ids } => match files.take_staged(&ids) {
+                            Some(paths) => {
+                                log!("copied files from the GUI: {}", paths.len());
+                                cmd_tx
+                                    .send(ClipCommand::Set(Content::Files(paths)))
+                                    .map_err(|_| SessionEnd::ClipboardGone)?;
+                            }
+                            None => log!("copied files from the GUI are incomplete"),
+                        },
+                        Event::SetLayout { id, layout } => {
+                            let result = info::set_layout(&layout);
+                            log!("layout {layout}: {result:?}");
+                            probe.refresh();
+                            ep.send_ack(id, result)
+                                .map_err(|e| SessionEnd::Lost(e.to_string(), true))?;
+                        }
+                        Event::Notify { .. }
+                        | Event::InsertReply { .. }
+                        | Event::Ack { .. }
                         | Event::Info(_)
                         | Event::Screenshot { .. }
                         | Event::CaptureFailed { .. } => {}
@@ -320,6 +389,10 @@ fn session(
         }
         loop {
             match local_rx.try_recv() {
+                Ok(Local(Content::Files(paths))) if ep.is_ready() && policy.agent_may_send => {
+                    log!("sending {} copied files", paths.len());
+                    outbox.start(&mut ep, paths);
+                }
                 Ok(Local(content)) if ep.is_ready() && policy.agent_may_send => {
                     log!("sending {content:?}");
                     if let Err(e) = ep.send_clip(&content) {
@@ -331,9 +404,39 @@ fn session(
                 Err(mpsc::TryRecvError::Disconnected) => return Err(SessionEnd::ClipboardGone),
             }
         }
+        if ep.is_ready() && !ep.has_outgoing() {
+            outbox.pump(&mut ep);
+        }
+        // While streaming a file there is no time to wait for the next message.
+        if outbox.busy() != fast_read {
+            fast_read = outbox.busy();
+            let slice = if fast_read {
+                Duration::from_millis(1)
+            } else {
+                READ_SLICE
+            };
+            stream.set_read_timeout(Some(slice)).ok();
+        }
+        while let Ok(note) = note_rx.try_recv() {
+            if ep.is_ready() {
+                ep.send_notify(&note.title, &note.body)
+                    .map_err(|e| lost(std::io::Error::other(e), true))?;
+            } else {
+                notify::dropped(&note);
+            }
+        }
         if ep.is_ready()
             && let Some(i) = probe.changed()
         {
+            let low = i
+                .battery
+                .is_some_and(|b| b.percent <= BATTERY_LOW && !b.charging);
+            if low && !battery_low {
+                let pct = i.battery.map_or(0, |b| b.percent);
+                ep.send_notify("Battery low", &format!("The target is at {pct}%"))
+                    .map_err(|e| lost(std::io::Error::other(e), true))?;
+            }
+            battery_low = low;
             log!("target info: {i:?}");
             ep.send_info(&i)
                 .map_err(|e| lost(std::io::Error::other(e), true))?;

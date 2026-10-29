@@ -160,6 +160,10 @@ impl DevicesUi {
 
     /// Starts connecting: reads the saved password off the UI thread (the macOS keychain can
     /// block on an ACL prompt) and continues in [`Self::on_password`].
+    pub fn connect_device(&mut self, device: SavedDevice) {
+        self.connect(device);
+    }
+
     fn connect(&mut self, device: SavedDevice) {
         self.error = None;
         self.looking_up = Some(device.clone());

@@ -22,6 +22,8 @@ pub struct Gpu {
     /// egui's vertex/index/uniform buffers need uploading (output or size changed). Video
     /// frames re-draw the same egui output many times; uploading it each time cost CPU.
     egui_buffers_dirty: bool,
+    /// Automation asked for the next presented frame (see `app/control.rs`).
+    capture: Option<std::sync::mpsc::Sender<(u32, u32, Vec<u8>)>>,
 }
 
 impl Gpu {
@@ -62,7 +64,8 @@ impl Gpu {
             wgpu::PresentMode::Fifo
         };
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | (caps.usages & wgpu::TextureUsages::COPY_SRC),
             format,
             width: size.width.max(1),
             height: size.height.max(1),
@@ -87,6 +90,7 @@ impl Gpu {
             pixels_per_point: 1.0,
             free_after_render: Vec::new(),
             egui_buffers_dirty: true,
+            capture: None,
         })
     }
 
@@ -116,6 +120,71 @@ impl Gpu {
         self.egui_buffers_dirty = true;
         self.paint_jobs =
             ctx.tessellate(std::mem::take(&mut output.shapes), output.pixels_per_point);
+    }
+
+    /// Sends the next drawn frame (video and UI) as `(width, height, RGBA)`.
+    pub fn request_capture(&mut self, tx: std::sync::mpsc::Sender<(u32, u32, Vec<u8>)>) {
+        self.capture = Some(tx);
+    }
+
+    /// Reads the frame just drawn into `frame` back to the CPU.
+    fn read_back(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &wgpu::Texture,
+    ) -> Option<wgpu::Buffer> {
+        if !frame.usage().contains(wgpu::TextureUsages::COPY_SRC) {
+            return None;
+        }
+        let (w, h) = (self.config.width, self.config.height);
+        let row = (w * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("capture"),
+            size: u64::from(row) * u64::from(h),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            frame.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        Some(buffer)
+    }
+
+    /// Waits for `buffer` (from [`Self::read_back`]) and returns tightly packed RGBA.
+    fn finish_capture(&self, buffer: &wgpu::Buffer) -> Option<Vec<u8>> {
+        let (w, h) = (self.config.width as usize, self.config.height as usize);
+        let row = (w * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize);
+        buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        self.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+        let data = buffer.slice(..).get_mapped_range().ok()?;
+        let bgra = matches!(
+            self.config.format,
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+        );
+        let mut out = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            out.extend_from_slice(&data[y * row..y * row + w * 4]);
+        }
+        if bgra {
+            out.as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .for_each(|p| p.swap(0, 2));
+        }
+        Some(out)
     }
 
     /// Draws the video into `video_rect` (physical pixels) and egui on top, then presents.
@@ -184,8 +253,18 @@ impl Gpu {
                 self.egui.render(&mut pass, &self.paint_jobs, &screen);
             }
         }
+        let capture = self.capture.take().and_then(|tx| {
+            // A surface that cannot be read back leaves the request to time out.
+            self.read_back(&mut encoder, &frame.texture)
+                .map(|b| (tx, b))
+        });
         extra.push(encoder.finish());
         self.queue.submit(extra);
+        if let Some((tx, buffer)) = capture
+            && let Some(rgba) = self.finish_capture(&buffer)
+        {
+            let _ = tx.send((self.config.width, self.config.height, rgba));
+        }
         self.queue.present(frame);
         self.free_textures();
         Ok(())

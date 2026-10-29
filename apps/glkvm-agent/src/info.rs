@@ -1,19 +1,22 @@
 //! What the agent can tell the GUI about the target besides the clipboard: keyboard layouts,
-//! session lock state, monitors, input method, focused application, account, uptime, battery
-//! and OS version. Polled, because all of it changes while the agent runs. Every field is
-//! best effort and `None` or empty where the OS offers no cheap way to ask.
+//! session lock state, monitors, input method, focused application, account, uptime, battery,
+//! OS version, and CPU, memory and disk use. Polled, because all of it changes while the agent
+//! runs. Every field is best effort and `None` or empty where the OS offers no cheap way to ask.
 
 use std::time::{Duration, Instant};
 
-use glkvm_clip::Focus;
 pub use glkvm_clip::Info;
+use glkvm_clip::{Focus, Usage};
 
 const EVERY: Duration = Duration::from_secs(2);
+/// Load moves on every poll, so it is resent on this timer instead of on change.
+const LOAD_EVERY: Duration = Duration::from_secs(10);
 
-/// Yields the info on the first call, then only when it changed.
+/// Yields the info on the first call, then when it changed or the load is due again.
 pub struct Probe {
     last: Option<Info>,
     at: Option<Instant>,
+    sent: Option<Instant>,
 }
 
 impl Probe {
@@ -21,7 +24,15 @@ impl Probe {
         Probe {
             last: None,
             at: None,
+            sent: None,
         }
+    }
+
+    /// Report again on the next call, e.g. after something the GUI asked for changed the target.
+    pub fn refresh(&mut self) {
+        self.at = None;
+        self.sent = None;
+        sys::invalidate();
     }
 
     pub fn changed(&mut self) -> Option<Info> {
@@ -30,9 +41,12 @@ impl Probe {
         }
         self.at = Some(Instant::now());
         let now = read();
-        if self.last.as_ref().is_some_and(|l| l.same_as(&now)) {
+        if self.last.as_ref().is_some_and(|l| l.same_as(&now))
+            && self.sent.is_some_and(|t| t.elapsed() < LOAD_EVERY)
+        {
             return None;
         }
+        self.sent = Some(Instant::now());
         self.last = Some(now.clone());
         Some(now)
     }
@@ -40,6 +54,11 @@ impl Probe {
 
 pub fn read() -> Info {
     sys::read()
+}
+
+/// Makes `layout` (one of `Info::layouts`) the active keyboard layout.
+pub fn set_layout(layout: &str) -> Result<(), String> {
+    sys::set_layout(layout)
 }
 
 /// The focused application, for choosing the paste keystroke.
@@ -82,6 +101,18 @@ fn is_terminal(app: &str) -> bool {
     TERMINALS.iter().any(|t| app.contains(t))
 }
 
+/// Used and total space of the filesystem holding `/`, from POSIX `df`.
+#[cfg(unix)]
+fn root_disk() -> Option<Usage> {
+    let out = run("df", &["-Pk", "/"])?;
+    let mut f = out.lines().nth(1)?.split_whitespace().skip(1);
+    let (total, used): (u64, u64) = (f.next()?.parse().ok()?, f.next()?.parse().ok()?);
+    Some(Usage {
+        used_mb: used / 1024,
+        total_mb: total / 1024,
+    })
+}
+
 #[cfg(unix)]
 fn run(cmd: &str, args: &[&str]) -> Option<String> {
     let out = std::process::Command::new(cmd).args(args).output().ok()?;
@@ -97,7 +128,7 @@ mod sys {
     use std::sync::Mutex;
 
     use super::*;
-    use glkvm_clip::{Battery, Display, SessionState};
+    use glkvm_clip::{Battery, Display, Load, SessionState};
 
     /// Keyboard layout, input method and display scale rarely change and each costs one or more
     /// subprocesses (`gsettings`, `setxkbmap`, `ibus`/`fcitx5-remote`); refresh them this often
@@ -112,9 +143,15 @@ mod sys {
         scale: u32,
     }
 
+    /// Drops the cached slow fields so the next [`read`] asks the OS again.
+    pub fn invalidate() {
+        *CACHE.lock().unwrap() = None;
+    }
+
+    static CACHE: Mutex<Option<(Instant, Slow)>> = Mutex::new(None);
+
     /// The slow fields, recomputed at most every [`SLOW`].
     fn slow() -> Slow {
-        static CACHE: Mutex<Option<(Instant, Slow)>> = Mutex::new(None);
         let mut cache = CACHE.lock().unwrap();
         if let Some((at, s)) = cache.as_ref()
             && at.elapsed() < SLOW
@@ -154,6 +191,49 @@ mod sys {
                 .ok()
                 .and_then(|t| t.split('.').next()?.parse().ok()),
             battery: battery(),
+            load: Some(load()),
+        }
+    }
+
+    /// CPU from the delta of `/proc/stat` since the previous call, memory from `/proc/meminfo`.
+    fn load() -> Load {
+        static PREV: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+        let cpu = std::fs::read_to_string("/proc/stat").ok().and_then(|t| {
+            let v: Vec<u64> = t
+                .lines()
+                .next()?
+                .split_whitespace()
+                .skip(1)
+                .filter_map(|n| n.parse().ok())
+                .collect();
+            // user nice system idle iowait irq softirq steal
+            let idle = v.get(3)? + v.get(4).copied().unwrap_or(0);
+            let total: u64 = v.iter().take(8).sum();
+            let prev = PREV.lock().unwrap().replace((idle, total))?;
+            let (di, dt) = (idle.saturating_sub(prev.0), total.saturating_sub(prev.1));
+            (dt > 0).then(|| (100 * (dt - di.min(dt)) / dt) as u8)
+        });
+        let memory = std::fs::read_to_string("/proc/meminfo").ok().and_then(|t| {
+            let kb = |key: &str| -> Option<u64> {
+                t.lines().find_map(|l| {
+                    l.strip_prefix(key)?
+                        .trim()
+                        .strip_suffix("kB")?
+                        .trim()
+                        .parse()
+                        .ok()
+                })
+            };
+            let (total, avail) = (kb("MemTotal:")?, kb("MemAvailable:")?);
+            Some(Usage {
+                used_mb: total.saturating_sub(avail) / 1024,
+                total_mb: total / 1024,
+            })
+        });
+        Load {
+            cpu_percent: cpu,
+            memory,
+            disk: root_disk(),
         }
     }
 
@@ -199,6 +279,58 @@ mod sys {
             })
             .collect();
         (all.first().cloned(), all)
+    }
+
+    /// GNOME: select the matching source. Anything else: put the layout first in X's list.
+    pub fn set_layout(layout: &str) -> Result<(), String> {
+        let spec = layout.strip_prefix("xkb:").ok_or("not an xkb layout")?;
+        let src = "org.gnome.desktop.input-sources";
+        if let Some(text) = run("gsettings", &["get", src, "sources"]) {
+            let pos = text
+                .split(['(', ')'])
+                .filter(|e| e.contains('\''))
+                .position(|e| e.contains(&format!("'{spec}'")));
+            if let Some(i) = pos {
+                return exec("gsettings", &["set", src, "current", &i.to_string()]);
+            }
+        }
+        let (_, all) = keyboards();
+        let mut order: Vec<&str> = all.iter().map(String::as_str).collect();
+        let at = order
+            .iter()
+            .position(|l| *l == layout)
+            .ok_or("unknown layout")?;
+        order.swap(0, at);
+        let (mut layouts, mut variants) = (Vec::new(), Vec::new());
+        for l in order {
+            let (code, v) = l
+                .trim_start_matches("xkb:")
+                .split_once('+')
+                .unwrap_or((l.trim_start_matches("xkb:"), ""));
+            layouts.push(code.to_owned());
+            variants.push(v.to_owned());
+        }
+        exec(
+            "setxkbmap",
+            &[
+                "-layout",
+                &layouts.join(","),
+                "-variant",
+                &variants.join(","),
+            ],
+        )
+    }
+
+    fn exec(cmd: &str, args: &[&str]) -> Result<(), String> {
+        let out = std::process::Command::new(cmd)
+            .args(args)
+            .output()
+            .map_err(|e| format!("cannot run {cmd}: {e}"))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_owned())
+        }
     }
 
     /// logind's `LockedHint`, which GNOME, KDE and others keep up to date.
@@ -317,6 +449,7 @@ mod sys {
 #[cfg(target_os = "macos")]
 mod sys {
     use super::*;
+    use glkvm_clip::Load;
 
     pub fn read() -> Info {
         let keyboard = run(
@@ -333,12 +466,22 @@ mod sys {
             keyboard,
             os_version: run("sw_vers", &["-productVersion"]).map(|v| format!("macOS {}", v.trim())),
             user: std::env::var("USER").ok(),
+            load: Some(Load {
+                disk: root_disk(),
+                ..Load::default()
+            }),
             ..Info::default()
         }
     }
 
     pub fn focus() -> Option<Focus> {
         None
+    }
+
+    pub fn invalidate() {}
+
+    pub fn set_layout(_: &str) -> Result<(), String> {
+        Err("switching layouts is not supported on macOS targets".into())
     }
 }
 
@@ -347,15 +490,20 @@ mod sys {
 #[cfg(windows)]
 mod sys {
     use super::*;
-    use glkvm_clip::{Battery, Display, SessionState};
-    use windows_sys::Win32::Foundation::{CloseHandle, LPARAM, RECT};
+    use glkvm_clip::{Battery, Display, Load, SessionState};
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, LPARAM, RECT};
     use windows_sys::Win32::Graphics::Gdi::{
         EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
     };
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
     use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
     use windows_sys::Win32::System::StationsAndDesktops::{CloseDesktop, OpenInputDesktop};
-    use windows_sys::Win32::System::SystemInformation::GetTickCount64;
-    use windows_sys::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW};
+    use windows_sys::Win32::System::SystemInformation::{
+        GetTickCount64, GlobalMemoryStatusEx, MEMORYSTATUSEX,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetSystemTimes, OpenProcess, QueryFullProcessImageNameW,
+    };
     use windows_sys::Win32::UI::HiDpi::{
         DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor, MDT_EFFECTIVE_DPI,
         SetProcessDpiAwarenessContext,
@@ -365,13 +513,44 @@ mod sys {
         GetKeyboardLayout, GetKeyboardLayoutList,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId, SendMessageW,
+        GetForegroundWindow, GetWindowThreadProcessId, PostMessageW, SendMessageW,
     };
 
     const DESKTOP_SWITCHDESKTOP: u32 = 0x0100;
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
     const WM_IME_CONTROL: u32 = 0x0283;
     const IMC_GETOPENSTATUS: usize = 5;
+
+    pub fn invalidate() {}
+
+    /// Asks the foreground window to switch, like the language bar does.
+    pub fn set_layout(layout: &str) -> Result<(), String> {
+        let want = u16::from_str_radix(
+            layout.strip_prefix("win:").ok_or("not a Windows layout")?,
+            16,
+        )
+        .map_err(|e| e.to_string())?;
+        let mut list = vec![std::ptr::null_mut(); 32];
+        let n = unsafe { GetKeyboardLayoutList(list.len() as i32, list.as_mut_ptr()) }.max(0);
+        let hkl = list[..n as usize]
+            .iter()
+            .find(|&&h| h as usize & 0xffff == want as usize)
+            .ok_or("layout not installed")?;
+        const WM_INPUTLANGCHANGEREQUEST: u32 = 0x0050;
+        let ok = unsafe {
+            PostMessageW(
+                GetForegroundWindow(),
+                WM_INPUTLANGCHANGEREQUEST,
+                0,
+                *hkl as isize,
+            )
+        };
+        if ok != 0 {
+            Ok(())
+        } else {
+            Err("no window to switch".into())
+        }
+    }
 
     pub fn read() -> Info {
         // Without this Windows reports scaled-down coordinates to us.
@@ -402,6 +581,48 @@ mod sys {
             user: std::env::var("USERNAME").ok(),
             uptime_secs: Some(unsafe { GetTickCount64() } / 1000),
             battery: battery(),
+            load: Some(load()),
+        }
+    }
+
+    fn load() -> Load {
+        let ticks = |f: FILETIME| (f.dwHighDateTime as u64) << 32 | f.dwLowDateTime as u64;
+        static PREV: std::sync::Mutex<Option<(u64, u64)>> = std::sync::Mutex::new(None);
+        let cpu = unsafe {
+            let (mut idle, mut kernel, mut user): (FILETIME, FILETIME, FILETIME) =
+                std::mem::zeroed();
+            (GetSystemTimes(&mut idle, &mut kernel, &mut user) != 0)
+                .then(|| {
+                    // Kernel time includes idle time.
+                    let (idle, total) = (ticks(idle), ticks(kernel) + ticks(user));
+                    let prev = PREV.lock().unwrap().replace((idle, total))?;
+                    let (di, dt) = (idle.saturating_sub(prev.0), total.saturating_sub(prev.1));
+                    (dt > 0).then(|| (100 * (dt - di.min(dt)) / dt) as u8)
+                })
+                .flatten()
+        };
+        let memory = unsafe {
+            let mut m: MEMORYSTATUSEX = std::mem::zeroed();
+            m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+            (GlobalMemoryStatusEx(&mut m) != 0).then(|| Usage {
+                used_mb: (m.ullTotalPhys - m.ullAvailPhys) >> 20,
+                total_mb: m.ullTotalPhys >> 20,
+            })
+        };
+        let disk = unsafe {
+            let root: Vec<u16> = "C:\\\0".encode_utf16().collect();
+            let (mut free, mut total, mut _total_free) = (0u64, 0u64, 0u64);
+            (GetDiskFreeSpaceExW(root.as_ptr(), &mut free, &mut total, &mut _total_free) != 0).then(
+                || Usage {
+                    used_mb: (total - free) >> 20,
+                    total_mb: total >> 20,
+                },
+            )
+        };
+        Load {
+            cpu_percent: cpu,
+            memory,
+            disk,
         }
     }
 

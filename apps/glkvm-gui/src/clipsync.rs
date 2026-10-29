@@ -10,7 +10,10 @@
 //! step instead of a stream of key presses that a window switch could misdirect. When the
 //! agent asks for a paste keystroke, this task sends it over the KVM's keyboard.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -19,8 +22,8 @@ use glkvm::api::bridge::BRIDGE_WS;
 use glkvm::client::WsStream;
 use glkvm::events::HidSender;
 use glkvm_clip::{
-    Content, Dedup, Endpoint, Error, Event, Hello, Info, InsertReply, PasteKey, PastePref, Policy,
-    Role, Secret,
+    Content, Dedup, Endpoint, Error, Event, FileReceiver, FileSender, Hello, Info, InsertReply,
+    PasteKey, PastePref, Policy, PowerAction, Pump, Purpose, Role, Secret,
 };
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -48,6 +51,73 @@ pub type InsertResult = Result<String, String>;
 
 /// PNG bytes of the target's screen, or why there are none.
 pub type CaptureResult = Result<Vec<u8>, String>;
+
+/// Whether the agent's OS accepted a request, or why not.
+pub type AckResult = Result<(), String>;
+
+/// Something the agent does to the target and answers with a plain yes or no.
+pub enum Request {
+    Power(PowerAction),
+    Layout(String),
+}
+
+/// How long the agent gets to verify, sync and rename a file after its last byte.
+const FILE_FINISH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Shared view of a running file transfer, for the UI.
+pub struct TransferProgress {
+    pub name: String,
+    pub total: u64,
+    pub sent: AtomicU64,
+    pub cancel: AtomicBool,
+}
+
+/// A file on its way to the target. `result` holds where the agent saved it.
+pub struct FileSend {
+    pub progress: Arc<TransferProgress>,
+    pub result: oneshot::Receiver<Result<String, String>>,
+}
+
+struct FileRequest {
+    path: PathBuf,
+    progress: Arc<TransferProgress>,
+    reply: oneshot::Sender<Result<String, String>>,
+    /// Part of a clipboard batch (its number): the files are staged on the target and put on
+    /// its clipboard together.
+    batch: Option<u32>,
+}
+
+/// The transfer being streamed, or waiting for the agent's verdict.
+struct ActiveFile {
+    sender: FileSender,
+    req: FileRequest,
+    finished_at: Option<Instant>,
+}
+
+impl ActiveFile {
+    fn fail(self, why: impl Into<String>) {
+        let _ = self.req.reply.send(Err(why.into()));
+    }
+}
+
+/// A clipboard batch in flight: its files' transfer ids as they complete.
+struct Batch {
+    ids: Vec<u32>,
+    remaining: usize,
+}
+
+/// Something the bridge wants the user to hear about.
+pub enum Note {
+    /// From the app itself, such as copied files it could not send.
+    Info(String),
+    /// From the target: a script's `glkvm-agent notify`, or the agent's own alert.
+    Target { title: String, body: String },
+}
+
+struct AckRequest {
+    request: Request,
+    reply: oneshot::Sender<AckResult>,
+}
 
 struct CaptureRequest {
     display: Option<u32>,
@@ -129,6 +199,9 @@ pub struct ClipBridge {
     settings: watch::Sender<Settings>,
     inserts: mpsc::UnboundedSender<InsertRequest>,
     captures: mpsc::UnboundedSender<CaptureRequest>,
+    acks: mpsc::UnboundedSender<AckRequest>,
+    files: mpsc::UnboundedSender<FileRequest>,
+    notes: Mutex<mpsc::UnboundedReceiver<Note>>,
     task: JoinHandle<()>,
 }
 
@@ -145,12 +218,18 @@ impl ClipBridge {
         let (settings, settings_rx) = watch::channel(settings);
         let (inserts, inserts_rx) = mpsc::unbounded_channel();
         let (captures, captures_rx) = mpsc::unbounded_channel();
+        let (acks, acks_rx) = mpsc::unbounded_channel();
+        let (files, files_rx) = mpsc::unbounded_channel();
+        let (notes_tx, notes) = mpsc::unbounded_channel();
         let task = rt.spawn(supervise(
             session,
             secret,
             settings_rx,
             inserts_rx,
             captures_rx,
+            acks_rx,
+            files_rx,
+            notes_tx,
             state_tx,
             wake,
         ));
@@ -159,6 +238,9 @@ impl ClipBridge {
             settings,
             inserts,
             captures,
+            acks,
+            files,
+            notes: Mutex::new(notes),
             task,
         }
     }
@@ -185,6 +267,54 @@ impl ClipBridge {
     pub fn capture(&self, display: Option<u32>) -> oneshot::Receiver<CaptureResult> {
         let (reply, rx) = oneshot::channel();
         let _ = self.captures.send(CaptureRequest { display, reply });
+        rx
+    }
+
+    /// Streams a file to the target's Downloads folder through the agent. Files queue and go
+    /// one at a time.
+    pub fn send_file(&self, path: PathBuf) -> Result<FileSend, String> {
+        let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+        if !meta.is_file() {
+            return Err("not a file".into());
+        }
+        if meta.len() > glkvm_clip::MAX_FILE {
+            return Err("the file is too large".into());
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or("the file name is not valid UTF-8")?
+            .to_owned();
+        let progress = Arc::new(TransferProgress {
+            name,
+            total: meta.len(),
+            sent: AtomicU64::new(0),
+            cancel: AtomicBool::new(false),
+        });
+        let (reply, result) = oneshot::channel();
+        let req = FileRequest {
+            path,
+            progress: progress.clone(),
+            reply,
+            batch: None,
+        };
+        self.files
+            .send(req)
+            .map_err(|_| "the clipboard bridge is stopped".to_string())?;
+        Ok(FileSend { progress, result })
+    }
+
+    /// Things the bridge wants the user to hear about, such as copied files it could not send.
+    pub fn take_notes(&self) -> Vec<Note> {
+        let mut rx = self.notes.lock().unwrap();
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// Asks the agent to lock, sleep, log off, restart or shut down the target, or to
+    /// switch its keyboard layout.
+    pub fn request(&self, request: Request) -> oneshot::Receiver<AckResult> {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.acks.send(AckRequest { request, reply });
         rx
     }
 
@@ -221,12 +351,16 @@ enum End {
     Lost(String, bool),
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn supervise(
     session: Session,
     secret: Secret,
     mut settings: watch::Receiver<Settings>,
     mut inserts: mpsc::UnboundedReceiver<InsertRequest>,
     mut captures: mpsc::UnboundedReceiver<CaptureRequest>,
+    mut acks: mpsc::UnboundedReceiver<AckRequest>,
+    mut files: mpsc::UnboundedReceiver<FileRequest>,
+    notes: mpsc::UnboundedSender<Note>,
     state: watch::Sender<BridgeState>,
     wake: impl Fn() + Send + Sync + 'static,
 ) {
@@ -255,6 +389,9 @@ async fn supervise(
                         &mut settings,
                         &mut inserts,
                         &mut captures,
+                        &mut acks,
+                        &mut files,
+                        &notes,
                         &mut local,
                         &set,
                         &wake,
@@ -299,6 +436,12 @@ async fn supervise(
                 Some(req) = captures.recv() => {
                     let _ = req.reply.send(Err("the agent is not connected".into()));
                 }
+                Some(req) = acks.recv() => {
+                    let _ = req.reply.send(Err("the agent is not connected".into()));
+                }
+                Some(req) = files.recv() => {
+                    let _ = req.reply.send(Err("the agent is not connected".into()));
+                }
             }
         }
     }
@@ -312,6 +455,9 @@ async fn run(
     settings: &mut watch::Receiver<Settings>,
     inserts: &mut mpsc::UnboundedReceiver<InsertRequest>,
     captures: &mut mpsc::UnboundedReceiver<CaptureRequest>,
+    acks: &mut mpsc::UnboundedReceiver<AckRequest>,
+    files: &mut mpsc::UnboundedReceiver<FileRequest>,
+    notes: &mpsc::UnboundedSender<Note>,
     local: &mut LocalClipboard,
     set: &impl Fn(BridgeState),
     wake: &(impl Fn() + Send + Sync),
@@ -329,6 +475,13 @@ async fn run(
     let mut pending: HashMap<u32, (oneshot::Sender<InsertResult>, HidSender, Instant)> =
         HashMap::new();
     let mut captured: HashMap<u32, (oneshot::Sender<CaptureResult>, Instant)> = HashMap::new();
+    let mut queue: VecDeque<FileRequest> = VecDeque::new();
+    let mut active: Option<ActiveFile> = None;
+    let mut batches: HashMap<u32, Batch> = HashMap::new();
+    let mut next_batch = 0u32;
+    let mut receiver = FileReceiver::new(std::env::temp_dir().join("glkvm-clip"));
+    let mut last_wake = Instant::now();
+    let mut acked: HashMap<u32, (oneshot::Sender<AckResult>, Instant)> = HashMap::new();
     let mut poll = interval(POLL);
     let mut ping = interval(PING);
     let mut status = interval(STATUS_EVERY);
@@ -342,7 +495,32 @@ async fn run(
             return End::Lost(e.to_string(), ep.is_ready());
         }
         let up = ep.is_ready();
+        if up && active.is_none() {
+            while let Some(req) = queue.pop_front() {
+                match start_file(&mut ep, req) {
+                    Ok(a) => {
+                        active = Some(a);
+                        break;
+                    }
+                    Err((req, e)) => {
+                        drop_batch(req.batch, &mut batches, &mut queue);
+                        let _ = req.reply.send(Err(e));
+                    }
+                }
+            }
+        }
         tokio::select! {
+            // One piece at a time, so pings, the clipboard and replies keep flowing.
+            _ = tokio::task::yield_now(), if active.as_ref().is_some_and(|a| a.finished_at.is_none()) => {
+                if let Some(a) = active.take() {
+                    active = stream_file(&mut ep, a, &mut batches, &mut queue);
+                    // The progress bar needs redraws, but not one per piece.
+                    if active.is_none() || last_wake.elapsed() > Duration::from_millis(100) {
+                        last_wake = Instant::now();
+                        wake();
+                    }
+                }
+            }
             msg = stream.next() => {
                 let data = match msg {
                     Some(Ok(Message::Binary(b))) => b,
@@ -409,7 +587,86 @@ async fn run(
                                 wake();
                             }
                         }
+                        Event::Ack { id, result } => {
+                            if let Some((tx, _)) = acked.remove(&id) {
+                                let _ = tx.send(result);
+                                wake();
+                            }
+                        }
+                        Event::FileResult { id, result } => {
+                            if active.as_ref().is_some_and(|a| a.sender.id == id)
+                                && let Some(a) = active.take()
+                            {
+                                match &result {
+                                    Ok(_) => {
+                                        if let Some(b) = a.req.batch
+                                            && let Some(batch) = batches.get_mut(&b)
+                                        {
+                                            batch.ids.push(id);
+                                            batch.remaining -= 1;
+                                            if batch.remaining == 0 {
+                                                let batch = batches.remove(&b).expect("just seen");
+                                                if let Err(e) = ep.send_files_ready(&batch.ids) {
+                                                    return End::Lost(e.to_string(), true);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        // The agent dropped it; free what it kept for this id.
+                                        let _ = ep.send_file_cancel(id);
+                                        if a.req.batch.is_some() {
+                                            let _ = notes.send(Note::Info(format!(
+                                                "Copied files not sent: {e}"
+                                            )));
+                                        }
+                                        drop_batch(a.req.batch, &mut batches, &mut queue);
+                                    }
+                                }
+                                let _ = a.req.reply.send(result);
+                                wake();
+                            }
+                        }
+                        // The agent sends files when something was copied on the target.
+                        Event::FileOffer { id, name, size, purpose } => {
+                            let refused = if purpose != Purpose::Clipboard || !settings.borrow().receives() {
+                                Err("the GUI does not take files from the target".to_string())
+                            } else {
+                                receiver.offer(id, &name, size, purpose)
+                            };
+                            if let Err(e) = refused
+                                && let Err(e) = ep.send_file_result(id, Err(e))
+                            {
+                                return End::Lost(e.to_string(), true);
+                            }
+                        }
+                        Event::FileData { id, data } => {
+                            if let Err(e) = receiver.data(id, &data)
+                                && let Err(e) = ep.send_file_result(id, Err(e))
+                            {
+                                return End::Lost(e.to_string(), true);
+                            }
+                        }
+                        Event::FileEnd { id, intact } => {
+                            let result = receiver.end(id, intact);
+                            if let Err(e) = ep.send_file_result(id, result) {
+                                return End::Lost(e.to_string(), true);
+                            }
+                        }
+                        Event::FileCancel { id } => receiver.cancel(id),
+                        Event::FilesReady { ids } => {
+                            if let Some(paths) = receiver.take_staged(&ids) {
+                                tracing::info!(count = paths.len(), "copied files from the target");
+                                local.apply(Content::Files(paths)).await;
+                            }
+                        }
+                        Event::Notify { title, body } => {
+                            let _ = notes.send(Note::Target { title, body });
+                            wake();
+                        }
                         Event::Policy(_)
+                        | Event::Power { .. }
+                        | Event::SetLayout { .. }
                         | Event::Insert { .. }
                         | Event::InsertPasted { .. }
                         | Event::Capture { .. } => {}
@@ -444,7 +701,42 @@ async fn run(
                     }
                 }
             }
+            Some(req) = files.recv() => {
+                if up {
+                    queue.push_back(req);
+                } else {
+                    let _ = req.reply.send(Err("the agent is not connected".into()));
+                }
+            }
+            Some(req) = acks.recv() => {
+                if !up {
+                    let _ = req.reply.send(Err("the agent is not connected".into()));
+                    continue;
+                }
+                let sent = match &req.request {
+                    Request::Power(a) => ep.send_power(*a),
+                    Request::Layout(l) => ep.send_set_layout(l),
+                };
+                match sent {
+                    Ok(id) => {
+                        acked.insert(id, (req.reply, Instant::now()));
+                    }
+                    Err(e) => {
+                        let _ = req.reply.send(Err(e.to_string()));
+                    }
+                }
+            }
             _ = poll.tick() => {
+                if active
+                    .as_ref()
+                    .and_then(|a| a.finished_at)
+                    .is_some_and(|t| t.elapsed() > FILE_FINISH_TIMEOUT)
+                    && let Some(a) = active.take()
+                {
+                    a.fail("the agent did not confirm the file");
+                    wake();
+                }
+                acked.retain(|_, (_, at)| at.elapsed() <= INSERT_TIMEOUT);
                 captured.retain(|_, (_, at)| at.elapsed() <= CAPTURE_TIMEOUT);
                 let expired: Vec<u32> = pending
                     .iter()
@@ -462,7 +754,9 @@ async fn run(
                     && settings.borrow().sends()
                 {
                     tracing::info!(?content, "clipboard to the target");
-                    if let Err(e) = ep.send_clip(&content) {
+                    if let Content::Files(paths) = content {
+                        queue_clip_files(paths, &mut queue, &mut batches, &mut next_batch, notes);
+                    } else if let Err(e) = ep.send_clip(&content) {
                         tracing::warn!(%e, "cannot send clipboard item");
                     }
                 }
@@ -547,6 +841,7 @@ impl LocalClipboard {
             let mut clip = arboard::Clipboard::new()?;
             match content {
                 Content::Text(t) => clip.set_text(t),
+                Content::Files(paths) => clip.set().file_list(&paths),
                 Content::Image {
                     width,
                     height,
@@ -570,6 +865,11 @@ impl LocalClipboard {
 async fn read_blocking() -> Option<Content> {
     tokio::task::spawn_blocking(|| {
         let mut clip = arboard::Clipboard::new().ok()?;
+        if let Ok(files) = clip.get().file_list()
+            && !files.is_empty()
+        {
+            return Some(Content::Files(files));
+        }
         if let Ok(t) = clip.get_text()
             && !t.is_empty()
         {
@@ -623,5 +923,118 @@ mod pasteboard {
 
     pub fn concealed() -> bool {
         false
+    }
+}
+
+/// Queues files copied here to go to the target's clipboard, if they are small enough.
+fn queue_clip_files(
+    paths: Vec<PathBuf>,
+    queue: &mut VecDeque<FileRequest>,
+    batches: &mut HashMap<u32, Batch>,
+    next_batch: &mut u32,
+    notes: &mpsc::UnboundedSender<Note>,
+) {
+    let sized: Vec<(PathBuf, u64)> = paths
+        .into_iter()
+        .filter_map(|p| {
+            let m = std::fs::metadata(&p).ok().filter(|m| m.is_file())?;
+            Some((p, m.len()))
+        })
+        .collect();
+    let total: u64 = sized.iter().map(|(_, n)| n).sum();
+    let skipped = if sized.is_empty() {
+        Some("folders are not supported")
+    } else if sized.len() > glkvm_clip::MAX_CLIP_FILES || total > glkvm_clip::MAX_CLIP_FILES_BYTES {
+        Some("too large to copy through the clipboard (use Send file)")
+    } else {
+        None
+    };
+    if let Some(why) = skipped {
+        let _ = notes.send(Note::Info(format!("Copied files not sent: {why}")));
+        return;
+    }
+    *next_batch += 1;
+    batches.insert(
+        *next_batch,
+        Batch {
+            ids: Vec::new(),
+            remaining: sized.len(),
+        },
+    );
+    for (path, size) in sized {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
+            continue;
+        };
+        let (reply, _) = oneshot::channel();
+        queue.push_back(FileRequest {
+            progress: Arc::new(TransferProgress {
+                name,
+                total: size,
+                sent: AtomicU64::new(0),
+                cancel: AtomicBool::new(false),
+            }),
+            path,
+            reply,
+            batch: Some(*next_batch),
+        });
+    }
+}
+
+/// Opens the file and tells the agent about it. On failure the request comes back with why.
+fn start_file(ep: &mut Endpoint, req: FileRequest) -> Result<ActiveFile, (FileRequest, String)> {
+    let purpose = if req.batch.is_some() {
+        Purpose::Clipboard
+    } else {
+        Purpose::Save
+    };
+    match FileSender::start(ep, &req.path, &req.progress.name, purpose) {
+        Ok(sender) => Ok(ActiveFile {
+            sender,
+            req,
+            finished_at: None,
+        }),
+        Err(e) => Err((req, e)),
+    }
+}
+
+/// Gives up on the rest of a clipboard batch: nothing is put on the target's clipboard.
+fn drop_batch(
+    batch: Option<u32>,
+    batches: &mut HashMap<u32, Batch>,
+    queue: &mut VecDeque<FileRequest>,
+) {
+    if let Some(b) = batch {
+        batches.remove(&b);
+        queue.retain(|r| r.batch != Some(b));
+    }
+}
+
+/// Queues the next piece of `a`, or its end. `None`: the transfer is over (failed or cancelled).
+fn stream_file(
+    ep: &mut Endpoint,
+    mut a: ActiveFile,
+    batches: &mut HashMap<u32, Batch>,
+    queue: &mut VecDeque<FileRequest>,
+) -> Option<ActiveFile> {
+    if a.req.progress.cancel.load(Ordering::Relaxed) {
+        drop_batch(a.req.batch, batches, queue);
+        a.sender.cancel(ep);
+        let _ = a.req.reply.send(Err("cancelled".into()));
+        return None;
+    }
+    match a.sender.pump(ep) {
+        Ok(Pump::Sent(n)) => {
+            a.req.progress.sent.fetch_add(n as u64, Ordering::Relaxed);
+            Some(a)
+        }
+        Ok(Pump::Finished) => {
+            a.finished_at = Some(Instant::now());
+            Some(a)
+        }
+        Err(e) => {
+            drop_batch(a.req.batch, batches, queue);
+            a.fail(e);
+            None
+        }
     }
 }

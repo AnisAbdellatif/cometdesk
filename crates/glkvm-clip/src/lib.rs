@@ -16,19 +16,45 @@
 
 mod content;
 mod pairing;
+mod receive;
+mod send;
+
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub use content::{Content, ContentKey, Dedup, encode_png};
 pub use pairing::Secret;
+pub use receive::FileReceiver;
+pub use send::{FileSender, Pump};
 
 /// Bumped on incompatible protocol changes; both ends refuse a different major.
-pub const PROTOCOL: u16 = 4;
+pub const PROTOCOL: u16 = 7;
 /// Longest text for one [`Endpoint::send_insert`] (one Noise message).
 pub const MAX_INSERT: usize = 60 * 1024;
 /// Largest clipboard item (encoded: UTF-8 text or PNG).
 pub const MAX_ITEM: usize = 16 * 1024 * 1024;
+/// Largest file for [`Endpoint::send_file_offer`]; files are streamed, not held in memory.
+pub const MAX_FILE: u64 = 64 * 1024 * 1024 * 1024;
+/// Longest piece of file data for one [`Endpoint::send_file_data`].
+pub const FILE_CHUNK: usize = 60 * 1024;
+/// Copied files travel on their own, so each one and the whole batch stay small enough to
+/// send without asking; larger ones go through "Send file".
+pub const MAX_CLIP_FILES_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_CLIP_FILES: usize = 64;
+/// Notification text the agent forwards is cut to this many characters.
+pub const MAX_NOTIFY_TITLE: usize = 100;
+pub const MAX_NOTIFY_BODY: usize = 500;
+
+/// What the receiver does with a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Purpose {
+    /// Keep it in the Downloads folder.
+    Save,
+    /// Stage it, and put it on the clipboard with the rest of its batch on `FilesReady`.
+    Clipboard,
+}
 
 const NOISE_PARAMS: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
 const PROLOGUE: &[u8] = b"glkvm-clip v1";
@@ -113,6 +139,9 @@ pub struct Info {
     /// Seconds since the target booted. Not compared when deciding whether to resend.
     pub uptime_secs: Option<u64>,
     pub battery: Option<Battery>,
+    /// Load, memory and system-drive use. Moves constantly: not compared when deciding
+    /// whether to resend (the agent resends it on a timer instead).
+    pub load: Option<Load>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,12 +177,59 @@ pub struct Battery {
     pub charging: bool,
 }
 
+/// Resource use of the target.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Load {
+    /// CPU busy over the last poll, 0-100; `None` until two samples exist.
+    pub cpu_percent: Option<u8>,
+    pub memory: Option<Usage>,
+    /// The system drive (`C:`, `/`).
+    pub disk: Option<Usage>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    pub used_mb: u64,
+    pub total_mb: u64,
+}
+
 impl Info {
-    /// Equality for deciding whether to resend: uptime always moves.
+    /// Equality for deciding whether to resend: uptime and load always move.
     pub fn same_as(&self, other: &Info) -> bool {
         let mut a = self.clone();
         a.uptime_secs = other.uptime_secs;
+        a.load = other.load;
         a == *other
+    }
+}
+
+/// What the GUI can ask the agent to do to the target's session or power state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PowerAction {
+    Lock,
+    Sleep,
+    Logoff,
+    Restart,
+    Shutdown,
+}
+
+impl PowerAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            PowerAction::Lock => "Lock",
+            PowerAction::Sleep => "Sleep",
+            PowerAction::Logoff => "Log off",
+            PowerAction::Restart => "Restart",
+            PowerAction::Shutdown => "Shut down",
+        }
+    }
+
+    /// Loses the user's unsaved work or the agent connection for good.
+    pub fn destructive(self) -> bool {
+        matches!(
+            self,
+            PowerAction::Logoff | PowerAction::Restart | PowerAction::Shutdown
+        )
     }
 }
 
@@ -238,6 +314,54 @@ enum Msg {
         id: u32,
         reason: String,
     },
+    Power {
+        id: u32,
+        action: PowerAction,
+    },
+    /// Switch the active keyboard layout; `layout` is one of `Info::layouts`.
+    SetLayout {
+        id: u32,
+        layout: String,
+    },
+    /// Answers `Power` and `SetLayout`. `Err` carries why the OS refused; `Ok` means it was
+    /// asked, not that it finished.
+    Ack {
+        id: u32,
+        result: std::result::Result<(), String>,
+    },
+    /// A message for the user, from the agent (a script on the target, or the agent itself).
+    Notify {
+        title: String,
+        body: String,
+    },
+    /// A file for the peer to save, streamed as `FileData`s up to the `FileEnd`.
+    FileOffer {
+        id: u32,
+        name: String,
+        size: u64,
+        purpose: Purpose,
+    },
+    /// Every file of a clipboard batch has arrived: put them on the clipboard, in this order.
+    FilesReady {
+        ids: Vec<u32>,
+    },
+    FileData {
+        id: u32,
+        data: Vec<u8>,
+    },
+    FileEnd {
+        id: u32,
+        sha256: [u8; 32],
+    },
+    /// Either side gives up on a transfer.
+    FileCancel {
+        id: u32,
+    },
+    /// The agent's verdict on a file: where it was saved, or why it was not.
+    FileResult {
+        id: u32,
+        result: std::result::Result<String, String>,
+    },
 }
 
 /// Something the caller must act on.
@@ -256,17 +380,80 @@ pub enum Event {
         paste: PastePref,
     },
     /// The agent's answer to an insert (GUI only).
-    InsertReply { id: u32, reply: InsertReply },
+    InsertReply {
+        id: u32,
+        reply: InsertReply,
+    },
     /// The GUI sent the paste keystroke (agent only).
-    InsertPasted { id: u32 },
+    InsertPasted {
+        id: u32,
+    },
     /// The agent's view of the target changed (GUI only).
     Info(Info),
     /// Take a screenshot and send it back with [`Endpoint::send_screenshot`] (agent only).
-    Capture { id: u32, display: Option<u32> },
+    Capture {
+        id: u32,
+        display: Option<u32>,
+    },
     /// A screenshot as PNG bytes, answering `Capture` `id` (GUI only).
-    Screenshot { id: u32, png: Vec<u8> },
+    Screenshot {
+        id: u32,
+        png: Vec<u8>,
+    },
     /// The agent could not capture (GUI only).
-    CaptureFailed { id: u32, reason: String },
+    CaptureFailed {
+        id: u32,
+        reason: String,
+    },
+    /// Lock, sleep, log off, restart or shut down the target (agent only).
+    Power {
+        id: u32,
+        action: PowerAction,
+    },
+    /// Switch the target's keyboard layout (agent only).
+    SetLayout {
+        id: u32,
+        layout: String,
+    },
+    /// A notification to show the user (GUI only), already cut to length.
+    Notify {
+        title: String,
+        body: String,
+    },
+    /// The peer offers a file; save it under `name`, a bare file name the sender chose and the
+    /// receiver must not trust.
+    FileOffer {
+        id: u32,
+        name: String,
+        size: u64,
+        purpose: Purpose,
+    },
+    /// A clipboard batch is complete; the receiver collects the files it staged.
+    FilesReady {
+        ids: Vec<u32>,
+    },
+    FileData {
+        id: u32,
+        data: Vec<u8>,
+    },
+    /// All of the file was sent; `intact` says whether it hashes to what the sender announced.
+    FileEnd {
+        id: u32,
+        intact: bool,
+    },
+    FileCancel {
+        id: u32,
+    },
+    /// Where the peer saved a file, or why it could not.
+    FileResult {
+        id: u32,
+        result: std::result::Result<String, String>,
+    },
+    /// The agent's answer to a power or layout request (GUI only).
+    Ack {
+        id: u32,
+        result: std::result::Result<(), String>,
+    },
 }
 
 enum Noise {
@@ -296,6 +483,8 @@ pub struct Endpoint {
     /// allocation per message.
     scratch: Vec<u8>,
     incoming: Option<Incoming>,
+    /// Running hashes of the files in flight, in either direction.
+    files: HashMap<u32, Sha256>,
     next_id: u32,
 }
 
@@ -320,6 +509,7 @@ impl Endpoint {
             out: Vec::new(),
             scratch: Vec::new(),
             incoming: None,
+            files: HashMap::new(),
             next_id: 1,
         };
         if role == Role::Client {
@@ -408,6 +598,101 @@ impl Endpoint {
         Ok(id)
     }
 
+    pub fn send_power(&mut self, action: PowerAction) -> Result<u32> {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.send(&Msg::Power { id, action })?;
+        Ok(id)
+    }
+
+    pub fn send_set_layout(&mut self, layout: &str) -> Result<u32> {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.send(&Msg::SetLayout {
+            id,
+            layout: layout.to_owned(),
+        })?;
+        Ok(id)
+    }
+
+    /// Starts sending a file: follow with [`Endpoint::send_file_data`] pieces and
+    /// [`Endpoint::send_file_end`].
+    pub fn send_file_offer(&mut self, name: &str, size: u64, purpose: Purpose) -> Result<u32> {
+        if size > MAX_FILE {
+            return Err(Error::Message("file too large".into()));
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.send(&Msg::FileOffer {
+            id,
+            name: name.to_owned(),
+            size,
+            purpose,
+        })?;
+        self.files.insert(id, Sha256::new());
+        Ok(id)
+    }
+
+    pub fn send_file_data(&mut self, id: u32, data: &[u8]) -> Result<()> {
+        if data.len() > FILE_CHUNK {
+            return Err(Error::TooLarge(data.len()));
+        }
+        let hash = self
+            .files
+            .get_mut(&id)
+            .ok_or_else(|| Error::Message(format!("no file {id} is being sent")))?;
+        hash.update(data);
+        self.send(&Msg::FileData {
+            id,
+            data: data.to_vec(),
+        })
+    }
+
+    pub fn send_file_end(&mut self, id: u32) -> Result<()> {
+        let hash = self
+            .files
+            .remove(&id)
+            .ok_or_else(|| Error::Message(format!("no file {id} is being sent")))?;
+        self.send(&Msg::FileEnd {
+            id,
+            sha256: hash.finalize().into(),
+        })
+    }
+
+    /// Texts longer than [`MAX_NOTIFY_TITLE`] / [`MAX_NOTIFY_BODY`] characters are cut.
+    pub fn send_notify(&mut self, title: &str, body: &str) -> Result<()> {
+        self.send(&Msg::Notify {
+            title: cut(title, MAX_NOTIFY_TITLE),
+            body: cut(body, MAX_NOTIFY_BODY),
+        })
+    }
+
+    pub fn send_files_ready(&mut self, ids: &[u32]) -> Result<()> {
+        self.send(&Msg::FilesReady { ids: ids.to_vec() })
+    }
+
+    pub fn send_file_cancel(&mut self, id: u32) -> Result<()> {
+        self.files.remove(&id);
+        self.send(&Msg::FileCancel { id })
+    }
+
+    pub fn send_file_result(
+        &mut self,
+        id: u32,
+        result: std::result::Result<String, String>,
+    ) -> Result<()> {
+        self.send(&Msg::FileResult { id, result })
+    }
+
+    /// Bytes queued for the wire: a sender waits for this to drain before queueing more.
+    pub fn outgoing_len(&self) -> usize {
+        self.out.len()
+    }
+
+    pub fn send_ack(&mut self, id: u32, result: std::result::Result<(), String>) -> Result<()> {
+        self.send(&Msg::Ack { id, result })
+    }
+
     pub fn send_capture_failed(&mut self, id: u32, reason: String) -> Result<()> {
         self.send(&Msg::CaptureFailed { id, reason })
     }
@@ -429,6 +714,9 @@ impl Endpoint {
         let (kind, wire) = match content {
             Content::Text(t) => (Kind::Text, t.as_bytes().to_vec()),
             Content::Image { .. } => (Kind::Png, content.to_png()?),
+            Content::Files(_) => {
+                return Err(Error::Message("files go through the file transfer".into()));
+            }
         };
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
@@ -535,6 +823,71 @@ impl Endpoint {
             Msg::Capture { .. } | Msg::CaptureFailed { .. } => {
                 return Err(Error::Message("capture message for the wrong role".into()));
             }
+            Msg::Notify { title, body } if self.role == Role::Client => {
+                events.push(Event::Notify {
+                    title: cut(&title, MAX_NOTIFY_TITLE),
+                    body: cut(&body, MAX_NOTIFY_BODY),
+                });
+            }
+            Msg::Notify { .. } => {
+                return Err(Error::Message("notification for the wrong role".into()));
+            }
+            Msg::FileOffer {
+                id,
+                name,
+                size,
+                purpose,
+            } => {
+                if size > MAX_FILE {
+                    return Err(Error::Message("file too large".into()));
+                }
+                self.files.insert(id, Sha256::new());
+                events.push(Event::FileOffer {
+                    id,
+                    name,
+                    size,
+                    purpose,
+                });
+            }
+            Msg::FilesReady { ids } => {
+                if ids.len() > MAX_CLIP_FILES {
+                    return Err(Error::Message("too many files".into()));
+                }
+                events.push(Event::FilesReady { ids });
+            }
+            Msg::FileData { id, data } => {
+                // Unknown ids are a cancelled or refused file whose data was already in
+                // flight: drop it quietly.
+                if let Some(hash) = self.files.get_mut(&id) {
+                    hash.update(&data);
+                    events.push(Event::FileData { id, data });
+                }
+            }
+            Msg::FileEnd { id, sha256 } => {
+                if let Some(hash) = self.files.remove(&id) {
+                    let intact = <[u8; 32]>::from(hash.finalize()) == sha256;
+                    events.push(Event::FileEnd { id, intact });
+                }
+            }
+            Msg::FileCancel { id } => {
+                self.files.remove(&id);
+                events.push(Event::FileCancel { id });
+            }
+            Msg::FileResult { id, result } => {
+                events.push(Event::FileResult { id, result });
+            }
+            Msg::Power { id, action } if self.role == Role::Agent => {
+                events.push(Event::Power { id, action });
+            }
+            Msg::SetLayout { id, layout } if self.role == Role::Agent => {
+                events.push(Event::SetLayout { id, layout });
+            }
+            Msg::Ack { id, result } if self.role == Role::Client => {
+                events.push(Event::Ack { id, result });
+            }
+            Msg::Power { .. } | Msg::SetLayout { .. } | Msg::Ack { .. } => {
+                return Err(Error::Message("request for the wrong role".into()));
+            }
             Msg::Policy(p) => {
                 if self.role == Role::Agent {
                     events.push(Event::Policy(p));
@@ -631,6 +984,14 @@ impl Endpoint {
     }
 }
 
+/// At most `max` characters, control characters replaced by spaces.
+fn cut(text: &str, max: usize) -> String {
+    text.chars()
+        .take(max)
+        .map(|c| if c.is_control() && c != '\n' { ' ' } else { c })
+        .collect()
+}
+
 fn push_frame(out: &mut Vec<u8>, payload: &[u8]) {
     out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     out.extend_from_slice(payload);
@@ -677,6 +1038,166 @@ mod tests {
         let (ce, ae) = pump(&mut c, &mut a).unwrap();
         assert_eq!(ce, vec![Event::Info(info)]);
         assert!(ae.is_empty());
+    }
+
+    #[test]
+    fn power_and_layout_round_trip_and_wrong_role() {
+        let s = Secret::generate();
+        let (mut c, mut a) = pair(&s, &s);
+        pump(&mut c, &mut a).unwrap();
+        let id = c.send_power(PowerAction::Restart).unwrap();
+        let (_, ae) = pump(&mut c, &mut a).unwrap();
+        assert_eq!(
+            ae,
+            vec![Event::Power {
+                id,
+                action: PowerAction::Restart
+            }]
+        );
+        a.send_ack(id, Err("denied".into())).unwrap();
+        let (ce, _) = pump(&mut c, &mut a).unwrap();
+        assert_eq!(
+            ce,
+            vec![Event::Ack {
+                id,
+                result: Err("denied".into())
+            }]
+        );
+        let id = c.send_set_layout("xkb:de").unwrap();
+        let (_, ae) = pump(&mut c, &mut a).unwrap();
+        assert_eq!(
+            ae,
+            vec![Event::SetLayout {
+                id,
+                layout: "xkb:de".into()
+            }]
+        );
+        a.send_power(PowerAction::Lock).unwrap();
+        assert!(pump(&mut c, &mut a).is_err());
+    }
+
+    #[test]
+    fn file_round_trip_detects_corruption() {
+        let s = Secret::generate();
+        let (mut c, mut a) = pair(&s, &s);
+        pump(&mut c, &mut a).unwrap();
+        let id = c.send_file_offer("a.bin", 6, Purpose::Save).unwrap();
+        c.send_file_data(id, b"abc").unwrap();
+        c.send_file_data(id, b"def").unwrap();
+        c.send_file_end(id).unwrap();
+        let (_, ae) = pump(&mut c, &mut a).unwrap();
+        assert_eq!(
+            ae,
+            vec![
+                Event::FileOffer {
+                    id,
+                    name: "a.bin".into(),
+                    size: 6,
+                    purpose: Purpose::Save
+                },
+                Event::FileData {
+                    id,
+                    data: b"abc".to_vec()
+                },
+                Event::FileData {
+                    id,
+                    data: b"def".to_vec()
+                },
+                Event::FileEnd { id, intact: true },
+            ]
+        );
+        a.send_file_result(id, Ok("/tmp/a.bin".into())).unwrap();
+        let (ce, _) = pump(&mut c, &mut a).unwrap();
+        assert_eq!(
+            ce,
+            vec![Event::FileResult {
+                id,
+                result: Ok("/tmp/a.bin".into())
+            }]
+        );
+        // Data for a cancelled file is not sent, and one that is already in flight is ignored.
+        let id = c.send_file_offer("b", 1, Purpose::Clipboard).unwrap();
+        c.send_file_cancel(id).unwrap();
+        c.send_file_data(id, b"x").unwrap_err();
+        let (_, ae) = pump(&mut c, &mut a).unwrap();
+        assert_eq!(ae.len(), 2);
+        // Both directions work: the agent can send files too.
+        let id = a.send_file_offer("c", 0, Purpose::Clipboard).unwrap();
+        a.send_file_end(id).unwrap();
+        a.send_files_ready(&[id]).unwrap();
+        let (ce, _) = pump(&mut c, &mut a).unwrap();
+        assert_eq!(ce.last(), Some(&Event::FilesReady { ids: vec![id] }));
+    }
+
+    #[test]
+    fn clipboard_file_streams_into_staging() {
+        let dir = std::env::temp_dir().join(format!("glkvm-clip-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("data.bin");
+        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i * 7) as u8).collect();
+        std::fs::write(&src, &bytes).unwrap();
+
+        let s = Secret::generate();
+        let (mut c, mut a) = pair(&s, &s);
+        pump(&mut c, &mut a).unwrap();
+        let mut rx = FileReceiver::new(dir.join("staging"));
+        let mut tx = FileSender::start(&mut c, &src, "data.bin", Purpose::Clipboard).unwrap();
+        let mut done = false;
+        while !done {
+            done = matches!(tx.pump(&mut c).unwrap(), Pump::Finished);
+            let (_, ae) = pump(&mut c, &mut a).unwrap();
+            for ev in ae {
+                match ev {
+                    Event::FileOffer {
+                        id,
+                        name,
+                        size,
+                        purpose,
+                    } => rx.offer(id, &name, size, purpose).unwrap(),
+                    Event::FileData { id, data } => rx.data(id, &data).unwrap(),
+                    Event::FileEnd { id, intact } => {
+                        rx.end(id, intact).unwrap();
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        }
+        let staged = rx.take_staged(&[tx.id]).unwrap();
+        assert_eq!(staged[0].file_name().unwrap(), "data.bin");
+        assert_eq!(std::fs::read(&staged[0]).unwrap(), bytes);
+        assert!(rx.take_staged(&[tx.id]).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn notifications_go_to_the_gui_and_are_cut() {
+        let s = Secret::generate();
+        let (mut c, mut a) = pair(&s, &s);
+        pump(&mut c, &mut a).unwrap();
+        a.send_notify(&"t".repeat(300), "done\u{7}").unwrap();
+        let (ce, _) = pump(&mut c, &mut a).unwrap();
+        assert_eq!(
+            ce,
+            vec![Event::Notify {
+                title: "t".repeat(MAX_NOTIFY_TITLE),
+                body: "done ".into()
+            }]
+        );
+        c.send_notify("x", "y").unwrap();
+        assert!(pump(&mut c, &mut a).is_err());
+    }
+
+    #[test]
+    fn load_does_not_trigger_a_resend() {
+        let a = Info::default();
+        let b = Info {
+            load: Some(Load {
+                cpu_percent: Some(9),
+                ..Load::default()
+            }),
+            ..Info::default()
+        };
+        assert!(a.same_as(&b));
     }
 
     #[test]

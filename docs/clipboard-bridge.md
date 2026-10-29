@@ -248,6 +248,35 @@ targets), dead-key characters get a following Space, composed ones (`â`) both s
 Windows tables serve Linux too; BIOS always gets US. Characters the layout can't type are
 skipped and reported. Keymaps we have no table for fall back to `hid/print`.
 
+### Telemetry, session actions, files, notifications (protocol v7, 2026-10-29)
+All carried by the same Noise session; `PROTOCOL` is 7, so the agent must be rebuilt and
+reinstalled with the GUI.
+
+- **Telemetry**: `Info.load` (CPU %, memory, system drive). Not part of `same_as`; the agent
+  resends `Info` every 10 s. macOS targets report disk only. The "Target" menu title shows
+  `CPU · RAM` and turns amber when the session is locked.
+- **Session actions**: `Power{id, action}` (lock, sleep, log off, restart, shut down) answered
+  by `Ack{id, result}`. Run through `loginctl`/`systemctl`, `rundll32`/`shutdown.exe`,
+  `pmset`/`osascript`. `Ack` also answers `SetLayout{id, layout}` (GNOME `gsettings` current
+  source, else `setxkbmap` reorder; Windows `WM_INPUTLANGCHANGEREQUEST`; not on macOS).
+- **Files**: `FileOffer{id, name, size, purpose}` → `FileData`* → `FileEnd{sha256}`, answered
+  by `FileResult{id, Ok(path) | Err}`; `FileCancel` from either side. Both directions.
+  The receiver (`glkvm_clip::FileReceiver`) sanitizes the name, writes a `.part` file and
+  renames after the hash matches. `Purpose::Save` goes to Downloads (GUI → agent only);
+  `Purpose::Clipboard` goes to a staging folder (`<tmp>/glkvm-clip/<nonce>-<id>/`, removed
+  after 24 h), and `FilesReady{ids}` makes the receiver put the batch on its clipboard
+  (`Content::Files`). Copied files are sent automatically only up to 64 files / 64 MiB in
+  total and never folders; the rest says so and points to "Send file". Dropping files on the
+  window or "Send file" streams them to Downloads when the agent is connected (otherwise
+  the drop still goes to the MSD upload).
+- **Region copy**: "Copy region as image" crops the agent's exact screenshot of the main
+  monitor to the rectangle dragged on the video. Assumes the KVM shows the main monitor.
+- **Notifications**: `Notify{title, body}` agent → GUI. `glkvm-agent notify <title> [body]`
+  hands a message to the running agent over the loopback instance port (rate limited:
+  burst of 5, one more per 2 s); the agent also notifies at 15 % battery when unplugged. The
+  GUI shows a toast while focused and a macOS notification (via `osascript`, texts passed as
+  arguments) otherwise.
+
 ### Fallback for macOS targets / no network: FunctionFS
 
 A userspace daemon on the Comet could present either a vendor bulk interface (WinUSB

@@ -4,12 +4,14 @@ mod actions;
 mod app;
 mod clipsync;
 mod console;
+mod crop;
 mod devices;
 mod gpu;
 mod media;
 mod ocr;
 mod setup;
 mod store;
+mod sysnotify;
 mod theme;
 
 use std::sync::Arc;
@@ -43,6 +45,7 @@ fn main() -> Result<()> {
         builder.with_default_menu(false);
     }
     let event_loop = builder.build()?;
+    app::control::start(event_loop.create_proxy());
     let mut app = app::App::new(rt, event_loop.create_proxy(), pins, iso_fix);
     event_loop.run_app(&mut app)?;
     Ok(())

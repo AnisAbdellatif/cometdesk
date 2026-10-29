@@ -136,6 +136,11 @@ fn run(mut clip: Clipboard, cmds: mpsc::Receiver<ClipCommand>, local: mpsc::Send
 }
 
 fn read(clip: &mut Clipboard, with_image: bool) -> Option<Content> {
+    if let Ok(files) = clip.get().file_list()
+        && !files.is_empty()
+    {
+        return Some(Content::Files(files));
+    }
     match clip.get_text() {
         Ok(t) if !t.is_empty() => return Some(Content::Text(t)),
         _ => {}
@@ -154,6 +159,7 @@ fn read(clip: &mut Clipboard, with_image: bool) -> Option<Content> {
 fn write(clip: &mut Clipboard, content: Content) -> Result<(), arboard::Error> {
     match content {
         Content::Text(t) => clip.set_text(t),
+        Content::Files(paths) => clip.set().file_list(&paths),
         Content::Image {
             width,
             height,

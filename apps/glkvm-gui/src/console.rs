@@ -18,7 +18,7 @@ use glkvm::api::system::{LatencyMode, Orientation, VencMode, VideoMode};
 use glkvm::events::{ConnState, DeviceState, EventOptions, EventSession, HidSender};
 use glkvm::hid::{HidCommand, MouseButton};
 use glkvm::{Session, SystemConfig};
-use glkvm_clip::{Hello, Info, PastePref, SessionState};
+use glkvm_clip::{Hello, Info, PastePref, PowerAction as SessionAction, SessionState};
 use glkvm_media::audio::{AudioSession, Player};
 use glkvm_media::direct::{MediaSession, SourceState};
 use glkvm_media::{SourceOptions, Transport};
@@ -32,7 +32,9 @@ use winit::keyboard::KeyCode;
 
 use crate::actions::{self, HostModifiers, Shortcut};
 use crate::app::UserEvent;
-use crate::clipsync::{BridgeState, ClipBridge, InsertResult, Settings as ClipSettings};
+use crate::clipsync::{
+    BridgeState, ClipBridge, InsertResult, Note, Request, Settings as ClipSettings,
+};
 use crate::gpu::Gpu;
 use crate::media::Media;
 use crate::setup::BridgeSetup;
@@ -76,6 +78,12 @@ struct Typing {
     task: JoinHandle<Result<(), String>>,
 }
 
+/// A region being picked: the drag's start (once it began) and the pointer now.
+struct RegionPick {
+    start: Option<egui::Pos2>,
+    now: egui::Pos2,
+}
+
 enum Confirm {
     Type {
         text: String,
@@ -83,6 +91,8 @@ enum Confirm {
     },
     Power(PowerAction),
     Click(AtxButton),
+    /// An action the agent carries out on the target's OS (log off, restart, shut down).
+    Session(SessionAction),
     /// Install / update / repair the bridge on the Comet; holds the action's name.
     BridgeSetup(String),
     Video(VideoChange),
@@ -185,6 +195,15 @@ pub struct Console {
     /// Outcome of an insert through the agent, while one is in flight.
     inserting: Option<tokio::sync::oneshot::Receiver<InsertResult>>,
     confirm: Option<Confirm>,
+    window_focused: bool,
+    /// A rectangle being dragged on the video, to copy that part of the screen.
+    region: Option<RegionPick>,
+    /// Where the video is drawn, in window points.
+    video_pts: Option<egui::Rect>,
+    /// Files on their way to the target through the agent.
+    transfers: Vec<crate::clipsync::FileSend>,
+    /// Files chosen in the "Send file" dialog, picked up by the next frame.
+    picked_files: Arc<std::sync::Mutex<Vec<std::path::PathBuf>>>,
     notice: Option<(String, Instant)>,
     stats: FrameStats,
     hidden_since: Option<Instant>,
@@ -257,6 +276,11 @@ impl Console {
             typing: None,
             inserting: None,
             confirm: None,
+            window_focused: true,
+            region: None,
+            video_pts: None,
+            transfers: Vec::new(),
+            picked_files: Arc::default(),
             notice: None,
             stats: FrameStats::default(),
             hidden_since: None,
@@ -1084,6 +1108,11 @@ impl Console {
     /// Keeps the input mapping in sync with where the video is drawn.
     pub fn update_layout(&mut self, gpu: &Gpu, pixels_per_point: f32) {
         if let Some(rect) = self.video_rect(gpu, pixels_per_point) {
+            let ppp = f64::from(pixels_per_point);
+            self.video_pts = Some(egui::Rect::from_min_size(
+                egui::pos2((rect.x / ppp) as f32, (rect.y / ppp) as f32),
+                egui::vec2((rect.w / ppp) as f32, (rect.h / ppp) as f32),
+            ));
             self.mapper.set_rect(rect);
         }
     }
@@ -1157,6 +1186,72 @@ impl Console {
         self.restart_watcher();
     }
 
+    // ----- automation (see app/control.rs) -----------------------------------------------
+
+    pub fn send_hid(&self, cmds: impl IntoIterator<Item = HidCommand>) {
+        for cmd in cmds {
+            self.hid.send(cmd);
+        }
+    }
+
+    /// Types `text` on the target without the confirmation a person gets.
+    pub fn control_type(&mut self, text: String) {
+        self.release_all();
+        self.deliver_text(text);
+    }
+
+    pub fn control_status(&self) -> serde_json::Value {
+        let state = self.state.borrow();
+        let (status, _) = self.status();
+        serde_json::json!({
+            "device": self.device.display_name(),
+            "status": status,
+            "connection": format!("{:?}", &*self.conn.borrow()),
+            "video_signal": state.video_signal(),
+            "transport": format!("{:?}", self.transport),
+            "fullscreen": self.fullscreen,
+            "stats": self.stats.shown,
+            "notice": self.notice.as_ref().map(|n| &n.0),
+            "typing": self.typing.as_ref().map(|t| serde_json::json!({
+                "done": t.done.load(Ordering::Relaxed), "total": t.total,
+            })),
+            "modal": self.has_modal(),
+            "agent": self.agent().is_some(),
+        })
+    }
+
+    /// Saves the device's snapshot of the target; with `ocr`, also reads the text on it.
+    pub fn control_snapshot(
+        &self,
+        path: std::path::PathBuf,
+        ocr: bool,
+        reply: std::sync::mpsc::Sender<serde_json::Value>,
+    ) {
+        let session = self.session.clone();
+        self.rt.spawn(async move {
+            let r = async {
+                let jpeg = session
+                    .snapshot(SnapshotOptions::default())
+                    .await
+                    .map_err(|e| format!("snapshot failed: {e}"))?;
+                tokio::fs::write(&path, &jpeg)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let mut v = serde_json::json!({"ok": true, "path": path, "bytes": jpeg.len()});
+                if ocr {
+                    let img = jpeg.to_vec();
+                    v["text"] = tokio::task::spawn_blocking(move || crate::ocr::recognize(&img))
+                        .await
+                        .map_err(|e| e.to_string())??
+                        .into();
+                }
+                Ok::<_, String>(v)
+            }
+            .await;
+            let _ = reply.send(r.unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e})));
+        });
+    }
+
     // ----- input -----------------------------------------------------------------------
 
     fn flush(&mut self) {
@@ -1227,7 +1322,7 @@ impl Console {
     }
 
     pub fn has_modal(&self) -> bool {
-        self.confirm.is_some() || self.target_setup.is_some()
+        self.confirm.is_some() || self.target_setup.is_some() || self.region.is_some()
     }
 
     pub fn send_combo(&mut self, keys: &[&'static str]) {
@@ -1247,7 +1342,11 @@ impl Console {
         // The user may still hold Cmd+Shift from the shortcut; those must not reach the target
         // together with the typed text.
         self.release_all();
-        match actions::confirm_reason(&text) {
+        let locked = self.last_session == Some(SessionState::Locked);
+        let reason = actions::confirm_reason(&text).or_else(|| {
+            locked.then(|| "been aimed at a locked target: it goes to the lock screen".to_string())
+        });
+        match reason {
             Some(reason) => self.confirm = Some(Confirm::Type { text, reason }),
             None => self.deliver_text(text),
         }
@@ -1432,6 +1531,111 @@ impl Console {
         rx
     }
 
+    /// Starts picking a region of the video to copy as an image.
+    pub fn pick_region(&mut self) {
+        if self.video_pts.is_none() {
+            return self.notify("No video to copy from yet".into());
+        }
+        self.release_all();
+        self.region = Some(RegionPick {
+            start: None,
+            now: egui::Pos2::ZERO,
+        });
+    }
+
+    /// Dims the video and lets the user drag a rectangle on it.
+    fn region_overlay(&mut self, ui: &mut egui::Ui) {
+        let (Some(pick), Some(area)) = (self.region.as_mut(), self.video_pts) else {
+            return;
+        };
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.region = None;
+            return;
+        }
+        let resp = ui.interact(area, egui::Id::unique("region_pick"), egui::Sense::drag());
+        ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Crosshair);
+        if let Some(p) = resp.interact_pointer_pos() {
+            pick.now = p;
+            if resp.drag_started() {
+                pick.start = Some(p);
+            }
+        }
+        let painter = ui.painter();
+        painter.rect_filled(area, 0.0, egui::Color32::from_black_alpha(90));
+        painter.text(
+            area.center_top() + egui::vec2(0.0, 12.0),
+            egui::Align2::CENTER_TOP,
+            "Drag over the part of the screen to copy · Esc cancels",
+            egui::FontId::proportional(15.0),
+            egui::Color32::WHITE,
+        );
+        let Some(start) = pick.start else { return };
+        let sel = egui::Rect::from_two_pos(start, pick.now).intersect(area);
+        painter.rect_stroke(
+            sel,
+            0.0,
+            egui::Stroke::new(2.0, theme::OK),
+            egui::StrokeKind::Inside,
+        );
+        if resp.drag_stopped() {
+            self.region = None;
+            if sel.width() >= 4.0 && sel.height() >= 4.0 {
+                let to = |p: egui::Pos2| {
+                    (
+                        (p.x - area.min.x) / area.width(),
+                        (p.y - area.min.y) / area.height(),
+                    )
+                };
+                let (a, b) = (to(sel.min), to(sel.max));
+                self.copy_screen_image([a.0, a.1, b.0, b.1]);
+            }
+        }
+    }
+
+    /// Copies part of the target's screen, `[left, top, right, bottom]` as fractions of the
+    /// video, as an image: cut from the agent's exact screenshot of the main monitor.
+    pub fn copy_screen_image(&mut self, region: [f32; 4]) {
+        let Some(d) = self.agent().and_then(|(_, i)| {
+            (i.session != SessionState::Locked)
+                .then(|| i.displays.iter().position(|d| d.primary).unwrap_or(0) as u32)
+        }) else {
+            return self.notify("Needs the agent connected, with the target unlocked".into());
+        };
+        let Some(rx) = self.agent_capture(Some(d)) else {
+            return;
+        };
+        let proxy = self.proxy.clone();
+        self.rt.spawn(async move {
+            let msg = match tokio::time::timeout(CAPTURE_REPLY_TIMEOUT, rx).await {
+                Ok(Ok(Ok(png))) => {
+                    let image = tokio::task::spawn_blocking(move || {
+                        let (w, h, rgba) = crate::crop::crop_png(&png, region)?;
+                        arboard::Clipboard::new()
+                            .and_then(|mut c| {
+                                c.set_image(arboard::ImageData {
+                                    width: w as usize,
+                                    height: h as usize,
+                                    bytes: rgba.into(),
+                                })
+                            })
+                            .map(|()| (w, h))
+                            .map_err(|e| e.to_string())
+                    })
+                    .await;
+                    match image {
+                        Ok(Ok((w, h))) => format!("Copied a {w}×{h} image of the screen"),
+                        Ok(Err(e)) => format!("Cannot copy the screen: {e}"),
+                        Err(e) => format!("Cannot copy the screen: {e}"),
+                    }
+                }
+                Ok(Ok(Err(e))) => format!("Screenshot failed: {e}"),
+                Ok(Err(_)) => "Screenshot failed: the agent did not answer".into(),
+                Err(_) => "Screenshot failed: the agent timed out".into(),
+            };
+            let _ = proxy.send_event(UserEvent::Notice(msg));
+        });
+    }
+
     /// Recognizes the text on the target's screen and copies it. From the agent's exact
     /// screenshot of the main monitor when it is connected and the session is unlocked,
     /// else from the device snapshot.
@@ -1489,10 +1693,25 @@ impl Console {
             (Some(u), Some((seen, at))) if seen == u => Some(u + at.elapsed().as_secs()),
             (u, _) => u,
         };
-        let title = match info.session {
-            SessionState::Locked => "Target: locked",
-            _ => "Target info",
+        // The title doubles as the status strip: lock state first, then load.
+        let (title, tint) = match info.session {
+            SessionState::Locked => ("Target: locked".to_string(), Some(theme::WARN)),
+            _ => {
+                let load = info.load.unwrap_or_default();
+                let mut parts = vec!["Target".to_string()];
+                if let Some(c) = load.cpu_percent {
+                    parts.push(format!("CPU {c}%"));
+                }
+                if let Some(m) = load.memory.filter(|m| m.total_mb > 0) {
+                    parts.push(format!("RAM {}%", m.used_mb * 100 / m.total_mb));
+                }
+                (parts.join(" · "), None)
+            }
         };
+        let mut title = egui::RichText::new(title);
+        if let Some(c) = tint {
+            title = title.color(c);
+        }
         ui.menu_button(title, |ui| {
             let layouts: Vec<&str> = info
                 .layouts
@@ -1556,6 +1775,25 @@ impl Console {
                     ),
                 ));
             }
+            if let Some(l) = info.load {
+                let usage = |u: glkvm_clip::Usage| {
+                    format!(
+                        "{:.1} / {:.1} GB ({}%)",
+                        u.used_mb as f64 / 1024.0,
+                        u.total_mb as f64 / 1024.0,
+                        (u.used_mb * 100).checked_div(u.total_mb).unwrap_or(0)
+                    )
+                };
+                if let Some(c) = l.cpu_percent {
+                    rows.push(("CPU", format!("{c}%")));
+                }
+                if let Some(m) = l.memory {
+                    rows.push(("Memory", usage(m)));
+                }
+                if let Some(d) = l.disk {
+                    rows.push(("Disk", usage(d)));
+                }
+            }
             egui::Grid::new("agent_info").num_columns(2).show(ui, |ui| {
                 for (k, v) in rows.iter().filter(|(_, v)| !v.is_empty()) {
                     ui.label(*k);
@@ -1563,6 +1801,192 @@ impl Console {
                     ui.end_row();
                 }
             });
+            if info.layouts.len() > 1 {
+                ui.separator();
+                ui.menu_button("Switch the target's layout", |ui| {
+                    for l in &info.layouts {
+                        let label = glkvm::layout::keymap_from_native(l).unwrap_or(l);
+                        let active = info.keyboard.as_deref() == Some(l.as_str());
+                        if ui.selectable_label(active, label).clicked() && !active {
+                            self.request_layout(l.clone());
+                            ui.close();
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    /// Lock, sleep, log off, restart and shut down through the agent: the OS closes the
+    /// session cleanly, unlike the ATX button. Shown only while the agent is connected.
+    fn session_menu(&mut self, ui: &mut egui::Ui) {
+        if !self.inserts_via_agent() {
+            return;
+        }
+        ui.menu_button("Session", |ui| {
+            for a in [
+                SessionAction::Lock,
+                SessionAction::Sleep,
+                SessionAction::Logoff,
+                SessionAction::Restart,
+                SessionAction::Shutdown,
+            ] {
+                let label = if a.destructive() {
+                    format!("{}…", a.label())
+                } else {
+                    a.label().to_string()
+                };
+                if ui.button(label).clicked() {
+                    if a.destructive() {
+                        self.confirm = Some(Confirm::Session(a));
+                    } else {
+                        self.session_action(a);
+                    }
+                    ui.close();
+                }
+            }
+        });
+    }
+
+    /// A message from the target: a toast while the window is in front, else a system
+    /// notification (a toast if the platform has none).
+    fn target_note(&mut self, title: &str, body: &str) {
+        let host = self.device.host.clone();
+        if !self.window_focused && crate::sysnotify::show(title, body, &host) {
+            return;
+        }
+        self.notify(if body.is_empty() {
+            title.to_owned()
+        } else {
+            format!("{title}: {body}")
+        });
+    }
+
+    pub fn set_window_focused(&mut self, focused: bool) {
+        self.window_focused = focused;
+    }
+
+    /// Streams `paths` to the target's Downloads folder through the agent.
+    fn send_files(&mut self, paths: Vec<std::path::PathBuf>) {
+        let Some(clip) = self.clip.as_ref() else {
+            return;
+        };
+        let mut errors = Vec::new();
+        for path in paths {
+            match clip.send_file(path.clone()) {
+                Ok(t) => self.transfers.push(t),
+                Err(e) => errors.push(format!("Cannot send {}: {e}", path.display())),
+            }
+        }
+        for e in errors {
+            self.notify(e);
+        }
+    }
+
+    fn pick_files_to_send(&self) {
+        let (picked, proxy) = (self.picked_files.clone(), self.proxy.clone());
+        self.rt.spawn(async move {
+            let files = rfd::AsyncFileDialog::new()
+                .set_title("Send files to the target")
+                .pick_files()
+                .await;
+            if let Some(files) = files {
+                picked
+                    .lock()
+                    .unwrap()
+                    .extend(files.iter().map(|f| f.path().to_owned()));
+            }
+            let _ = proxy.send_event(UserEvent::Refresh);
+        });
+    }
+
+    /// Reports finished transfers and draws the running ones.
+    fn poll_transfers(&mut self, ctx: &egui::Context) {
+        use tokio::sync::oneshot::error::TryRecvError;
+        let mut notes = Vec::new();
+        self.transfers.retain_mut(|t| match t.result.try_recv() {
+            Ok(Ok(path)) => {
+                notes.push(format!("Sent {} to the target: {path}", t.progress.name));
+                false
+            }
+            Ok(Err(e)) => {
+                notes.push(format!("Sending {} failed: {e}", t.progress.name));
+                false
+            }
+            Err(TryRecvError::Closed) => {
+                notes.push(format!("Sending {} was interrupted", t.progress.name));
+                false
+            }
+            Err(TryRecvError::Empty) => true,
+        });
+        for n in notes {
+            self.notify(n);
+        }
+        if self.transfers.is_empty() {
+            return;
+        }
+        egui::Area::new(egui::Id::unique("transfers"))
+            .anchor(egui::Align2::LEFT_BOTTOM, [8.0, -8.0])
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    for p in self.transfers.iter().map(|t| &t.progress) {
+                        let sent = p.sent.load(Ordering::Relaxed);
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::ProgressBar::new(sent as f32 / p.total.max(1) as f32)
+                                    .desired_width(240.0)
+                                    .text(format!(
+                                        "{} · {:.1} / {:.1} MB",
+                                        p.name,
+                                        sent as f64 / 1e6,
+                                        p.total as f64 / 1e6
+                                    )),
+                            );
+                            if ui.button("Cancel").clicked() {
+                                p.cancel.store(true, Ordering::Relaxed);
+                            }
+                        });
+                    }
+                });
+            });
+    }
+
+    fn request_layout(&mut self, layout: String) {
+        let Some(rx) = self
+            .clip
+            .as_ref()
+            .map(|c| c.request(Request::Layout(layout)))
+        else {
+            return;
+        };
+        let proxy = self.proxy.clone();
+        self.rt.spawn(async move {
+            let msg = match rx.await {
+                Ok(Ok(())) => return,
+                Ok(Err(e)) => format!("Cannot switch the layout: {e}"),
+                Err(_) => "Cannot switch the layout: the agent disconnected".into(),
+            };
+            let _ = proxy.send_event(UserEvent::Notice(msg));
+        });
+    }
+
+    fn session_action(&mut self, action: SessionAction) {
+        let Some(rx) = self
+            .clip
+            .as_ref()
+            .map(|c| c.request(Request::Power(action)))
+        else {
+            return;
+        };
+        let proxy = self.proxy.clone();
+        self.rt.spawn(async move {
+            let msg = match rx.await {
+                Ok(Ok(())) => format!("{}: requested", action.label()),
+                Ok(Err(e)) => format!("{} failed: {e}", action.label()),
+                // The target went down before it could answer.
+                Err(_) => format!("{}: the agent disconnected", action.label()),
+            };
+            let _ = proxy.send_event(UserEvent::Notice(msg));
         });
     }
 
@@ -1626,9 +2050,24 @@ impl Console {
                 .map(|f| f.path().to_owned())
                 .collect()
         });
-        if !dropped.is_empty() && self.caps.supports(Feature::Msd) {
-            self.media.dropped(dropped);
+        let mut dropped = dropped;
+        dropped.append(&mut self.picked_files.lock().unwrap());
+        if !dropped.is_empty() {
+            if self.inserts_via_agent() {
+                self.send_files(dropped);
+            } else if self.caps.supports(Feature::Msd) {
+                self.media.dropped(dropped);
+            }
         }
+        if let Some(notes) = self.clip.as_ref().map(ClipBridge::take_notes) {
+            for n in notes {
+                match n {
+                    Note::Info(text) => self.notify(text),
+                    Note::Target { title, body } => self.target_note(&title, &body),
+                }
+            }
+        }
+        self.poll_transfers(ui.ctx());
         if let Some(rx) = self.inserting.as_mut() {
             match rx.try_recv() {
                 Ok(Ok(msg)) => {
@@ -1801,6 +2240,16 @@ impl Console {
             action = ConsoleAction::TargetChanged;
         }
         let agent_up = self.inserts_via_agent();
+        if agent_up
+            && ui
+                .button("Send file")
+                .on_hover_text(
+                    "Copy a file to the target's Downloads folder (or drop it on the window)",
+                )
+                .clicked()
+        {
+            self.pick_files_to_send();
+        }
         ui.menu_button("Capture", |ui| {
             if ui
                 .button("Save device snapshot")
@@ -1817,6 +2266,26 @@ impl Console {
                 .clicked()
             {
                 self.exact_screenshot();
+                ui.close();
+            }
+            if ui
+                .add_enabled(agent_up, egui::Button::new("Copy region as image"))
+                .on_hover_text(
+                    "Drag a rectangle on the video; copied pixel-exact from the agent's screenshot",
+                )
+                .on_disabled_hover_text("Needs the agent connected on the target")
+                .clicked()
+            {
+                self.pick_region();
+                ui.close();
+            }
+            if ui
+                .add_enabled(agent_up, egui::Button::new("Copy screenshot as image"))
+                .on_hover_text("The main monitor, pixel-exact, from the agent")
+                .on_disabled_hover_text("Needs the agent connected on the target")
+                .clicked()
+            {
+                self.copy_screen_image([0.0, 0.0, 1.0, 1.0]);
                 ui.close();
             }
             if ui
@@ -1850,6 +2319,7 @@ impl Console {
         if self.caps.supports(Feature::Msd) {
             self.media.menu(ui);
         }
+        self.session_menu(ui);
         self.info_menu(ui);
 
         // Right: the viewer itself.
@@ -1963,6 +2433,7 @@ impl Console {
                 egui::Label::new(egui::RichText::new(msg).size(18.0).color(theme::MUTED)),
             );
         }
+        self.region_overlay(ui);
         if self.show_stats && !self.stats.shown.is_empty() {
             egui::Area::new(egui::Id::unique("stats"))
                 .anchor(egui::Align2::RIGHT_BOTTOM, [-8.0, -8.0])
@@ -2024,6 +2495,15 @@ impl Console {
                 format!("Press the ATX {} button?", b.as_str()),
                 "This acts on the target directly.".into(),
             ),
+            Confirm::Session(a) => (
+                format!("{} the target?", a.label()),
+                match a {
+                    SessionAction::Logoff => "Programs on the target are closed; unsaved work may be lost.",
+                    SessionAction::Restart => "The target restarts; unsaved work may be lost, and the agent reconnects after boot.",
+                    _ => "The target powers off; unsaved work may be lost. Turn it back on with the ATX power menu.",
+                }
+                .into(),
+            ),
             Confirm::BridgeSetup(what) => (
                 format!("{what}?"),
                 "Installs the clipboard bridge on the Comet through its web terminal and \
@@ -2084,6 +2564,7 @@ impl Console {
                 Some(Confirm::Type { text, .. }) => self.deliver_text(text),
                 Some(Confirm::BridgeSetup(_)) => self.setup.run(),
                 Some(Confirm::Video(c)) => self.apply_video(c),
+                Some(Confirm::Session(a)) => self.session_action(a),
                 Some(c) => self.atx(c),
                 None => {}
             },
