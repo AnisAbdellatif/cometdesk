@@ -63,7 +63,7 @@ impl Peer {
             .clear_codecs()
             .enable_h264(true)
             .enable_opus(true, false)
-            .set_stats_interval(None)
+            .set_stats_interval(Some(Duration::from_secs(1)))
             .build(Instant::now());
         let cand = Candidate::host(local, "udp").map_err(proto)?;
         rtc.add_local_candidate(cand);
@@ -210,6 +210,12 @@ async fn pump(neg: Negotiated, ends: &mut Ends, stats: &mut MediaStats) -> Ended
                         tracing::info!(?st, "ice state");
                     }
                     Event::Connected => tracing::info!("dtls connected"),
+                    Event::PeerStats(p) => tracing::debug!(
+                        rx = p.peer_bytes_rx, loss = ?p.ingress_loss_fraction, rtt = ?p.rtt,
+                        pair = ?p.selected_candidate_pair, "peer stats"),
+                    Event::MediaIngressStats(m) => tracing::debug!(
+                        packets = m.packets, plis = m.plis, nacks = m.nacks, loss = ?m.loss,
+                        jitter = m.jitter, "media stats"),
                     Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
                         end!("ICE disconnected")
                     }
@@ -222,6 +228,10 @@ async fn pump(neg: Negotiated, ends: &mut Ends, stats: &mut MediaStats) -> Ended
                         let now = Instant::now();
                         let key = is_keyframe(&d.data);
                         if !d.contiguous && !key {
+                            tracing::debug!(
+                                len = d.data.len(),
+                                "gap in the video stream, asking for a keyframe"
+                            );
                             waiting_for_key = true;
                             pli!();
                         }
@@ -263,6 +273,7 @@ async fn pump(neg: Negotiated, ends: &mut Ends, stats: &mut MediaStats) -> Ended
                             stats.fps = window.1 as f32 / secs;
                             stats.kbps = window.2 as f32 * 8.0 / 1000.0 / secs;
                             ends.stats.send_replace(*stats);
+                            tracing::debug!(fps = stats.fps, kbps = stats.kbps, "rtc video stats");
                             window = (now, 0, 0);
                         }
                     }
@@ -380,6 +391,10 @@ async fn pump_audio(
                 Ok(Output::Event(Event::IceConnectionStateChange(
                     IceConnectionState::Disconnected,
                 ))) => return ("ICE disconnected".into(), got_any),
+                Ok(Output::Event(Event::IceConnectionStateChange(st))) => {
+                    tracing::info!(?st, "audio ice state");
+                }
+                Ok(Output::Event(Event::Connected)) => tracing::info!("audio dtls connected"),
                 Ok(Output::Event(Event::MediaData(d))) => {
                     if !got_any {
                         got_any = true;

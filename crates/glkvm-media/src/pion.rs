@@ -3,11 +3,11 @@
 //! We are the offerer. Signaling, all JSON text frames:
 //! - client → `{"type":"config","video":true,"speaker":false,"mic":false,"hid":false,
 //!   "offerer":true,"flexfecLevel":0,"orientation":0,"camera":false}`;
-//! - client → `{"type":"offer","sdp":"…"}`, server → `{"type":"answer","sdp":"…"}`;
+//! - client → `{"type":"offer","sdp":B}`, server → `{"type":"answer","sdp":B}`, where `B` is
+//!   base64 of the JSON `{"type":"offer"|"answer","sdp":"v=0…"}` (as the web app does it);
 //! - either side → `{"type":"candidate","candidate":"candidate:…"}`.
 //!
-//! The field layout of the replies is lenient on purpose (see [`parse_signal`]); it has not
-//! been confirmed against a device yet. We offer plain RTP + NACK, no FlexFEC (str0m has
+//! The reply parser is lenient on purpose (see [`parse_signal`]). We offer plain RTP + NACK, no FlexFEC (str0m has
 //! none); whether gl-pion accepts that is what `glkvm-cli view --transport pion` shows.
 
 use std::time::Duration;
@@ -53,6 +53,23 @@ pub enum Signal {
     Other,
 }
 
+/// Wraps an SDP the way the server expects: base64 of the JSON session description.
+fn encode_sdp(kind: &str, sdp: &str) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(json!({"type": kind, "sdp": sdp}).to_string())
+}
+
+/// Inverse of [`encode_sdp`]; a value that is not base64 JSON is taken as a plain SDP.
+fn decode_sdp(value: &str) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(value.trim())
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| v["sdp"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| value.to_owned())
+}
+
 /// Classifies a signaling message. The SDP may sit at `sdp`, `data.sdp` or `answer.sdp`; a
 /// candidate is a string or an object with a `candidate` field.
 pub fn parse_signal(text: &str) -> Signal {
@@ -68,7 +85,7 @@ pub fn parse_signal(text: &str) -> Signal {
         ]
         .into_iter()
         .find_map(Value::as_str)
-        .map_or(Signal::Other, |s| Signal::Answer(s.to_owned())),
+        .map_or(Signal::Other, |s| Signal::Answer(decode_sdp(s))),
         Some("candidate") => [&v["candidate"], &v["candidate"]["candidate"], &v["data"]]
             .into_iter()
             .find_map(Value::as_str)
@@ -109,7 +126,7 @@ async fn negotiate(session: Session, kind: MediaKind) -> Result<Negotiated> {
     tracing::debug!(sdp = %offer.to_sdp_string(), "pion offer");
     sink.send(config_message(kind)).await?;
     sink.send(Message::text(
-        json!({"type": "offer", "sdp": offer.to_sdp_string()}).to_string(),
+        json!({"type": "offer", "sdp": encode_sdp("offer", &offer.to_sdp_string())}).to_string(),
     ))
     .await?;
 
@@ -148,6 +165,7 @@ async fn negotiate(session: Session, kind: MediaKind) -> Result<Negotiated> {
     let task = tokio::spawn(async move {
         let _sink = sink; // keeps the socket open
         while let Some(Ok(msg)) = stream.next().await {
+            tracing::debug!(?msg, "pion signaling (after answer)");
             if let Message::Text(text) = msg
                 && let Signal::Candidate(c) = parse_signal(&text)
                 && let Some(c) = rtc::parse_candidate(&c)
@@ -155,6 +173,7 @@ async fn negotiate(session: Session, kind: MediaKind) -> Result<Negotiated> {
                 let _ = cand_tx.send(c);
             }
         }
+        tracing::debug!("pion signaling socket closed");
     });
     Ok(Negotiated {
         peer,
@@ -176,6 +195,14 @@ mod tests {
         ] {
             assert_eq!(parse_signal(t), Signal::Answer("v=0".into()), "{t}");
         }
+    }
+
+    #[test]
+    fn sdp_travels_as_base64_json() {
+        let wire = encode_sdp("answer", "v=0\r\ns=-\r\n");
+        assert_eq!(decode_sdp(&wire), "v=0\r\ns=-\r\n");
+        let msg = json!({"type": "answer", "sdp": wire}).to_string();
+        assert_eq!(parse_signal(&msg), Signal::Answer("v=0\r\ns=-\r\n".into()));
     }
 
     #[test]

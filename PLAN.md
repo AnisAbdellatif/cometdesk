@@ -205,15 +205,18 @@ Rules for every source:
 Pion, Janus}` (CLI: `view --transport direct|pion|janus`; GUI: `GLKVM_TRANSPORT`). Pion and
 Janus share a str0m engine (`rtc.rs`): H.264 only, host candidates only (str0m has no
 STUN/TURN, so the device must be reachable over UDP: LAN or VPN), NACK/RTX but no FlexFEC,
-PLI for keyframes. The Pion and Janus handshakes follow the notes above and are covered by
-parser unit tests only; they are **not yet verified against a device** (ignored tests
-`pion_delivers_a_keyframe` / `janus_delivers_a_keyframe` in `glkvm-media/tests/device.rs`).
+PLI for keyframes. Verified against the Comet over Tailscale on 2026-10-29 (details in `docs/protocol.md`): the
+Pion and Janus handshakes work (Pion SDPs are base64 JSON), ICE/DTLS connect and video flows,
+but **plain RTP without FlexFEC is not usable on a lossy path**: gl-pion sends unpaced bursts,
+loses part of each, and never answers NACK or PLI. So the spike's answer is "accepts it, but only
+good on a clean LAN". Next for remote: a FlexFEC-03 decoder (str0m has none, so we would receive
+raw RTP ourselves), or Direct over the VPN, which works (60 fps, 1.0 s to first frame). M7 not run.
 Audio (Pion only): `pion::start_audio` opens a second, audio-only connection (`speaker: true`,
 Opus recv-only); `audio::Player` decodes with the pure-Rust `opus-decoder` (no libopus/cmake)
 and plays through `cpal` with a 40 ms prebuffer and a 150 ms latency cap. CLI: `view --transport
 pion --audio`; GUI: Video menu → "Play audio". Unit-tested for the decoder glue and buffer
-behavior; the device test `pion_delivers_audio` has **not been run** (device unreachable when
-written), nor has M7.
+behavior; on the device the audio connection reaches ICE/DTLS but no packets arrived while the
+target was presumably silent (unconfirmed with sound).
 
 ### 2.4 Decode
 

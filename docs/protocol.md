@@ -83,6 +83,30 @@ Binary message = `[event type][payload]`:
 
 - Direct mode works while the saved `video_mode` is `webrtc`. No mode switch needed.
 
+## Pion (`/pion/ws`) and Janus, measured over Tailscale (2026-10-29)
+
+Device in `video_mode = webrtc`, Mac and Comet on a tailnet (direct path, ~25 ms RTT).
+
+- **Signaling**: config `{type, video, speaker, mic, hid, offerer: true}` (+ `flexfecLevel`,
+  `orientation`, `camera` when video). SDPs, both directions, are **base64 of the JSON
+  `{"type", "sdp"}`**, not plain strings; a plain-SDP offer makes the server reset the
+  socket. Candidates are plain `candidate:` strings with `sdpMid`/`sdpMLineIndex`. The server
+  sends `server-ice-complete` and its candidates after the answer (host, srflx, relay).
+- **Answer**: H.264 PT 108 + RTX 109, NACK, PLI, FIR, transport-cc. No FlexFEC unless offered.
+- **Without FlexFEC the stream does not survive loss.** ICE and DTLS connect in ~0.3 s, the
+  first keyframe arrives ~1 s in, then ~1 s of 60 fps. The server sends large frames as
+  unpaced bursts of 3-12 packets of ~1170 bytes; on this path 3-10 packets of nearly every
+  burst are lost (peer ingress loss 20-50 %). We sent NACKs (27 in 10 s) and PLIs, and **no
+  retransmission (RTX or otherwise) ever arrived**, and PLI did not produce a keyframe within
+  5 s, so str0m's incomplete frames stall the decoder until the watchdog reconnects. Removing
+  the transport-cc extension changed nothing. Janus behaved the same (connects, intermittent
+  frames, same loss) but the connection survives longer.
+- Consequence: Pion/Janus work only on a clean link (LAN) until FlexFEC-03 is decoded or the
+  server honors NACK. Over Tailscale use Direct (TCP): 1.0 s to first keyframe, 60 fps.
+- **Audio** (`speaker: true`, video false, separate connection): negotiates Opus 48k/2
+  sendonly, ICE and DTLS connect, but no packets arrived while the target was presumably
+  silent. Not confirmed with sound playing.
+
 ## U8 (partial)
 
 - `hid.connected` was `false` while the target was off and `true` once it was on, without us
