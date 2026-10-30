@@ -26,7 +26,7 @@ use sha2::{Digest, Sha256};
 
 pub use content::{Content, ContentKey, Dedup, encode_png};
 pub use pairing::Secret;
-pub use receive::FileReceiver;
+pub use receive::{FileReceiver, create_restricted_dir_all, default_staging_dir};
 pub use send::{FileSender, Pump, expand};
 
 /// Bumped on incompatible protocol changes; both ends refuse a different major.

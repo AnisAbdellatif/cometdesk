@@ -31,9 +31,15 @@ fn secret_path() -> io::Result<PathBuf> {
     Ok(dir()?.join("pairing"))
 }
 
+pub fn staging_dir() -> PathBuf {
+    cometdesk_clip::default_staging_dir()
+}
+
 pub fn save_secret(secret: &Secret) -> io::Result<PathBuf> {
     let path = secret_path()?;
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    if let Some(parent) = path.parent() {
+        cometdesk_clip::create_restricted_dir_all(parent)?;
+    }
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -42,15 +48,42 @@ pub fn save_secret(secret: &Secret) -> io::Result<PathBuf> {
         opts.mode(0o600);
     }
     use io::Write;
-    opts.open(&path)?.write_all(secret.to_code().as_bytes())?;
+    use zeroize::Zeroize;
+    let mut code = secret.to_code();
+    let mut file = opts.open(&path)?;
+    let res = file.write_all(code.as_bytes());
+    code.zeroize();
+    res?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
     Ok(path)
 }
 
 pub fn load_secret() -> io::Result<Option<Secret>> {
-    match std::fs::read_to_string(secret_path()?) {
-        Ok(s) => Secret::from_code(s.trim())
-            .map(Some)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "corrupted pairing file")),
+    let path = secret_path()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&path) {
+            let mut perms = meta.permissions();
+            if perms.mode() & 0o077 != 0 {
+                perms.set_mode(0o600);
+                let _ = std::fs::set_permissions(&path, perms);
+            }
+        }
+    }
+    use zeroize::Zeroize;
+    match std::fs::read_to_string(&path) {
+        Ok(mut s) => {
+            let secret = Secret::from_code(s.trim());
+            s.zeroize();
+            secret
+                .map(Some)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "corrupted pairing file"))
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
@@ -101,4 +134,49 @@ pub fn host_name() -> String {
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "target".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_round_trip_and_permissions() {
+        let dir =
+            std::env::temp_dir().join(format!("cometdesk-cfg-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let secret = Secret::generate();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let secret_file = dir.join("pairing");
+            cometdesk_clip::create_restricted_dir_all(&dir).unwrap();
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            use std::io::Write;
+            use zeroize::Zeroize;
+            let mut code = secret.to_code();
+            opts.open(&secret_file)
+                .unwrap()
+                .write_all(code.as_bytes())
+                .unwrap();
+            code.zeroize();
+            let meta = std::fs::metadata(&secret_file).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+            let dir_meta = std::fs::metadata(&dir).unwrap();
+            assert_eq!(dir_meta.permissions().mode() & 0o777, 0o700);
+
+            let mut loaded = std::fs::read_to_string(&secret_file).unwrap();
+            let loaded_secret = Secret::from_code(loaded.trim()).unwrap();
+            loaded.zeroize();
+            assert_eq!(loaded_secret, secret);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

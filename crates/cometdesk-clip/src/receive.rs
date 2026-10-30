@@ -55,6 +55,7 @@ pub struct FileReceiver {
 impl FileReceiver {
     /// `staging` holds clipboard files, each in its own sub-folder so names stay as sent.
     pub fn new(staging: PathBuf) -> FileReceiver {
+        let _ = create_restricted_dir_all(&staging);
         remove_stale(&staging);
         let nonce = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -112,8 +113,25 @@ impl FileReceiver {
                 }
             }
         };
-        fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        if purpose == Purpose::Save {
+            fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        } else {
+            create_restricted_dir_all(&dir)
+                .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        }
         let part = dir.join(format!(".cometdesk-{id}-{name}.part"));
+        #[cfg(unix)]
+        let file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&part)
+                .map_err(|e| format!("cannot create the file: {e}"))?
+        };
+        #[cfg(not(unix))]
         let file = File::create(&part).map_err(|e| format!("cannot create the file: {e}"))?;
         self.open.insert(
             id,
@@ -197,6 +215,66 @@ impl FileReceiver {
         let mut seen = std::collections::HashSet::new();
         paths.retain(|p| seen.insert(p.clone()));
         Some(paths)
+    }
+}
+
+/// The default user-isolated staging directory for clipboard files and updates.
+///
+/// On Unix, prefers `$XDG_RUNTIME_DIR/cometdesk-clip` (mode 0700) or `~/.local/state/cometdesk-agent/staging` (mode 0700).
+/// On Windows, uses `%LOCALAPPDATA%\cometdesk-agent\staging`.
+pub fn default_staging_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
+            return PathBuf::from(local).join("cometdesk-agent").join("staging");
+        }
+        if let Some(user) = std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
+            return PathBuf::from(user)
+                .join("AppData")
+                .join("Local")
+                .join("cometdesk-agent")
+                .join("staging");
+        }
+        std::env::temp_dir().join("cometdesk-agent").join("staging")
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+            return PathBuf::from(runtime).join("cometdesk-clip");
+        }
+        if let Some(state) = std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
+            return PathBuf::from(state).join("cometdesk-agent").join("staging");
+        }
+        if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+            return PathBuf::from(home).join(".local/state/cometdesk-agent/staging");
+        }
+        std::env::temp_dir().join(format!("cometdesk-clip-{}", std::process::id()))
+    }
+}
+
+/// Creates `path` and all ancestor directories, ensuring that newly created
+/// directories (and `path` itself) have restricted permissions (0700 on Unix).
+pub fn create_restricted_dir_all(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        use std::os::unix::fs::PermissionsExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        builder.mode(0o700);
+        builder.create(path)?;
+        if let Ok(meta) = fs::metadata(path) {
+            let mut perms = meta.permissions();
+            if perms.mode() & 0o077 != 0 {
+                perms.set_mode(0o700);
+                let _ = fs::set_permissions(path, perms);
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)
     }
 }
 
@@ -340,5 +418,28 @@ mod tests {
         assert_eq!(unique(&dir, "a.txt"), dir.join("a (2).txt"));
         assert_eq!(unique(&dir, "b"), dir.join("b"));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_dir_and_subdirs_have_restricted_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("cometdesk-perm-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut rx = FileReceiver::new(dir.clone());
+        let meta = fs::metadata(&dir).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+
+        rx.offer(1, "test.txt", 4, Purpose::Clipboard).unwrap();
+        rx.data(1, b"test").unwrap();
+        let path = rx.end(1, true).unwrap();
+        let p = Path::new(&path);
+        let parent = p.parent().unwrap();
+        let parent_meta = fs::metadata(parent).unwrap();
+        assert_eq!(parent_meta.permissions().mode() & 0o777, 0o700);
+        let file_meta = fs::metadata(p).unwrap();
+        assert_eq!(file_meta.permissions().mode() & 0o777, 0o600);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

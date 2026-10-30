@@ -951,6 +951,7 @@ dependencies = [
  "windows",
  "windows-sys 0.61.2",
  "x11rb",
+ "zeroize",
 ]
 
 [[package]]
@@ -985,6 +986,7 @@ dependencies = [
  "sha2 0.11.1",
  "snow",
  "thiserror 2.0.21",
+ "zeroize",
 ]
 
 [[package]]

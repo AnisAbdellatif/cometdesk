@@ -51,10 +51,6 @@ const READ_SLICE: Duration = Duration::from_millis(100);
 /// Notify the user when an unplugged target drops to this percentage.
 const BATTERY_LOW: u8 = 15;
 
-/// Local port held while `run` is active, so a second instance (autostart plus a manual
-/// start) refuses to run instead of fighting over the clipboard.
-const INSTANCE_PORT: u16 = 47476;
-
 /// `--log FILE`: append log lines there instead of stderr.
 static LOG_FILE: std::sync::OnceLock<std::sync::Mutex<std::fs::File>> = std::sync::OnceLock::new();
 
@@ -184,20 +180,17 @@ fn run(relay: &str, log_file: Option<&str>) -> ExitCode {
     } else {
         1
     };
-    let listener = (0..tries).find_map(|i| {
-        if i > 0 {
-            std::thread::sleep(Duration::from_millis(200));
-        }
-        std::net::TcpListener::bind(("127.0.0.1", INSTANCE_PORT)).ok()
-    });
-    match listener.ok_or(()) {
+    match notify::bind(tries) {
         // Held for as long as the process lives, by the thread that answers `notify`.
-        Ok(l) => notify::serve(l, note_tx),
-        Err(()) => {
+        Ok(guard) => notify::serve(guard, note_tx),
+        Err(notify::BindError::AlreadyRunning) => {
             log!("another cometdesk-agent is already running for this user; exiting");
             return ExitCode::SUCCESS;
         }
-    };
+        Err(notify::BindError::Failed(e)) => {
+            return fail(&format!("cannot start instance listener: {e}"));
+        }
+    }
     let secret = match config::load_secret() {
         Ok(Some(s)) => s,
         Ok(None) => return fail("not paired: run `cometdesk-agent pair <code>` first"),
@@ -274,7 +267,7 @@ fn session(
     };
     let mut last_rx = Instant::now();
     let mut probe = info::Probe::new();
-    let mut files = FileReceiver::new(std::env::temp_dir().join("cometdesk-clip"));
+    let mut files = FileReceiver::new(config::staging_dir());
     let mut outbox = filesend::Outbox::default();
     let mut fast_read = false;
     let mut battery_low = false;
