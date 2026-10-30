@@ -8,3 +8,20 @@
 # tokenade — legacy per-project embedding model cache (now global)
 .fastembed_cache/
 .DS_Store
+
+# graphify — keep the report and graph, ignore caches, build state and dated snapshots
+graphify-out/cache/
+graphify-out/.graphify_*
+graphify-out/manifest.json
+graphify-out/20??-??-??/
+
+# tokenade — scaffold backups
+*.tokenade-original
+
+# Claude Code — local settings and worktrees
+.claude/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
