@@ -35,3 +35,5 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSString", "NSData", "NSDictionary", "NSError", "NSGeometry"] }
 objc2 = "0.6"
 objc2-vision = { version = "0.3", default-features = false, features = ["std", "VNRequest", "VNRequestHandler", "VNObservation", "VNRecognizeTextRequest", "VNTypes", "VNGeometry", "objc2-core-foundation"] }
+objc2-local-authentication = { version = "0.3", default-features = false, features = ["LAContext", "block2"] }
+block2 = { version = "0.6", default-features = false }

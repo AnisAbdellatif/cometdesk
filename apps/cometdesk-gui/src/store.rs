@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use cometdesk_view::KeyOptions;
 use serde::{Deserialize, Serialize};
@@ -256,11 +257,29 @@ fn legacy_entry(account: &str) -> keyring::Result<keyring::Entry> {
     keyring::Entry::new(LEGACY_KEYCHAIN_SERVICE, account)
 }
 
+/// How long one successful Touch ID check covers further keychain reads.
+const UNLOCK_WINDOW: Duration = Duration::from_secs(300);
+static UNLOCKED_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Touch ID (or password) before the keychain is read. A refusal is an error, never "no entry",
+/// so it can't lead to an item being overwritten.
+fn unlock() -> keyring::Result<()> {
+    let mut at = UNLOCKED_AT.lock().unwrap();
+    if at.is_some_and(|t| t.elapsed() < UNLOCK_WINDOW) {
+        return Ok(());
+    }
+    crate::touchid::authenticate("unlock your saved device passwords")
+        .map_err(|e| keyring::Error::NoStorageAccess(e.into()))?;
+    *at = Some(Instant::now());
+    Ok(())
+}
+
 fn load(device: &SavedDevice) -> keyring::Result<Credentials> {
     let account = device.keychain_account();
     if let Some(c) = CACHE.lock().unwrap().get(&account) {
         return Ok(c.clone());
     }
+    unlock()?;
     tracing::debug!(%account, "keychain read");
     let mut creds = match entry(&account)?.get_password() {
         Ok(raw) => Credentials::parse(&raw),

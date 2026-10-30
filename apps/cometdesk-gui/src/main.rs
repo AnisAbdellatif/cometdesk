@@ -14,6 +14,7 @@ mod setup;
 mod store;
 mod sysnotify;
 mod theme;
+mod touchid;
 
 use std::sync::Arc;
 
