@@ -27,6 +27,12 @@ if [ -f /etc/kvmd/override.d/90-glkvm-rs-rndis.yaml ]; then
 fi
 
 mkdir -p "$BASE/target" "$BASE/agents" "$EXTRA" /etc/cometdesk-bridge /etc/kvmd/override.d
+for u in kvmd nobody; do
+	if id -u "$u" >/dev/null 2>&1; then
+		chown -R "$u" "$BASE/agents" 2>/dev/null || true
+		break
+	fi
+done
 
 # put <src> <dest> <mode>: replace dest only if it differs
 put() {
@@ -39,8 +45,16 @@ put() {
 }
 
 put "$SRC/cometdesk_bridge.py" "$BASE/cometdesk_bridge.py" 755
-put "$SRC/install.sh" "$BASE/target/install.sh" 644
-put "$SRC/install.ps1" "$BASE/target/install.ps1" 644
+if [ -f "$SRC/target/install.sh" ]; then
+	put "$SRC/target/install.sh" "$BASE/target/install.sh" 644
+else
+	put "$SRC/install.sh" "$BASE/target/install.sh" 644
+fi
+if [ -f "$SRC/target/install.ps1" ]; then
+	put "$SRC/target/install.ps1" "$BASE/target/install.ps1" 644
+else
+	put "$SRC/install.ps1" "$BASE/target/install.ps1" 644
+fi
 for f in manifest.yaml nginx.ctx-http.conf nginx.ctx-server.conf; do
 	put "$SRC/$f" "$EXTRA/$f" 644
 done

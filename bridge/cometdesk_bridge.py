@@ -55,24 +55,41 @@ class Side:
         self.pending = bytearray()  # bytes for this side, sent while it was absent
         self.dropped = 0
         self.since: float | None = None
+        self.last_activity: float = 0.0
         self.peer = ""
         self.sessions = 0
 
+    def is_responsive(self, timeout: float = 45.0) -> bool:
+        if self.conn is None:
+            return False
+        if hasattr(self.conn, "is_closing") and self.conn.is_closing():
+            return False
+        if getattr(self.conn, "closed", False):
+            return False
+        return (time.time() - self.last_activity) < timeout
+
     def buffer(self, data: bytes) -> None:
-        if len(self.pending) + len(data) > self.max_buffer:
-            self.dropped += len(self.pending) + len(data)
-            self.pending.clear()
+        capacity = self.max_buffer - len(self.pending)
+        if capacity <= 0:
+            self.dropped += len(data)
+            log.warning("%s absent, buffer full: dropped %d bytes so far", self.name, self.dropped)
+            return
+        if len(data) > capacity:
+            self.pending += data[:capacity]
+            dropped_now = len(data) - capacity
+            self.dropped += dropped_now
             log.warning("%s absent, buffer full: dropped %d bytes so far", self.name, self.dropped)
             return
         self.pending += data
 
 
 class Bridge:
-    def __init__(self, max_buffer: int) -> None:
+    def __init__(self, max_buffer: int, idle_timeout: float = 45.0) -> None:
         self.agent = Side("agent", max_buffer)
         self.client = Side("client", max_buffer)
         self.bytes_up = 0    # agent -> client
         self.bytes_down = 0  # client -> agent
+        self.idle_timeout = idle_timeout
 
     # ----- session bookkeeping
 
@@ -98,7 +115,8 @@ class Bridge:
             side.pending.clear()
         # Otherwise `other` is waiting for its first partner and side.pending holds its
         # opening bytes (e.g. the client's handshake): keep them for this connection.
-        side.conn, side.peered, side.peer, side.since = conn, False, peer, time.time()
+        now = time.time()
+        side.conn, side.peered, side.peer, side.since, side.last_activity = conn, False, peer, now, now
         log.info("%s connected: %s", side.name, peer)
 
     def _detach(self, side: Side, other: Side, conn) -> None:
@@ -118,6 +136,8 @@ class Bridge:
         self.agent.peered = self.client.peered = True
         self.agent.sessions += 1
         self.client.sessions += 1
+        now = time.time()
+        self.agent.last_activity = self.client.last_activity = now
         log.info("paired agent %s with client %s", self.agent.peer, self.client.peer)
         flush = []
         for s in (self.agent, self.client):
@@ -127,6 +147,7 @@ class Bridge:
         return flush
 
     async def _deliver(self, dest: Side, data: bytes) -> None:
+        dest.last_activity = time.time()
         if dest.conn is None:
             dest.buffer(data)
         elif dest is self.agent:
@@ -141,6 +162,24 @@ class Bridge:
         if sock is not None:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         peer = "%s:%s" % writer.get_extra_info("peername")[:2]
+        if self.agent.conn is not None and self.agent.peered:
+            if self.agent.is_responsive(self.idle_timeout):
+                log.warning(
+                    "rejecting new agent connection from %s: active paired session with %s is responsive",
+                    peer,
+                    self.agent.peer,
+                )
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                return
+            log.info(
+                "replacing idle/unresponsive paired agent session (%s, last active %.1fs ago)",
+                self.agent.peer,
+                time.time() - self.agent.last_activity,
+            )
         self._attach(self.agent, self.client, writer, peer)
         try:
             for dest, data in self._pair_if_both():
@@ -148,6 +187,7 @@ class Bridge:
             while data := await reader.read(65536):
                 if self.agent.conn is not writer:
                     break  # replaced or reset meanwhile
+                self.agent.last_activity = time.time()
                 self.bytes_up += len(data)
                 await self._deliver(self.client, data)
         except (ConnectionError, asyncio.IncompleteReadError):
@@ -174,6 +214,7 @@ class Bridge:
                     data = msg.data.encode()
                 else:
                     break
+                self.client.last_activity = time.time()
                 self.bytes_down += len(data)
                 await self._deliver(self.agent, data)
         except ConnectionError:
@@ -289,11 +330,37 @@ async def handle_agent_upload(request: web.Request) -> web.Response:
     return web.json_response({"name": os.path.basename(path), "size": size, "sha256": digest.hexdigest()})
 
 
+def _get_agent_sha256(name: str) -> str:
+    path = _agent_path(name)
+    if not os.path.isfile(path):
+        raise web.HTTPNotFound(text="no such agent binary on the Comet; set up the bridge again")
+    st = os.stat(path)
+    cached = _digests.get(name)
+    if cached is None or cached[:2] != (st.st_mtime, st.st_size):
+        with open(path, "rb") as f:
+            cached = (st.st_mtime, st.st_size, hashlib.sha256(f.read()).hexdigest())
+        _digests[name] = cached
+    return cached[2]
+
+
 async def handle_agent_download(request: web.Request) -> web.StreamResponse:
-    path = _agent_path(request.match_info["name"])
+    name = request.match_info["name"]
+    if name.endswith(".sha256"):
+        base_name = name[:-7]
+        sha = _get_agent_sha256(base_name)
+        return web.Response(text=f"{sha}  {base_name}\n", content_type="text/plain")
+    path = _agent_path(name)
     if not os.path.isfile(path):
         raise web.HTTPNotFound(text="no such agent binary on the Comet; set up the bridge again")
     return web.FileResponse(path)
+
+
+async def handle_agent_sha256(request: web.Request) -> web.Response:
+    name = request.match_info["name"]
+    if name.endswith(".sha256"):
+        name = name[:-7]
+    sha = _get_agent_sha256(name)
+    return web.Response(text=f"{sha}  {name}\n", content_type="text/plain")
 
 
 def target_script(name: str):
@@ -320,6 +387,7 @@ async def serve_downloads(host: str, port: int) -> None:
     app = web.Application()
     app.router.add_get("/install.sh", target_script("install.sh"))
     app.router.add_get("/install.ps1", target_script("install.ps1"))
+    app.router.add_get("/agents/{name}/sha256", handle_agent_sha256)
     app.router.add_get("/agents/{name}", handle_agent_download)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
@@ -373,6 +441,45 @@ def _restrict_socket(path: str) -> None:
                 "confirm nginx can still reach it", path)
 
 
+def drop_privileges(target_user: str | None = None) -> None:
+    """Drop root privileges to an unprivileged user after binding sockets."""
+    if os.geteuid() != 0:
+        return  # already unprivileged or not running as root
+
+    candidates = [target_user] if target_user else ["kvmd", "nobody"]
+    user_entry = None
+    for name in candidates:
+        if not name:
+            continue
+        try:
+            user_entry = pwd.getpwnam(name)
+            break
+        except KeyError:
+            continue
+
+    if user_entry is None:
+        log.warning("could not find unprivileged user to drop privileges to; running as uid %d", os.geteuid())
+        return
+
+    uid = user_entry.pw_uid
+    gid = user_entry.pw_gid
+
+    for d in (AGENTS_DIR,):
+        try:
+            os.makedirs(d, exist_ok=True)
+            os.chown(d, uid, gid)
+        except OSError as ex:
+            log.warning("cannot chown %s to %s: %s", d, user_entry.pw_name, ex)
+
+    try:
+        os.initgroups(user_entry.pw_name, gid)
+        os.setgid(gid)
+        os.setuid(uid)
+        log.info("dropped root privileges to user %s (uid=%d, gid=%d)", user_entry.pw_name, uid, gid)
+    except OSError as ex:
+        log.warning("failed to drop privileges to user %s: %s", user_entry.pw_name, ex)
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--unix", default="/run/kvmd/cometdesk-bridge.sock")
@@ -380,10 +487,12 @@ async def main() -> None:
     parser.add_argument("--agent-port", type=int, default=47474)
     parser.add_argument("--download-port", type=int, default=47475)
     parser.add_argument("--max-buffer", type=int, default=256 * 1024)
+    parser.add_argument("--idle-timeout", type=float, default=45.0)
+    parser.add_argument("--user", default=None, help="unprivileged user to run as or drop privileges to")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-    bridge = Bridge(args.max_buffer)
+    bridge = Bridge(args.max_buffer, idle_timeout=args.idle_timeout)
     app = web.Application(client_max_size=MAX_AGENT_SIZE)
     app.router.add_get("/ws", bridge.handle_client)
     app.router.add_get("/status", bridge.handle_status)
@@ -394,6 +503,7 @@ async def main() -> None:
         os.unlink(args.unix)
     await web.UnixSite(runner, args.unix).start()
     _restrict_socket(args.unix)  # nginx-only: a world-writable socket bypasses kvmd login
+    drop_privileges(args.user)
     log.info("cometdesk-bridge %s: client socket %s", VERSION, args.unix)
     asyncio.ensure_future(serve_downloads(args.agent_host, args.download_port))
     await serve_agent(bridge, args.agent_host, args.agent_port)

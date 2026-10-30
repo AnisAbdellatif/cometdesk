@@ -8,6 +8,15 @@ DHCP_CONF=/etc/cometdesk-bridge/udhcpd.conf
 DHCP_PID=/run/cometdesk-bridge-udhcpd.pid
 CHAIN=cometdesk-bridge-in
 
+# Determine unprivileged user if available (kvmd or nobody)
+BRIDGE_USER=""
+for u in kvmd nobody; do
+	if id -u "$u" >/dev/null 2>&1; then
+		BRIDGE_USER="$u"
+		break
+	fi
+done
+
 # kill_udhcpd ours|others: udhcpd catches SIGTERM without exiting, so follow up with KILL.
 # (Every BusyBox tool is the same binary, so start-stop-daemon --exec can't tell them apart.)
 kill_udhcpd() {
@@ -26,15 +35,10 @@ kill_udhcpd() {
 	return 0
 }
 
-link_up() {
-	# GL's own USB network sharing adds NAT and a default route for the target: undo it.
-	# Its stop leaves its udhcpd running (advertising the Comet as router), so kill that too.
-	kvmd-rndis stop >/dev/null 2>&1
-	kill_udhcpd others
-	ifconfig usb0 192.168.5.1 netmask 255.255.255.0 up || return 1
-
+setup_firewall() {
 	# The target may reach DHCP, ping, the relay (47474) and the downloads (47475) on the Comet,
 	# nothing else (no web UI, no SSH, no forwarding).
+	# Configured reliably regardless of whether usb0 exists yet (iptables allows rules on non-existent interfaces).
 	iptables -N $CHAIN 2>/dev/null || iptables -F $CHAIN
 	iptables -A $CHAIN -m state --state ESTABLISHED,RELATED -j ACCEPT
 	iptables -A $CHAIN -p udp --dport 67 -j ACCEPT
@@ -44,11 +48,27 @@ link_up() {
 	iptables -A $CHAIN -j DROP
 	iptables -C INPUT -i usb0 -j $CHAIN 2>/dev/null || iptables -I INPUT 1 -i usb0 -j $CHAIN
 	iptables -C FORWARD -i usb0 -j DROP 2>/dev/null || iptables -I FORWARD 1 -i usb0 -j DROP
+}
+
+link_up() {
+	# GL's own USB network sharing adds NAT and a default route for the target: undo it.
+	# Its stop leaves its udhcpd running (advertising the Comet as router), so kill that too.
+	kvmd-rndis stop >/dev/null 2>&1
+	kill_udhcpd others
+
+	# Firewall setup must occur regardless of whether ifconfig usb0 succeeds immediately,
+	# so traffic forwarding is never left open if the interface appears later.
+	setup_firewall
+
+	if ! ifconfig usb0 192.168.5.1 netmask 255.255.255.0 up; then
+		return 1
+	fi
 
 	touch /tmp/cometdesk-bridge-udhcpd.leases
 	kill_udhcpd ours
 	/usr/sbin/udhcpd -f $DHCP_CONF >/dev/null 2>&1 &
 	echo $! > $DHCP_PID
+	return 0
 }
 
 link_down() {
@@ -71,8 +91,10 @@ start() {
 	else
 		link_status=DEGRADED
 	fi
+	user_opt=""
+	[ -n "$BRIDGE_USER" ] && user_opt="--user $BRIDGE_USER"
 	start-stop-daemon --start --quiet --background --make-pidfile --pidfile $PIDFILE \
-		--exec /bin/sh -- -c "exec /usr/bin/python3 $DAEMON 2>&1 | logger -t cometdesk-bridge"
+		--exec /bin/sh -- -c "exec /usr/bin/python3 $DAEMON $user_opt 2>&1 | logger -t cometdesk-bridge"
 	rc=$?
 	if [ $rc != 0 ]; then
 		echo "FAIL"
