@@ -5,9 +5,11 @@
 
 use std::fmt;
 
+use zeroize::{Zeroize, ZeroizeOnDrop};
+
 const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct Secret([u8; 32]);
 
 impl Secret {

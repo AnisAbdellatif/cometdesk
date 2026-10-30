@@ -15,3 +15,4 @@ sha2 = "0.11.1"
 # and breaks cross-compiling the agent. The pure-Rust resolver needs no std feature.
 snow = { version = "0.10.0", default-features = false, features = ["default-resolver", "default-resolver-crypto"] }
 thiserror = "2.0.21"
+zeroize = { version = "1.9.1", features = ["derive"] }
