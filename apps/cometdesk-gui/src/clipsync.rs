@@ -35,6 +35,8 @@ use crate::store::ClipDirection;
 
 const POLL: Duration = Duration::from_millis(300);
 const PING: Duration = Duration::from_secs(15);
+/// The agent answers every ping, so a session silent this long is dead (sleep, network change).
+const SILENCE_TIMEOUT: Duration = Duration::from_secs(45);
 const STATUS_EVERY: Duration = Duration::from_secs(5);
 /// Agent connected per the relay, but no answer to our handshake for this long: assume a
 /// dead connection and reset the session.
@@ -605,6 +607,7 @@ async fn run(
     let mut poll = interval(POLL);
     let mut ping = interval(PING);
     let mut status = interval(STATUS_EVERY);
+    let mut last_rx = Instant::now();
     for t in [&mut poll, &mut ping, &mut status] {
         t.set_missed_tick_behavior(MissedTickBehavior::Delay);
     }
@@ -643,7 +646,10 @@ async fn run(
             }
             msg = stream.next() => {
                 let data = match msg {
-                    Some(Ok(Message::Binary(b))) => b,
+                    Some(Ok(Message::Binary(b))) => {
+                        last_rx = Instant::now();
+                        b
+                    }
                     Some(Ok(Message::Close(_))) | None => {
                         return End::Lost("relay closed the session".into(), up)
                     }
@@ -973,6 +979,9 @@ async fn run(
                         tracing::warn!(%e, "cannot send clipboard item");
                     }
                 }
+            }
+            _ = tokio::time::sleep_until(last_rx + SILENCE_TIMEOUT), if up => {
+                return End::Lost("agent stopped answering".into(), true);
             }
             _ = ping.tick(), if up => {
                 if let Err(e) = ep.ping() {
