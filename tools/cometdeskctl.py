@@ -9,6 +9,8 @@
   cometdeskctl.py type 'hello'             # key presses on the target
   cometdeskctl.py key Enter | combo ControlLeft AltLeft Delete
   cometdeskctl.py click 0.5 0.5 [left|right]   # target position in 0..1
+  cometdeskctl.py launch [device]      # start the app (COMETDESK_CONTROL set), wait for the socket, connect
+  cometdeskctl.py wait connected|video|idle [secs]   # poll status; exit 1 on timeout
   cometdeskctl.py raw '{"cmd":"wheel","dy":-3}'
 Exit status is 1 when the app answers ok=false.
 Also usable as a module: `from cometdeskctl import Client; Client().call("status")`.
@@ -50,11 +52,58 @@ class Client:
         raise TimeoutError("condition not met")
 
 
+CONDITIONS = {
+    "connected": lambda st: st.get("screen") == "console"
+    and st["console"].get("connection") == "Connected",
+    "video": lambda st: st.get("screen") == "console" and st.get("video") is not None,
+    "idle": lambda st: st.get("screen") == "devices",
+}
+
+
+def launch(device=None, timeout=30):
+    """Starts the GUI (debug build unless COMETDESK_BIN) and returns a Client; connects to `device`."""
+    import subprocess
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.environ.get("COMETDESK_CONTROL", "")
+    path = path if path not in ("", "1") else "/tmp/cometdesk-control.sock"
+    if os.path.exists(path):
+        os.unlink(path)
+    env = {**os.environ, "COMETDESK_CONTROL": path}
+    log = open(os.environ.get("COMETDESK_LOG", "/tmp/cometdesk-gui.log"), "w")
+    subprocess.Popen([os.environ.get("COMETDESK_BIN", f"{root}/target/debug/cometdesk-gui")],
+                     env=env, stdout=log, stderr=log, start_new_session=True)
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            c = Client(path)
+            break
+        except OSError:
+            time.sleep(0.2)
+    else:
+        raise TimeoutError("control socket did not appear; see COMETDESK_LOG")
+    if device:
+        r = c.call("connect", name=device)
+        if not r.get("ok"):
+            raise RuntimeError(r)
+        c.wait(CONDITIONS["connected"], timeout)
+    return c
+
+
 def main(a):
     if not a:
         sys.exit(__doc__)
     c, rest = a[0], a[1:]
     one = lambda k: {k: rest[0]} if rest else {}
+    if c == "launch":
+        cl = launch(rest[0] if rest else None)
+        print(json.dumps(cl.call("status")))
+        return
+    if c == "wait":
+        try:
+            Client().wait(CONDITIONS[rest[0]], float(rest[1]) if len(rest) > 1 else 30)
+        except (TimeoutError, KeyError):
+            sys.exit(1)
+        return
     req = {
         "status": lambda: ("status", {}), "devices": lambda: ("devices", {}),
         "connect": lambda: ("connect", {"name": rest[0]}), "disconnect": lambda: ("disconnect", {}),

@@ -30,6 +30,10 @@ Replies are `{"ok":true,...}` or `{"ok":false,"error":"..."}`.
 | `release_all` | | |
 | `ui_click`, `ui_text` | `x`,`y` window points; `text` | drives the app's own UI |
 
+`cometdeskctl.py launch [device]` starts the app, waits for the socket and connects;
+`wait connected|video|idle [secs]` polls `status`. `tools/smoke.py` is an end-to-end check
+against a real device (connect, video, screenshots, input) that exits 1 on failure.
+
 Python: `from cometdeskctl import Client; c = Client(); c.call("click", x=.5, y=.5)`.
 
 Notes: `screenshot` needs the window visible (a hidden window never draws, so it times out).
