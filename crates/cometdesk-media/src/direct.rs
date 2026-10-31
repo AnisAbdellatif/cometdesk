@@ -23,9 +23,9 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior, sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::source::Control;
+use crate::source::{Control, FrameTracker};
 pub use crate::source::{MediaControl, MediaSession, MediaStats, SourceState};
-use crate::{Codec, EncodedFrame};
+use crate::{Codec, EncodedFrame, annexb};
 
 const OP_PING: u8 = 0;
 const OP_FRAME: u8 = 1;
@@ -171,7 +171,7 @@ async fn run(
     let (mut sink, mut stream) = ws.split();
 
     // 1. Wait for the `media` event and pick a format.
-    let (codec, profile) = timeout(MEDIA_EVENT_TIMEOUT, async {
+    let (mut codec, mut profile) = timeout(MEDIA_EVENT_TIMEOUT, async {
         while let Some(msg) = stream.next().await {
             if let Message::Text(text) = msg? {
                 let v: Value = serde_json::from_str(&text)?;
@@ -194,6 +194,8 @@ async fn run(
     tracing::info!(?codec, ?profile, "direct stream offered");
 
     sink.send(start_message(codec)).await?;
+    stats.codec = Some(codec);
+    stats_tx.send_replace(*stats);
     state_tx.send_replace(SourceState::Streaming {
         codec,
         profile: profile.clone(),
@@ -207,8 +209,7 @@ async fn run(
     let mut last_frame: Option<Instant> = None;
     let mut key_requested_for_stall = false;
     let mut waiting_for_key = false;
-    let mut window_start = Instant::now();
-    let (mut window_frames, mut window_bytes) = (0u32, 0usize);
+    let mut tracker = FrameTracker::new();
     let mut got_any = false;
 
     let ended = |got_any: bool, reason: String| {
@@ -248,9 +249,16 @@ async fn run(
                             stats.dropped_total += 1;
                             continue;
                         }
-                        stats.frames_total += 1;
-                        window_frames += 1;
-                        window_bytes += data.len();
+                        // With `video_format=1` the device still offers "h264" (profile
+                        // 42E01F) but sends H.265, so trust the parameter sets instead.
+                        if key && let Some(real) = annexb::sniff_codec(&data) && real != codec {
+                            tracing::info!(offered = ?codec, ?real, "direct stream codec differs from the offer");
+                            codec = real;
+                            profile = None;
+                            stats.codec = Some(codec);
+                            state_tx.send_replace(SourceState::Streaming { codec, profile: None });
+                        }
+                        tracker.record_frame(stats, key, data.len());
                         let frame = EncodedFrame { codec, data, keyframe: key, received_at: now.into_std() };
                         match frame_tx.try_send(frame) {
                             Ok(()) => waiting_for_key = false,
@@ -293,14 +301,9 @@ async fn run(
                     sink.send(Message::binary(vec![OP_KEY_REQUEST])).await?;
                 }
 
-                let secs = (now - window_start).as_secs_f32();
-                if secs >= 1.0 {
-                    stats.fps = window_frames as f32 / secs;
-                    stats.kbps = window_bytes as f32 * 8.0 / 1000.0 / secs;
+                if tracker.tick(stats, now.into_std()) {
+                    stats.codec = Some(codec);
                     stats_tx.send_replace(*stats);
-                    window_start = now;
-                    window_frames = 0;
-                    window_bytes = 0;
                 }
             }
         }

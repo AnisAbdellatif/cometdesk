@@ -97,6 +97,8 @@ pub enum Shortcut {
     ToggleStats,
     /// Show the toolbar (e.g. in fullscreen).
     ShowToolbar,
+    /// Open the action search.
+    Palette,
 }
 
 /// Modifier keys held on the host, tracked from raw key events.
@@ -134,6 +136,7 @@ pub fn shortcut(code: KeyCode, mods: HostModifiers, target: TargetOs) -> Option<
             KeyCode::KeyF => Some(Shortcut::ToggleFullscreen),
             KeyCode::KeyS => Some(Shortcut::ToggleStats),
             KeyCode::KeyT => Some(Shortcut::ShowToolbar),
+            KeyCode::KeyK => Some(Shortcut::Palette),
             _ => None,
         };
     }

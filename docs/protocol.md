@@ -136,6 +136,32 @@ Device in `video_mode = webrtc`, Mac and Comet on a tailnet (direct path, ~25 ms
   transport by `video_mode`: Janus in `webrtc`, Pion in `flex_fec`, in `direct_h264` the media socket has no audio, so Pion's audio-only connection is tried (untested on the device).
 - `opus-decoder` 0.1.1 can panic on some packets (`celt/vq.rs`: `1 << i` on a `u8` with more
   than 8 blocks), only with overflow checks on. The player catches it and recreates the decoder.
+- **H.265 (checked on V1.10.1, 2026-10-30)**:
+  - Direct (`/api/media/ws`): with `video_format = 1` the `media` event still offers `h264`
+    (profile `42E01F`) but the frames are H.265 (VPS/SPS/PPS/IDR = NAL types 32/33/34/19). The
+    client sniffs the codec from each keyframe's parameter sets and trusts that over the offer.
+    Works: 60 fps at 1920×1080@60. The device web app's Direct player is H.264-only and sets
+    `video_format = 0` before it starts, so opening it switches the encoder back.
+  - Pion (`/pion/ws`): gl-pion answers an H.264 payload type even when H.265 is offered first,
+    and then sends no RTP at all (only STUN/RTCP) while the encoder is on H.265. The client falls
+    back to Direct for H.265 (`Transport::for_codec`). The web app's Pion player has no codec
+    handling either.
+  - Janus (`/janus/ws`): `watch` with `video_format: 1` (as the web app sends) negotiates H.265 and
+    streams it.
+  - Idle bitrate: on a still screen H.264 sends almost nothing, but H.265 sends every frame
+    (~150 B) plus a full keyframe every `h264_gop` frames (~200 KB at 1440p). At GOP 30 / 60 fps
+    that is ~3.3 Mbit/s of keyframes; GOP 240 brings it to ~0.45 Mbit/s. A keyframe request
+    (`0x01` on Direct) is answered within ~12 frames under H.265, so a long GOP does not slow our
+    recovery. `cometdesk-cli probe --key-request-at N` measures this.
+
+## Codec (`video_format`)
+
+The Rockchip RV1126 hardware encoder on GL-RM1 supports H.264 and H.265 (HEVC), gated by `features.h265` in `GET /api/streamer`.
+- The device stores the active codec as `video_format` (0 = H.264, 1 = H.265) in both system configuration (`GET /api/system/get_config` → `video_format`) and streamer parameters (`/api/streamer` → `params.video_format`).
+- Dual persistence: changing the codec requires writing to both system configuration (`POST /api/system/set_config` with JSON `{"video_format": N}`) and streamer parameters (`POST /api/streamer/set_params?video_format=N`), restarting the encoder for a few seconds.
+- Client implementation: SDK provides `Session::set_video_format`, CLI provides `codec [h264|h265]` and `view --codec`, and GUI provides a "Codec" submenu with confirmation dialog and dynamic stream reconnect. Windowed keyframe/delta-frame size counters are tracked in `MediaStats` and reported in `--bench` and GUI stats.
+- Which transports carry H.265: see the WebRTC notes above (Direct and Janus yes, Pion no).
+
 
 ## U8 (partial)
 

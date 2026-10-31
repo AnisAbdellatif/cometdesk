@@ -71,6 +71,29 @@ impl Session {
             .and_then(VideoMode::parse))
     }
 
+    /// The saved video format (H.264 or H.265), `None` if unset or unknown.
+    pub async fn video_format(&self) -> Result<Option<VideoFormat>> {
+        let cfg = self.system_config().await?;
+        if let Some(format) = cfg.video_format.and_then(VideoFormat::from_wire) {
+            return Ok(Some(format));
+        }
+        if let Ok(st) = self.streamer_state().await
+            && let Some(format) = st.params.video_format.and_then(VideoFormat::from_wire)
+        {
+            return Ok(Some(format));
+        }
+        Ok(None)
+    }
+
+    /// Switches the hardware encoder video format. **Device-wide and persisted**
+    /// in both the system config and the streamer params.
+    pub async fn set_video_format(&self, format: VideoFormat) -> Result<()> {
+        self.set_config_field("video_format", format.wire_value().into())
+            .await?;
+        self.set_stream_param("video_format", &format.wire_value().to_string())
+            .await
+    }
+
     /// Switches the saved video mode. **Device-wide and persisted.** See
     /// [`Session::set_config_field`] for the write semantics.
     pub async fn set_video_mode(&self, mode: VideoMode) -> Result<()> {
@@ -221,6 +244,61 @@ impl LatencyMode {
     }
 }
 
+/// Hardware encoder video format (`video_format`: 0 = H.264, 1 = H.265).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoFormat {
+    H264,
+    H265,
+}
+
+impl VideoFormat {
+    pub const ALL: [VideoFormat; 2] = [VideoFormat::H264, VideoFormat::H265];
+
+    pub fn wire_value(self) -> i64 {
+        match self {
+            VideoFormat::H264 => 0,
+            VideoFormat::H265 => 1,
+        }
+    }
+
+    pub fn from_wire(v: i64) -> Option<VideoFormat> {
+        match v {
+            0 => Some(VideoFormat::H264),
+            1 => Some(VideoFormat::H265),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            VideoFormat::H264 => "h264",
+            VideoFormat::H265 => "h265",
+        }
+    }
+
+    /// Name for people (`H.264`, `H.265`).
+    pub fn label(self) -> &'static str {
+        match self {
+            VideoFormat::H264 => "H.264",
+            VideoFormat::H265 => "H.265",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<VideoFormat> {
+        match s.to_ascii_lowercase().as_str() {
+            "h264" | "h.264" | "0" => Some(VideoFormat::H264),
+            "h265" | "h.265" | "hevc" | "1" => Some(VideoFormat::H265),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for VideoFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,5 +309,33 @@ mod tests {
         let c: CapabilityResult = fixtures::load("system_capability");
         assert_eq!(c.capability["cpu_model"], "rv1126");
         assert_eq!(c.capability["usb_version"], "2");
+    }
+
+    #[test]
+    fn video_format_wire_and_parse() {
+        assert_eq!(VideoFormat::H264.wire_value(), 0);
+        assert_eq!(VideoFormat::H265.wire_value(), 1);
+
+        assert_eq!(VideoFormat::from_wire(0), Some(VideoFormat::H264));
+        assert_eq!(VideoFormat::from_wire(1), Some(VideoFormat::H265));
+        assert_eq!(VideoFormat::from_wire(2), None);
+        assert_eq!(VideoFormat::from_wire(-1), None);
+
+        assert_eq!(VideoFormat::H264.name(), "h264");
+        assert_eq!(VideoFormat::H265.name(), "h265");
+
+        assert_eq!(VideoFormat::parse("h264"), Some(VideoFormat::H264));
+        assert_eq!(VideoFormat::parse("H264"), Some(VideoFormat::H264));
+        assert_eq!(VideoFormat::parse("h.264"), Some(VideoFormat::H264));
+        assert_eq!(VideoFormat::parse("0"), Some(VideoFormat::H264));
+
+        assert_eq!(VideoFormat::parse("h265"), Some(VideoFormat::H265));
+        assert_eq!(VideoFormat::parse("H265"), Some(VideoFormat::H265));
+        assert_eq!(VideoFormat::parse("h.265"), Some(VideoFormat::H265));
+        assert_eq!(VideoFormat::parse("hevc"), Some(VideoFormat::H265));
+        assert_eq!(VideoFormat::parse("1"), Some(VideoFormat::H265));
+
+        assert_eq!(VideoFormat::parse("vp9"), None);
+        assert_eq!(VideoFormat::parse(""), None);
     }
 }

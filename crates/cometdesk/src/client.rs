@@ -114,6 +114,8 @@ pub struct SystemConfig {
     pub video_processing: Option<String>,
     pub orientation: Option<i32>,
     pub venc_mode: Option<String>,
+    /// 0 = H.264, 1 = H.265.
+    pub video_format: Option<i64>,
     pub scroll_rate: Option<u32>,
     pub reverse_scrolling: Option<String>,
     pub relative_sense: Option<u32>,

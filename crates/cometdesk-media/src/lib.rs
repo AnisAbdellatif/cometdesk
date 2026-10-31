@@ -13,7 +13,10 @@ pub mod vt;
 
 use std::time::Instant;
 
-pub use source::{SourceOptions, Transport, start};
+pub use source::{
+    FrameTracker, MediaControl, MediaSession, MediaStats, SourceOptions, SourceState, Transport,
+    start,
+};
 
 use bytes::Bytes;
 
@@ -24,11 +27,37 @@ pub enum Codec {
 }
 
 impl Codec {
+    /// Name for people (`H.264`, `H.265`).
+    pub fn label(self) -> &'static str {
+        match self {
+            Codec::H264 => "H.264",
+            Codec::H265 => "H.265",
+        }
+    }
+
     /// Format name used by the device (`h264`, `h265`).
     pub fn wire_name(self) -> &'static str {
         match self {
             Codec::H264 => "h264",
             Codec::H265 => "h265",
+        }
+    }
+}
+
+impl From<cometdesk::api::system::VideoFormat> for Codec {
+    fn from(vf: cometdesk::api::system::VideoFormat) -> Self {
+        match vf {
+            cometdesk::api::system::VideoFormat::H264 => Codec::H264,
+            cometdesk::api::system::VideoFormat::H265 => Codec::H265,
+        }
+    }
+}
+
+impl From<Codec> for cometdesk::api::system::VideoFormat {
+    fn from(c: Codec) -> Self {
+        match c {
+            Codec::H264 => cometdesk::api::system::VideoFormat::H264,
+            Codec::H265 => cometdesk::api::system::VideoFormat::H265,
         }
     }
 }

@@ -13,8 +13,10 @@ use cometdesk::api::bridge::Health;
 use cometdesk::api::capabilities::{Capabilities, Feature};
 use cometdesk::api::edid::{self, EdidPreset};
 use cometdesk::api::hid::PrintOptions;
-use cometdesk::api::streamer::{QualityPreset, SnapshotOptions, StreamerLimits, StreamerParams};
-use cometdesk::api::system::{LatencyMode, Orientation, VencMode, VideoMode};
+use cometdesk::api::streamer::{
+    QualityPreset, SnapshotOptions, StreamerLimits, StreamerParams, StreamerUpdate,
+};
+use cometdesk::api::system::{LatencyMode, Orientation, VencMode, VideoFormat, VideoMode};
 use cometdesk::events::{ConnState, DeviceState, EventOptions, EventSession, HidSender};
 use cometdesk::hid::{HidCommand, MouseButton};
 use cometdesk::{Session, SystemConfig};
@@ -102,7 +104,8 @@ enum Confirm {
 #[derive(Clone)]
 enum VideoChange {
     Mode(VideoMode),
-    Quality(QualityPreset),
+    Encoder(StreamerUpdate),
+    Codec(VideoFormat),
     Venc(VencMode),
     Latency(LatencyMode),
     Orientation(Orientation),
@@ -112,6 +115,8 @@ enum VideoChange {
 /// Device-wide video settings as last read from the device.
 #[derive(Default)]
 struct VideoInfo {
+    codec: Option<VideoFormat>,
+    h265_supported: bool,
     mode: Option<VideoMode>,
     venc: Option<VencMode>,
     latency: Option<LatencyMode>,
@@ -121,6 +126,7 @@ struct VideoInfo {
     edid_presets: Vec<EdidPreset>,
     params: StreamerParams,
     limits: StreamerLimits,
+    source_fps: Option<u32>,
 }
 
 /// Reads the device-wide video settings.
@@ -133,7 +139,12 @@ async fn read_video_info(session: &Session) -> VideoInfo {
     );
     let cfg = cfg.ok().unwrap_or_default();
     let st = st.unwrap_or_default();
+    let source_fps = st.source_fps();
+    let codec = cfg.video_format.and_then(VideoFormat::from_wire);
+    let h265_supported = st.features.h265;
     VideoInfo {
+        codec,
+        h265_supported,
         mode: cfg.video_mode.as_deref().and_then(VideoMode::parse),
         venc: cfg.venc_mode.as_deref().and_then(VencMode::parse),
         latency: cfg.video_processing.as_deref().and_then(LatencyMode::parse),
@@ -145,6 +156,7 @@ async fn read_video_info(session: &Session) -> VideoInfo {
         edid_presets: presets.unwrap_or_default(),
         params: st.params,
         limits: st.limits,
+        source_fps,
     }
 }
 
@@ -191,6 +203,12 @@ pub struct Console {
     menu_open: bool,
     /// Toolbar rectangle in points while it is shown.
     toolbar_rect: Option<egui::Rect>,
+    /// Since when the pointer rests on the top edge in fullscreen.
+    edge_since: Option<Instant>,
+    /// The open tab of the right-hand panel.
+    drawer: Option<Tab>,
+    /// The action search while open: its query.
+    palette: Option<String>,
     typing: Option<Typing>,
     /// Outcome of an insert through the agent, while one is in flight.
     inserting: Option<tokio::sync::oneshot::Receiver<InsertResult>>,
@@ -228,6 +246,8 @@ pub struct Console {
     audio_on: bool,
     video_info: VideoInfo,
     video_info_rx: Option<tokio::sync::oneshot::Receiver<VideoInfo>>,
+    /// Frame rate and bitrate (kbit/s) edited in the video menu, not applied yet.
+    encoder_draft: Option<(i64, i64, i64)>,
     /// Output device names, cached while the audio-output submenu is open (enumerating them
     /// every frame is slow); with the time they were read, for a short TTL.
     audio_outputs: Option<(Vec<String>, Instant)>,
@@ -277,6 +297,9 @@ impl Console {
             toolbar_hover: false,
             menu_open: false,
             toolbar_rect: None,
+            edge_since: None,
+            drawer: None,
+            palette: None,
             typing: None,
             inserting: None,
             confirm: None,
@@ -299,8 +322,12 @@ impl Console {
             target_changed: false,
             transport: Transport::default(),
             audio_on: false,
-            video_info: VideoInfo::default(),
+            video_info: VideoInfo {
+                codec: c.config.video_format.and_then(VideoFormat::from_wire),
+                ..VideoInfo::default()
+            },
             video_info_rx: None,
+            encoder_draft: None,
             audio_outputs: None,
             media,
             adopted_keyboard: None,
@@ -490,7 +517,7 @@ impl Console {
         if let Some(c) = tint {
             title = title.color(c);
         }
-        ui.menu_button(title, |ui| {
+        theme::section(ui, title, |ui| {
             ui.set_min_width(260.0);
             ui.label(egui::RichText::new(format!("Clipboard: {state_text}")).strong());
             // The Comet side.
@@ -695,11 +722,22 @@ impl Console {
 
     fn start_stream(&mut self) {
         let _guard = self.rt.enter();
+        let prefer = self
+            .video_info
+            .codec
+            .map(Into::into)
+            .unwrap_or(cometdesk_media::Codec::H264);
+        if self.transport.for_codec(prefer) != self.transport {
+            self.notify(
+                "WebRTC with error correction can't carry H.265; using Direct while the device is on H.265"
+                    .into(),
+            );
+        }
         let media = cometdesk_media::start(
             self.session.clone(),
             SourceOptions {
                 transport: self.transport,
-                ..Default::default()
+                prefer,
             },
         );
         let (video, media) = media.take_video();
@@ -806,7 +844,6 @@ impl Console {
     fn apply_video(&mut self, change: VideoChange) {
         let session = self.session.clone();
         let proxy = self.proxy.clone();
-        let limits = self.video_info.limits;
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.video_info_rx = Some(rx);
         self.rt.spawn(async move {
@@ -816,11 +853,16 @@ impl Console {
                     .await
                     .map(|()| format!("Video mode: {}", m.wire_name()))
                     .map_err(|e| format!("Cannot set video mode: {e}")),
-                VideoChange::Quality(p) => session
-                    .set_streamer_params(p.update(&limits))
+                VideoChange::Encoder(u) => session
+                    .set_streamer_params(u)
                     .await
                     .map(|_| "Encoder quality changed".to_string())
                     .map_err(|e| format!("Cannot set quality: {e}")),
+                VideoChange::Codec(f) => session
+                    .set_video_format(f)
+                    .await
+                    .map(|()| format!("Codec: {}", f.label()))
+                    .map_err(|e| format!("Cannot set codec: {e}")),
                 VideoChange::Venc(m) => session
                     .set_venc_mode(m)
                     .await
@@ -848,12 +890,17 @@ impl Console {
     }
 
     fn video_menu(&mut self, ui: &mut egui::Ui) {
-        ui.label("Video source (this app)");
+        ui.label(egui::RichText::new("This viewer").strong());
+        ui.label(
+            egui::RichText::new("Video source")
+                .color(theme::MUTED)
+                .small(),
+        );
         for t in Transport::ALL {
             let label = match t {
-                Transport::Direct => "Direct",
-                Transport::Pion => "WebRTC (FEC)",
-                Transport::Janus => "WebRTC (Janus)",
+                Transport::Direct => "Direct (LAN, lowest latency)",
+                Transport::Pion => "Remote (WebRTC with error correction)",
+                Transport::Janus => "Remote (WebRTC, Janus)",
             };
             if ui.radio(self.transport == t, label).clicked() {
                 self.set_transport(t);
@@ -877,7 +924,7 @@ impl Console {
         if self.audio_on {
             let devices = self.audio_outputs();
             let mut chosen = None;
-            ui.menu_button("Audio output", |ui| {
+            theme::section(ui, "Audio output", |ui| {
                 let current = &self.device.audio_output;
                 if ui.radio(current.is_empty(), "System default").clicked() {
                     chosen = Some(String::new());
@@ -896,23 +943,59 @@ impl Console {
             }
         }
         ui.separator();
-        ui.label("Device-wide (affects every viewer)");
+        ui.label(
+            egui::RichText::new("Whole device")
+                .strong()
+                .color(theme::WARN),
+        );
+        ui.label(
+            egui::RichText::new("Changes apply to every viewer, after confirming")
+                .color(theme::MUTED)
+                .small(),
+        );
         let info = &self.video_info;
         let mut change = None;
-        ui.menu_button("Video mode", |ui| {
+        theme::section(ui, "Streaming protocol", |ui| {
             for m in VideoMode::ALL {
                 let on = info.mode == Some(m);
-                if ui.radio(on, m.wire_name()).clicked() && !on {
+                if ui
+                    .radio(on, video_mode_label(m))
+                    .on_hover_text(m.wire_name())
+                    .clicked()
+                    && !on
+                {
                     change = Some(VideoChange::Mode(m));
                 }
             }
         });
-        ui.menu_button("Encoder mode", |ui| {
-            for (m, label) in [(VencMode::Smart, "Smart"), (VencMode::Normal, "Normal")] {
+        theme::section(ui, "Codec", |ui| {
+            for format in VideoFormat::ALL {
+                let on = info.codec == Some(format);
+                let supported = match format {
+                    VideoFormat::H264 => true,
+                    VideoFormat::H265 => info.h265_supported,
+                };
+                let label = format.label();
+                let radio = egui::RadioButton::new(on, label);
+                if ui
+                    .add_enabled(supported, radio)
+                    .on_disabled_hover_text("H.265 is not supported by this device")
+                    .clicked()
+                    && !on
+                {
+                    change = Some(VideoChange::Codec(format));
+                }
+            }
+        });
+        theme::section(ui, "Bandwidth saving", |ui| {
+            for (m, label) in [
+                (VencMode::Smart, "Smart (less bandwidth)"),
+                (VencMode::Normal, "Normal"),
+            ] {
                 let on = info.venc == Some(m);
                 if ui
                     .radio(on, label)
-                    .on_hover_text("Smart mode reduces bandwidth")
+                    .on_hover_text("Encoder mode: Smart reduces bandwidth")
                     .clicked()
                     && !on
                 {
@@ -920,7 +1003,7 @@ impl Console {
                 }
             }
         });
-        ui.menu_button("Latency mode", |ui| {
+        theme::section(ui, "Latency mode", |ui| {
             for (m, label) in [
                 (LatencyMode::LowestLatency, "Lowest latency"),
                 (LatencyMode::SmoothDisplay, "Smooth display"),
@@ -931,7 +1014,7 @@ impl Console {
                 }
             }
         });
-        ui.menu_button("Orientation", |ui| {
+        theme::section(ui, "Orientation", |ui| {
             for o in Orientation::ALL {
                 let on = info.orientation == o;
                 if ui.radio(on, format!("{}°", o.degrees())).clicked() && !on {
@@ -940,7 +1023,7 @@ impl Console {
             }
         });
         ui.add_enabled_ui(!info.edid_presets.is_empty(), |ui| {
-            ui.menu_button("Display (EDID)", |ui| {
+            theme::section(ui, "Display resolution", |ui| {
                 egui::ScrollArea::vertical()
                     .max_height(360.0)
                     .show(ui, |ui| {
@@ -966,25 +1049,104 @@ impl Console {
             });
         });
         ui.separator();
-        let p = &info.params;
-        ui.label(format!(
-            "Encoder: {} fps, {} kbit/s",
-            p.desired_fps.map_or("?".into(), |v| v.to_string()),
-            p.h264_bitrate.map_or("?".into(), |v| v.to_string()),
-        ));
-        for (label, preset) in [
-            ("Low", QualityPreset::Low),
-            ("Medium", QualityPreset::Medium),
-            ("High", QualityPreset::High),
-            ("Max", QualityPreset::Max),
-        ] {
-            if ui.button(label).clicked() {
-                change = Some(VideoChange::Quality(preset));
-            }
-        }
+        self.encoder_controls(ui, &mut change);
         if let Some(c) = change {
             self.confirm = Some(Confirm::Video(c));
             ui.close();
+        }
+    }
+
+    /// Frame rate and bitrate, each set on its own. Edits are kept as a draft until applied.
+    fn encoder_controls(&mut self, ui: &mut egui::Ui, change: &mut Option<VideoChange>) {
+        let info = &self.video_info;
+        let p = &info.params;
+        let (cur_fps, cur_kbps, cur_gop) = (p.desired_fps, p.h264_bitrate, p.h264_gop);
+        let (f, b, g) = (
+            info.limits.desired_fps,
+            info.limits.h264_bitrate,
+            info.limits.h264_gop,
+        );
+        let (fps_min, fps_max) = (f.min.max(1), f.max.max(f.min.max(1)));
+        let (kbps_min, kbps_max) = (b.min, b.max.max(b.min));
+        let (gop_min, gop_max) = (g.min.max(1), g.max.max(g.min.max(1)));
+        let source = info.source_fps.map_or(60, i64::from);
+        let (mut fps, mut kbps, mut gop) = self.encoder_draft.unwrap_or((
+            cur_fps.unwrap_or(30),
+            cur_kbps.unwrap_or(kbps_min),
+            cur_gop.unwrap_or(gop_min),
+        ));
+        let shown = |v: Option<i64>| v.map_or("?".into(), |v| v.to_string());
+        ui.label(format!(
+            "Encoder: {} fps, {} kbit/s, keyframe every {} frames",
+            shown(cur_fps),
+            shown(cur_kbps),
+            shown(cur_gop),
+        ));
+        ui.horizontal(|ui| {
+            ui.label("Frame rate");
+            ui.add(
+                egui::DragValue::new(&mut fps)
+                    .range(fps_min..=fps_max)
+                    .suffix(" fps"),
+            );
+            for v in [30, source] {
+                if (fps_min..=fps_max).contains(&v) && ui.small_button(v.to_string()).clicked() {
+                    fps = v;
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Bitrate");
+            ui.add(
+                egui::DragValue::new(&mut kbps)
+                    .range(kbps_min..=kbps_max)
+                    .speed(50)
+                    .suffix(" kbit/s"),
+            );
+        });
+        ui.horizontal(|ui| {
+            for p in QualityPreset::ALL {
+                let v = p.bitrate(&info.limits);
+                if ui
+                    .small_button(format!("{p:?}"))
+                    .on_hover_text(format!("{v} kbit/s"))
+                    .clicked()
+                {
+                    kbps = v;
+                }
+            }
+        });
+        // H.265 on this encoder sends every frame of a still screen and a full keyframe
+        // each interval, so the interval sets its idle bitrate (~200 KB per keyframe at
+        // 1440p). Our viewers ask for a keyframe when they need one.
+        ui.horizontal(|ui| {
+            ui.label("Keyframe every");
+            ui.add(
+                egui::DragValue::new(&mut gop)
+                    .range(gop_min..=gop_max)
+                    .suffix(" frames"),
+            )
+            .on_hover_text(format!("{:.1} s at {fps} fps", gop as f64 / fps as f64));
+            for v in [fps, gop_max] {
+                if (gop_min..=gop_max).contains(&v) && ui.small_button(v.to_string()).clicked() {
+                    gop = v;
+                }
+            }
+        });
+        let update = StreamerUpdate {
+            desired_fps: (Some(fps) != cur_fps).then_some(fps),
+            h264_bitrate: (Some(kbps) != cur_kbps).then_some(kbps),
+            h264_gop: (Some(gop) != cur_gop).then_some(gop),
+            ..Default::default()
+        };
+        let edited = update != StreamerUpdate::default();
+        self.encoder_draft = edited.then_some((fps, kbps, gop));
+        if ui
+            .add_enabled(edited, egui::Button::new("Apply…"))
+            .clicked()
+        {
+            self.encoder_draft = None;
+            *change = Some(VideoChange::Encoder(update));
         }
     }
 
@@ -1069,8 +1231,19 @@ impl Console {
                 .map(|st| *st.media.stats.borrow())
                 .unwrap_or_default();
             let replaced = self.stream.as_ref().map_or(0, |st| st.pipeline.replaced());
+            let codec_prefix = media
+                .codec
+                .map_or(String::new(), |c| format!("{} · ", c.label()));
+            let frame_sizes = if media.avg_keyframe_bytes > 0 || media.avg_delta_bytes > 0 {
+                format!(
+                    " · key {} B · delta {} B",
+                    media.avg_keyframe_bytes, media.avg_delta_bytes
+                )
+            } else {
+                String::new()
+            };
             s.shown = format!(
-                "{} fps · {:.1} Mb/s · decode {:.1} ms · net→screen {:.1} ms · dropped {} · {}",
+                "{codec_prefix}{} fps · {:.1} Mb/s{frame_sizes} · decode {:.1} ms · net→screen {:.1} ms · dropped {} · {}",
                 (n / secs).round(),
                 media.kbps / 1000.0,
                 s.decode.as_secs_f64() * 1000.0 / n,
@@ -1327,12 +1500,20 @@ impl Console {
         self.toolbar_rect.is_some_and(|r| r.contains(pos))
     }
 
+    /// Opens the action search (Right Cmd + K).
+    pub fn open_palette(&mut self) {
+        self.palette = Some(String::new());
+    }
+
     pub fn menu_open(&self) -> bool {
         self.menu_open
     }
 
     pub fn has_modal(&self) -> bool {
-        self.confirm.is_some() || self.target_setup.is_some() || self.region.is_some()
+        self.confirm.is_some()
+            || self.target_setup.is_some()
+            || self.region.is_some()
+            || self.palette.is_some()
     }
 
     pub fn send_combo(&mut self, keys: &[&'static str]) {
@@ -1703,26 +1884,16 @@ impl Console {
             (Some(u), Some((seen, at))) if seen == u => Some(u + at.elapsed().as_secs()),
             (u, _) => u,
         };
-        // The title doubles as the status strip: lock state first, then load.
+        // A fixed title: load figures live in the body so the menu does not change width.
         let (title, tint) = match info.session {
-            SessionState::Locked => ("Target: locked".to_string(), Some(theme::WARN)),
-            _ => {
-                let load = info.load.unwrap_or_default();
-                let mut parts = vec!["Target".to_string()];
-                if let Some(c) = load.cpu_percent {
-                    parts.push(format!("CPU {c}%"));
-                }
-                if let Some(m) = load.memory.filter(|m| m.total_mb > 0) {
-                    parts.push(format!("RAM {}%", m.used_mb * 100 / m.total_mb));
-                }
-                (parts.join(" · "), None)
-            }
+            SessionState::Locked => ("System info · locked".to_string(), Some(theme::WARN)),
+            _ => ("System info".to_string(), None),
         };
         let mut title = egui::RichText::new(title);
         if let Some(c) = tint {
             title = title.color(c);
         }
-        ui.menu_button(title, |ui| {
+        theme::section(ui, title, |ui| {
             let layouts: Vec<&str> = info
                 .layouts
                 .iter()
@@ -1820,7 +1991,7 @@ impl Console {
             }
             if info.layouts.len() > 1 {
                 ui.separator();
-                ui.menu_button("Switch the target's layout", |ui| {
+                theme::section(ui, "Switch the target's layout", |ui| {
                     for l in &info.layouts {
                         let label = cometdesk::layout::keymap_from_native(l).unwrap_or(l);
                         let active = info.keyboard.as_deref() == Some(l.as_str());
@@ -1840,7 +2011,7 @@ impl Console {
         if !self.inserts_via_agent() {
             return;
         }
-        ui.menu_button("Session", |ui| {
+        theme::section(ui, "Session", |ui| {
             for a in [
                 SessionAction::Lock,
                 SessionAction::Sleep,
@@ -2041,7 +2212,7 @@ impl Console {
         if d.modes.is_empty() && !can_main {
             return;
         }
-        ui.menu_button(format!("Display {}", index + 1), |ui| {
+        theme::section(ui, format!("Display {}", index + 1), |ui| {
             if !d.modes.is_empty() {
                 ui.label("Resolution");
                 egui::ScrollArea::vertical()
@@ -2173,11 +2344,12 @@ impl Console {
     // ----- ui --------------------------------------------------------------------------
 
     /// Whether the toolbar is drawn this frame (always, except in fullscreen).
-    pub fn toolbar_visible(&self, pointer: Option<egui::Pos2>) -> bool {
+    pub fn toolbar_visible(&self, edge_dwelled: bool) -> bool {
         !self.fullscreen
             || self.toolbar_hover
-            || pointer.is_some_and(|p| p.y <= 6.0)
+            || edge_dwelled
             || self.confirm.is_some()
+            || self.drawer.is_some()
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) -> ConsoleAction {
@@ -2238,9 +2410,11 @@ impl Console {
                     let rotated = info.orientation != self.video_info.orientation
                         && self.video_info.mode.is_some()
                         && self.transport != Transport::Direct;
+                    let codec_changed =
+                        info.codec != self.video_info.codec && self.video_info.mode.is_some();
                     self.video_info = info;
                     self.video_info_rx = None;
-                    if rotated {
+                    if rotated || codec_changed {
                         self.stream = None;
                         self.start_stream();
                     }
@@ -2275,7 +2449,19 @@ impl Console {
         // The popups of a menu are outside the toolbar: while one is open the pointer is
         // not over the toolbar, which must not hide it (and the menu with it).
         self.menu_open = egui::Popup::is_any_open(ui.ctx());
-        if self.menu_open || self.toolbar_visible(pointer) {
+        let at_edge = self.fullscreen && pointer.is_some_and(|p| p.y <= 6.0);
+        if !at_edge {
+            self.edge_since = None;
+        }
+        let edge_dwelled = at_edge && {
+            let since = *self.edge_since.get_or_insert_with(Instant::now);
+            let rested = since.elapsed();
+            if rested < EDGE_DWELL {
+                ui.ctx().request_repaint_after(EDGE_DWELL - rested);
+            }
+            rested >= EDGE_DWELL
+        };
+        if self.menu_open || self.toolbar_visible(edge_dwelled) {
             let frame = egui::Frame::NONE
                 .fill(theme::PANEL)
                 .stroke(egui::Stroke::new(1.0, theme::BORDER))
@@ -2289,6 +2475,19 @@ impl Console {
                 }
                 ui.horizontal_centered(|ui| action = self.toolbar(ui));
             });
+            // The signal edge: the toolbar's lower rule carries the connection state.
+            let rect = resp.response.rect;
+            let (_, signal) = self.status();
+            let signal = if signal == theme::OK {
+                signal.gamma_multiply(0.4)
+            } else {
+                signal
+            };
+            ui.painter().hline(
+                rect.x_range(),
+                rect.bottom() - 0.5,
+                egui::Stroke::new(1.5, signal),
+            );
             self.toolbar_hover = self.fullscreen && resp.response.contains_pointer();
             self.toolbar_rect = Some(resp.response.rect);
         } else {
@@ -2302,6 +2501,13 @@ impl Console {
                 self.overlays(ui);
             });
         self.video_area = central.response.rect;
+        if self.drawer_ui(ui.ctx()) {
+            self.target_changed = true;
+        }
+        let from_palette = self.palette_ui(ui.ctx());
+        if from_palette != ConsoleAction::None {
+            action = from_palette;
+        }
         self.dialogs(ui.ctx());
         self.adopt_agent_os();
         // Only clear the flag when it is actually propagated: another action this frame must
@@ -2344,16 +2550,22 @@ impl Console {
         if ui.button("‹ Devices").clicked() {
             action = ConsoleAction::Disconnect;
         }
+        theme::badge(ui, &self.device.host, self.device.display_name(), 26.0);
         ui.label(
             egui::RichText::new(self.device.display_name())
-                .size(15.0)
+                .size(17.0)
                 .strong(),
         );
         let (text, color) = self.status();
-        theme::status_pill(ui, color, &text);
+        // Fixed width: a status change must not shift the controls under the pointer.
+        ui.allocate_ui_with_layout(
+            egui::vec2(STATUS_WIDTH, ui.spacing().interact_size.y),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| theme::status_dot(ui, color, &text),
+        );
         ui.separator();
 
-        // Middle: things to do on the target.
+        // Do things on the target.
         ui.menu_button("Keys", |ui| {
             for (label, keys) in actions::COMBOS {
                 if ui.button(*label).clicked() {
@@ -2376,35 +2588,13 @@ impl Console {
             "Type the clipboard key by key: no agent connected on the target (Right Cmd + V)"
         };
         if ui
-            .add(theme::primary("Paste"))
+            .add(egui::Button::new("Paste"))
             .on_hover_text(hint)
             .clicked()
         {
             self.request_type_clipboard();
         }
-        if self.clip_menu(ui) != ConsoleAction::None {
-            action = ConsoleAction::TargetChanged;
-        }
         let agent_up = self.inserts_via_agent();
-        if agent_up
-            && ui
-                .button("Send file")
-                .on_hover_text(
-                    "Copy a file to the target's Downloads folder (or drop it on the window)",
-                )
-                .clicked()
-        {
-            self.pick_files_to_send();
-        }
-        if agent_up
-            && ui
-                .button("Files")
-                .on_hover_text("Browse the target's files and download them to this Mac")
-                .clicked()
-            && let Some(clip) = self.clip.as_ref()
-        {
-            self.browser.open(clip);
-        }
         ui.menu_button("Capture", |ui| {
             if ui
                 .button("Save device snapshot")
@@ -2471,11 +2661,6 @@ impl Console {
                 }
             });
         }
-        if self.caps.supports(Feature::Msd) {
-            self.media.menu(ui);
-        }
-        self.session_menu(ui);
-        self.info_menu(ui);
 
         // Right: the viewer itself.
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2487,22 +2672,79 @@ impl Console {
             if ui.button(icon).on_hover_text(tip).clicked() {
                 action = ConsoleAction::ToggleFullscreen;
             }
-            if self.settings_menu(ui) {
-                action = ConsoleAction::TargetChanged;
+            let panel_open = self.drawer.is_some();
+            if ui
+                .selectable_label(panel_open, "Panel")
+                .on_hover_text("Target, video and settings")
+                .clicked()
+            {
+                self.drawer = if panel_open { None } else { Some(Tab::Target) };
             }
-            ui.menu_button("Video", |ui| self.video_menu(ui));
+            if ui
+                .button("Actions")
+                .on_hover_text("Search every action (Right Cmd + K)")
+                .clicked()
+            {
+                self.palette = Some(String::new());
+            }
         });
         action
     }
 
+    /// Everything about the machine behind the KVM: clipboard sync, files, session, system
+    /// info and virtual media. True when the saved device changed.
+    fn target_panel(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        let locked = self
+            .agent()
+            .is_some_and(|(_, i)| matches!(i.session, SessionState::Locked));
+        if locked {
+            theme::banner(ui, theme::WARN, "The target is locked (lock screen).");
+        } else if self.clip.is_some() && self.bridge_action().is_some() {
+            theme::banner(
+                ui,
+                theme::WARN,
+                "Clipboard needs attention: open Clipboard below.",
+            );
+        }
+        if self.clip_menu(ui) != ConsoleAction::None {
+            changed = true;
+        }
+        if self.inserts_via_agent() {
+            if ui
+                .button("Send file…")
+                .on_hover_text(
+                    "Copy a file to the target's Downloads folder (or drop it on the window)",
+                )
+                .clicked()
+            {
+                self.pick_files_to_send();
+            }
+            if ui
+                .button("Browse files…")
+                .on_hover_text("Browse the target's files and download them to this Mac")
+                .clicked()
+                && let Some(clip) = self.clip.as_ref()
+            {
+                self.browser.open(clip);
+            }
+        }
+        self.session_menu(ui);
+        self.info_menu(ui);
+        if self.caps.supports(Feature::Msd) {
+            self.media.menu(ui);
+        }
+        changed
+    }
+
     /// Target OS, keyboard layout, stats and the device's web interface. True when the saved
     /// device changed.
-    fn settings_menu(&mut self, ui: &mut egui::Ui) -> bool {
+    fn settings_panel(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
-        ui.menu_button("Settings", |ui| {
+        {
             ui.set_min_width(200.0);
             let before = self.device.target;
-            ui.menu_button(format!("Target OS: {}", before.label()), |ui| {
+            theme::section(ui, format!("Target OS: {}", before.label()), |ui| {
                 for os in TargetOs::ALL {
                     if ui
                         .radio_value(&mut self.device.target, os, os.label())
@@ -2529,7 +2771,7 @@ impl Console {
                 })
                 .unwrap_or_default();
             let before = self.device.keymap.clone();
-            ui.menu_button(format!("Keyboard layout: {current}"), |ui| {
+            theme::section(ui, format!("Keyboard layout: {current}"), |ui| {
                 egui::ScrollArea::vertical()
                     .max_height(320.0)
                     .show(ui, |ui| {
@@ -2548,7 +2790,6 @@ impl Console {
                         }
                     });
             })
-            .response
             .on_hover_text("Keyboard layout of the target, used by Paste when typing");
             changed |= self.device.keymap != before;
 
@@ -2566,7 +2807,7 @@ impl Console {
                 }
                 ui.close();
             }
-        });
+        }
         changed
     }
 
@@ -2589,6 +2830,14 @@ impl Console {
             );
         }
         self.region_overlay(ui);
+        // Fullscreen hides the toolbar and its status: surface anything that is not OK.
+        let (text, color) = self.status();
+        if self.fullscreen && self.toolbar_rect.is_none() && color != theme::OK {
+            egui::Area::new(egui::Id::unique("fullscreen-status"))
+                .anchor(egui::Align2::CENTER_TOP, [0.0, 12.0])
+                .interactable(false)
+                .show(ui.ctx(), |ui| theme::floating_status(ui, color, &text));
+        }
         if self.show_stats && !self.stats.shown.is_empty() {
             egui::Area::new(egui::Id::unique("stats"))
                 .anchor(egui::Align2::RIGHT_BOTTOM, [-8.0, -8.0])
@@ -2634,6 +2883,233 @@ impl Console {
         }
     }
 
+    /// The right-hand panel: everything that is not one of the four everyday actions.
+    /// True when the saved device changed.
+    fn drawer_ui(&mut self, ctx: &egui::Context) -> bool {
+        let Some(tab) = self.drawer else { return false };
+        let top = self.toolbar_rect.map_or(0.0, |r| r.bottom());
+        let height = (ctx.content_rect().height() - top - 24.0).max(240.0);
+        let (mut changed, mut close, mut next) = (false, false, tab);
+        #[allow(deprecated)] // a stable id keeps the panel's scroll position
+        let panel_id = egui::Id::new("panel");
+        egui::Area::new(panel_id)
+            .anchor(egui::Align2::RIGHT_TOP, [-8.0, top + 8.0])
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(theme::PANEL)
+                    .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(egui::Margin::same(12))
+                    .show(ui, |ui| {
+                        ui.set_width(320.0);
+                        ui.set_min_height(height - 24.0);
+                        theme::set_inline_sections(ui, true);
+                        ui.horizontal(|ui| {
+                            for t in Tab::ALL {
+                                if ui.selectable_label(tab == t, t.label()).clicked() {
+                                    next = t;
+                                }
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    close = ui.add(theme::ghost("Close")).clicked();
+                                },
+                            );
+                        });
+                        ui.separator();
+                        egui::ScrollArea::vertical()
+                            .max_height(height - 64.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| match tab {
+                                Tab::Target => changed = self.target_panel(ui),
+                                Tab::Video => self.video_menu(ui),
+                                Tab::Settings => changed = self.settings_panel(ui),
+                            });
+                    });
+            });
+        self.drawer = if close { None } else { Some(next) };
+        changed
+    }
+
+    fn commands(&self) -> Vec<(String, Cmd)> {
+        let agent = self.inserts_via_agent();
+        let mut v = vec![("Paste the clipboard".to_string(), Cmd::Paste)];
+        for (label, keys) in actions::COMBOS {
+            v.push((format!("Send {label}"), Cmd::Keys(keys)));
+        }
+        if self.caps.supports(Feature::Atx) {
+            v.extend([
+                ("Power on".into(), Cmd::Power(PowerAction::On)),
+                ("Shut down".into(), Cmd::Power(PowerAction::Off)),
+                ("Force power off".into(), Cmd::Power(PowerAction::OffHard)),
+                ("Reset".into(), Cmd::Power(PowerAction::ResetHard)),
+                (
+                    "Press the power button".into(),
+                    Cmd::Click(AtxButton::Power),
+                ),
+            ]);
+        }
+        v.push(("Save device snapshot".into(), Cmd::Snapshot));
+        v.push(("Copy screen text (OCR)".into(), Cmd::Ocr));
+        if agent {
+            v.extend([
+                ("Save exact screenshot".into(), Cmd::ExactShot),
+                ("Copy region as image".into(), Cmd::CopyRegion),
+                ("Copy screenshot as image".into(), Cmd::CopyScreen),
+                ("Send file…".into(), Cmd::SendFile),
+                ("Browse the target's files…".into(), Cmd::BrowseFiles),
+            ]);
+        }
+        v.extend([
+            ("Toggle fullscreen".into(), Cmd::Fullscreen),
+            ("Toggle stats".into(), Cmd::Stats),
+            ("Open panel: Target".into(), Cmd::Panel(Tab::Target)),
+            ("Open panel: Video".into(), Cmd::Panel(Tab::Video)),
+            ("Open panel: Settings".into(), Cmd::Panel(Tab::Settings)),
+            ("Open the device web interface".into(), Cmd::WebUi),
+            ("Back to devices".into(), Cmd::Disconnect),
+        ]);
+        v
+    }
+
+    fn run_command(&mut self, cmd: Cmd) -> ConsoleAction {
+        match cmd {
+            Cmd::Paste => self.request_type_clipboard(),
+            Cmd::Keys(keys) => self.send_combo(keys),
+            Cmd::Power(a) => self.confirm = Some(Confirm::Power(a)),
+            Cmd::Click(b) => self.confirm = Some(Confirm::Click(b)),
+            Cmd::Snapshot => self.snapshot(),
+            Cmd::ExactShot => self.exact_screenshot(),
+            Cmd::CopyRegion => self.pick_region(),
+            Cmd::CopyScreen => self.copy_screen_image([0.0, 0.0, 1.0, 1.0]),
+            Cmd::Ocr => self.copy_screen_text(),
+            Cmd::Fullscreen => return ConsoleAction::ToggleFullscreen,
+            Cmd::Stats => self.show_stats = !self.show_stats,
+            Cmd::Panel(t) => self.drawer = Some(t),
+            Cmd::SendFile => self.pick_files_to_send(),
+            Cmd::BrowseFiles => {
+                if let Some(clip) = self.clip.as_ref() {
+                    self.browser.open(clip);
+                }
+            }
+            Cmd::WebUi => {
+                let url = format!("https://{}/", self.session.host());
+                if let Err(e) = open::that(&url) {
+                    self.notify(format!("Cannot open {url}: {e}"));
+                }
+            }
+            Cmd::Disconnect => return ConsoleAction::Disconnect,
+        }
+        ConsoleAction::None
+    }
+
+    /// The action search: type to filter, Up/Down to move, Enter to run, Esc to close.
+    fn palette_ui(&mut self, ctx: &egui::Context) -> ConsoleAction {
+        let Some(mut query) = self.palette.take() else {
+            return ConsoleAction::None;
+        };
+        let needle = query.to_lowercase();
+        let mut matches: Vec<(String, Cmd)> = self
+            .commands()
+            .into_iter()
+            .filter(|(l, _)| l.to_lowercase().contains(&needle))
+            .collect();
+        #[allow(deprecated)]
+        let sel_id = egui::Id::new("palette-selected");
+        let mut sel = ctx.data(|d| d.get_temp::<usize>(sel_id)).unwrap_or(0);
+        let (down, up, close) = ctx.input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::Escape),
+            )
+        });
+        let last = matches.len().saturating_sub(1);
+        if down {
+            sel = (sel + 1).min(last);
+        }
+        if up {
+            sel = sel.saturating_sub(1);
+        }
+        let before = query.clone();
+        let mut chosen = None;
+        egui::Modal::new(egui::Id::unique("actions")).show(ctx, |ui| {
+            ui.set_width(440.0);
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut query)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("Search actions…"),
+            );
+            edit.request_focus();
+            ui.add_space(4.0);
+            if matches.is_empty() {
+                ui.label(egui::RichText::new("No action matches.").color(theme::MUTED));
+            }
+            egui::ScrollArea::vertical()
+                .max_height(340.0)
+                .show(ui, |ui| {
+                    for (i, (label, cmd)) in matches.iter().enumerate() {
+                        let (rect, resp) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), 28.0),
+                            egui::Sense::click(),
+                        );
+                        let on = i == sel;
+                        if on || resp.hovered() {
+                            let fill = if on { theme::CARD_HOVER } else { theme::CARD };
+                            ui.painter()
+                                .rect_filled(rect, egui::CornerRadius::same(4), fill);
+                        }
+                        if on {
+                            ui.painter().rect_stroke(
+                                rect,
+                                egui::CornerRadius::same(4),
+                                egui::Stroke::new(1.0, theme::ACCENT),
+                                egui::StrokeKind::Inside,
+                            );
+                            resp.scroll_to_me(None);
+                        }
+                        let font = egui::TextStyle::Body.resolve(ui.style());
+                        ui.painter().text(
+                            rect.left_center() + egui::vec2(10.0, 0.0),
+                            egui::Align2::LEFT_CENTER,
+                            label,
+                            font.clone(),
+                            theme::TEXT,
+                        );
+                        ui.painter().text(
+                            rect.right_center() - egui::vec2(10.0, 0.0),
+                            egui::Align2::RIGHT_CENTER,
+                            cmd.hint(),
+                            egui::TextStyle::Small.resolve(ui.style()),
+                            theme::MUTED,
+                        );
+                        if resp.clicked() {
+                            chosen = Some(i);
+                        }
+                    }
+                });
+            if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                chosen = (!matches.is_empty()).then_some(sel.min(last));
+            }
+        });
+        if query != before {
+            sel = 0;
+        }
+        ctx.data_mut(|d| d.insert_temp(sel_id, sel));
+        if let Some(i) = chosen {
+            ctx.data_mut(|d| d.insert_temp(sel_id, 0usize));
+            let (_, cmd) = matches.swap_remove(i);
+            return self.run_command(cmd);
+        }
+        if !close {
+            self.palette = Some(query);
+        } else {
+            ctx.data_mut(|d| d.insert_temp(sel_id, 0usize));
+        }
+        ConsoleAction::None
+    }
+
     fn dialogs(&mut self, ctx: &egui::Context) {
         self.target_setup_dialog(ctx);
         let Some(confirm) = &self.confirm else { return };
@@ -2673,9 +3149,30 @@ impl Console {
                      interface. Other viewers may need to reconnect."
                         .into(),
                 ),
-                VideoChange::Quality(p) => (
-                    format!("Change the encoder quality to {p:?}?"),
+                VideoChange::Encoder(u) => (
+                    format!(
+                        "Set the encoder to {}?",
+                        [
+                            u.desired_fps.map(|v| format!("{v} fps")),
+                            u.h264_bitrate.map(|v| format!("{v} kbit/s")),
+                            u.h264_gop.map(|v| format!("a keyframe every {v} frames")),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                    ),
                     "This is saved on the device and affects every viewer's bitrate and frame rate."
+                        .into(),
+                ),
+                VideoChange::Codec(f) => (
+                    format!(
+                        "Switch the video codec to {}?",
+                        f.label()
+                    ),
+                    "This is saved on the device and affects every viewer. Switching codec restarts \
+                     the encoder for a few seconds. WebRTC with error correction can't carry H.265; \
+                     viewers on it switch to Direct."
                         .into(),
                 ),
                 VideoChange::Venc(m) => (
@@ -2726,6 +3223,78 @@ impl Console {
             Some(false) => self.confirm = None,
             None => {}
         }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Target,
+    Video,
+    Settings,
+}
+
+impl Tab {
+    const ALL: [Tab; 3] = [Tab::Target, Tab::Video, Tab::Settings];
+
+    fn label(self) -> &'static str {
+        match self {
+            Tab::Target => "Target",
+            Tab::Video => "Video",
+            Tab::Settings => "Settings",
+        }
+    }
+}
+
+/// An entry of the action search.
+enum Cmd {
+    Paste,
+    Keys(&'static [&'static str]),
+    Power(PowerAction),
+    Click(AtxButton),
+    Snapshot,
+    ExactShot,
+    CopyRegion,
+    CopyScreen,
+    Ocr,
+    Fullscreen,
+    Stats,
+    Panel(Tab),
+    SendFile,
+    BrowseFiles,
+    WebUi,
+    Disconnect,
+}
+
+impl Cmd {
+    /// Right-hand note in the action search: the shortcut, or the group it belongs to.
+    fn hint(&self) -> &'static str {
+        match self {
+            Cmd::Paste => "Right Cmd V",
+            Cmd::Fullscreen => "Right Cmd F",
+            Cmd::Stats => "Right Cmd S",
+            Cmd::Keys(_) => "Keys",
+            Cmd::Power(_) | Cmd::Click(_) => "Power",
+            Cmd::Snapshot | Cmd::ExactShot | Cmd::CopyRegion | Cmd::CopyScreen | Cmd::Ocr => {
+                "Capture"
+            }
+            Cmd::SendFile | Cmd::BrowseFiles => "Files",
+            Cmd::Panel(_) | Cmd::WebUi | Cmd::Disconnect => "Viewer",
+        }
+    }
+}
+
+/// Width reserved for the status pill in the toolbar: fits the longest status text.
+const STATUS_WIDTH: f32 = 196.0;
+
+/// How long the pointer rests on the top edge before the fullscreen toolbar appears.
+const EDGE_DWELL: std::time::Duration = std::time::Duration::from_millis(350);
+
+fn video_mode_label(m: VideoMode) -> &'static str {
+    match m {
+        VideoMode::FlexFec => "WebRTC with error correction",
+        VideoMode::Webrtc => "WebRTC",
+        VideoMode::GlWebrtc => "GL native (no Janus)",
+        VideoMode::DirectH264 => "Direct H.264",
     }
 }
 

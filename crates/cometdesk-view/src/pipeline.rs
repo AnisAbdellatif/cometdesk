@@ -55,6 +55,7 @@ impl FramePipeline {
         std::thread::Builder::new()
             .name("decode".into())
             .spawn(move || {
+                crate::set_user_interactive_qos();
                 let shared = thread_shared;
                 let control = thread_control;
                 let current = Arc::new(Mutex::new(Instant::now()));

@@ -23,7 +23,7 @@ use tokio::time::{MissedTickBehavior, interval, sleep, sleep_until};
 use crate::annexb;
 use crate::audio::AudioState;
 use crate::flexfec;
-use crate::source::{Control, Ends, MediaStats, SourceState};
+use crate::source::{Control, Ends, FrameTracker, MediaStats, SourceState};
 use crate::{Codec, EncodedFrame};
 
 /// Keyframe requests after lost packets are spaced at least this far apart.
@@ -88,7 +88,7 @@ impl Peer {
     ///
     /// `reordering`: packets the receiver holds back behind a gap before giving up on it.
     /// Each one costs 1/60 s of added delay at 60 fps when something is lost.
-    pub async fn new(host: &str, reordering: usize) -> Result<Peer> {
+    pub async fn new(host: &str, reordering: usize, prefer: Codec) -> Result<Peer> {
         let target = host_addr(host)?;
         let ip = tokio::task::spawn_blocking(move || -> std::io::Result<IpAddr> {
             let probe = StdUdp::bind(if target.is_ipv4() {
@@ -104,18 +104,24 @@ impl Peer {
         .map_err(proto)?;
         let socket = UdpSocket::bind((ip, 0)).await.map_err(proto)?;
         let local = socket.local_addr().map_err(proto)?;
-        let mut rtc = RtcConfig::new()
-            .clear_codecs()
-            .enable_h264(true)
-            .enable_opus(true, false)
-            .set_reordering_size_video(reordering)
-            .set_reordering_timeout_video(Some(REORDERING_TIMEOUT))
-            .set_stats_interval(Some(Duration::from_secs(1)))
-            .build(Instant::now());
+        let mut rtc = configure_rtc(reordering, prefer);
         let cand = Candidate::host(local, "udp").map_err(proto)?;
         rtc.add_local_candidate(cand);
         Ok(Peer { rtc, socket, local })
     }
+}
+
+pub(crate) fn configure_rtc(reordering: usize, prefer: Codec) -> Rtc {
+    let mut cfg = RtcConfig::new().clear_codecs();
+    if prefer == Codec::H265 {
+        cfg = cfg.enable_h265(true);
+    }
+    cfg.enable_h264(true)
+        .enable_opus(true, false)
+        .set_reordering_size_video(reordering)
+        .set_reordering_timeout_video(Some(REORDERING_TIMEOUT))
+        .set_stats_interval(Some(Duration::from_secs(1)))
+        .build(Instant::now())
 }
 
 fn host_addr(host: &str) -> Result<SocketAddr> {
@@ -158,8 +164,13 @@ pub(crate) fn parse_candidate(line: &str) -> Option<Candidate> {
     Candidate::from_sdp_string(&format!("candidate:{line}")).ok()
 }
 
-pub(crate) fn is_keyframe(data: &[u8]) -> bool {
-    annexb::nal_units(data).any(|n| annexb::nal_type(Codec::H264, n) == 5)
+pub(crate) fn is_keyframe(codec: Codec, data: &[u8]) -> bool {
+    annexb::nal_units(data).any(|n| {
+        matches!(
+            annexb::classify(codec, n),
+            annexb::NalKind::Slice { idr: true }
+        )
+    })
 }
 
 enum Ended {
@@ -220,7 +231,7 @@ async fn pump(neg: Negotiated, ends: &mut Ends, stats: &mut MediaStats) -> Ended
     let mut last_frame: Option<Instant> = None;
     let mut key_requested = false;
     let mut waiting_for_key = true;
-    let mut window = (Instant::now(), 0u32, 0usize);
+    let mut tracker = FrameTracker::new();
     let mut watchdog = interval(Duration::from_millis(100));
     watchdog.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut got_any = false;
@@ -312,7 +323,11 @@ async fn pump(neg: Negotiated, ends: &mut Ends, stats: &mut MediaStats) -> Ended
                     Event::MediaData(d) => {
                         mid = Some(d.mid);
                         let now = Instant::now();
-                        let key = is_keyframe(&d.data);
+                        let codec = match d.params.spec().codec {
+                            str0m::format::Codec::H265 => Codec::H265,
+                            _ => Codec::H264,
+                        };
+                        let key = is_keyframe(codec, &d.data);
                         if key {
                             tracing::debug!(
                                 since_last = ?last_key.map(|t| now.duration_since(t)),
@@ -339,8 +354,10 @@ async fn pump(neg: Negotiated, ends: &mut Ends, stats: &mut MediaStats) -> Ended
                         waiting_for_key = false;
                         if !got_any || key_requested {
                             got_any = true;
+                            stats.codec = Some(codec);
+                            ends.stats.send_replace(*stats);
                             ends.state.send_replace(SourceState::Streaming {
-                                codec: Codec::H264,
+                                codec,
                                 profile: None,
                             });
                         }
@@ -351,11 +368,9 @@ async fn pump(neg: Negotiated, ends: &mut Ends, stats: &mut MediaStats) -> Ended
                             tracing::debug!(gap = ?now.duration_since(prev), key, contiguous = d.contiguous, len = d.data.len(), "late frame");
                         }
                         last_frame = Some(now);
-                        stats.frames_total += 1;
-                        window.1 += 1;
-                        window.2 += d.data.len();
+                        tracker.record_frame(stats, key, d.data.len());
                         let frame = EncodedFrame {
-                            codec: Codec::H264,
+                            codec,
                             data: Bytes::copy_from_slice(&d.data),
                             keyframe: key,
                             received_at: now,
@@ -369,11 +384,8 @@ async fn pump(neg: Negotiated, ends: &mut Ends, stats: &mut MediaStats) -> Ended
                             }
                             Err(mpsc::error::TrySendError::Closed(_)) => end!("consumer closed"),
                         }
-                        let el = now.duration_since(window.0);
-                        if el >= Duration::from_secs(1) {
-                            let secs = el.as_secs_f32();
-                            stats.fps = window.1 as f32 / secs;
-                            stats.kbps = window.2 as f32 * 8.0 / 1000.0 / secs;
+                        if tracker.tick(stats, now) {
+                            stats.codec = Some(codec);
                             ends.stats.send_replace(*stats);
                             let f = fec.stats();
                             tracing::debug!(
@@ -384,7 +396,6 @@ async fn pump(neg: Negotiated, ends: &mut Ends, stats: &mut MediaStats) -> Ended
                                 fec_inconsistent = f.inconsistent,
                                 "rtc video stats"
                             );
-                            window = (now, 0, 0);
                         }
                     }
                     _ => {}
@@ -565,5 +576,127 @@ async fn pump_audio(
         if let Err(e) = rtc.handle_input(input) {
             return (e.to_string(), got_any);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use str0m::media::Direction;
+
+    #[test]
+    fn codec_aware_keyframe_detection() {
+        // H.264 IDR slice (type 5)
+        let h264_idr = [0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84];
+        assert!(is_keyframe(Codec::H264, &h264_idr));
+        assert!(!is_keyframe(Codec::H265, &h264_idr));
+
+        // H.264 non-IDR slice (type 1)
+        let h264_delta = [0x00, 0x00, 0x00, 0x01, 0x41, 0x9a];
+        assert!(!is_keyframe(Codec::H264, &h264_delta));
+        assert!(!is_keyframe(Codec::H265, &h264_delta));
+
+        // H.264 SPS (7) + PPS (8) without IDR
+        let h264_params = [
+            0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x00, 0x00, 0x01, 0x68, 0xce,
+        ];
+        assert!(!is_keyframe(Codec::H264, &h264_params));
+
+        // H.264 SPS + PPS + IDR
+        let h264_full_key = [
+            0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x00, 0x00, 0x01, 0x68, 0xce, 0x00, 0x00,
+            0x00, 0x01, 0x65, 0x88,
+        ];
+        assert!(is_keyframe(Codec::H264, &h264_full_key));
+
+        // H.265 IRAP NAL types 16..=21:
+        // Type 19 (IDR_W_RADL): (19 << 1) = 0x26
+        let h265_idr_19 = [0x00, 0x00, 0x00, 0x01, 0x26, 0x01];
+        assert!(is_keyframe(Codec::H265, &h265_idr_19));
+        assert!(!is_keyframe(Codec::H264, &h265_idr_19));
+
+        // Type 20 (IDR_N_LP): (20 << 1) = 0x28
+        let h265_idr_20 = [0x00, 0x00, 0x00, 0x01, 0x28, 0x01];
+        assert!(is_keyframe(Codec::H265, &h265_idr_20));
+
+        // Type 21 (CRA_NUT): (21 << 1) = 0x2A
+        let h265_cra = [0x00, 0x00, 0x00, 0x01, 0x2A, 0x01];
+        assert!(is_keyframe(Codec::H265, &h265_cra));
+
+        // Type 16 (BLA_W_LP): (16 << 1) = 0x20
+        let h265_bla = [0x00, 0x00, 0x00, 0x01, 0x20, 0x01];
+        assert!(is_keyframe(Codec::H265, &h265_bla));
+
+        // H.265 non-IRAP slice (TRAIL_R, type 1): (1 << 1) = 0x02
+        let h265_delta = [0x00, 0x00, 0x00, 0x01, 0x02, 0x01];
+        assert!(!is_keyframe(Codec::H265, &h265_delta));
+        assert!(!is_keyframe(Codec::H264, &h265_delta));
+
+        // H.265 VPS (32=0x40), SPS (33=0x42), PPS (34=0x44) without IRAP
+        let h265_params = [
+            0x00, 0x00, 0x00, 0x01, 0x40, 0x01, 0x00, 0x00, 0x00, 0x01, 0x42, 0x01, 0x00, 0x00,
+            0x00, 0x01, 0x44, 0x01,
+        ];
+        assert!(!is_keyframe(Codec::H265, &h265_params));
+
+        // H.265 VPS + SPS + PPS + IDR
+        let h265_full_key = [
+            0x00, 0x00, 0x00, 0x01, 0x40, 0x01, 0x00, 0x00, 0x00, 0x01, 0x42, 0x01, 0x00, 0x00,
+            0x00, 0x01, 0x44, 0x01, 0x00, 0x00, 0x00, 0x01, 0x26, 0x01,
+        ];
+        assert!(is_keyframe(Codec::H265, &h265_full_key));
+    }
+
+    #[test]
+    fn sdp_offer_prefers_h265_with_h264_fallback() {
+        let mut rtc = configure_rtc(REORDERING_FEC, Codec::H265);
+        let mut api = rtc.sdp_api();
+        api.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
+        let (offer, _) = api.apply().expect("sdp offer");
+        let sdp = offer.to_sdp_string();
+
+        // Must offer both H.265 and H.264
+        assert!(
+            sdp.contains("a=rtpmap:102 H265/90000"),
+            "missing H.265 rtpmap:\n{sdp}"
+        );
+        assert!(
+            sdp.contains("H264/90000"),
+            "missing H.264 rtpmap fallback:\n{sdp}"
+        );
+
+        // m=video line must place H.265 before H.264
+        let m_video = sdp
+            .lines()
+            .find(|l| l.starts_with("m=video"))
+            .expect("m=video line");
+        let pts: Vec<u8> = m_video
+            .split(' ')
+            .skip(3)
+            .filter_map(|p| p.parse().ok())
+            .collect();
+        assert!(pts.contains(&102), "m=video missing PT 102 (H.265)");
+        let pos_265 = pts.iter().position(|&p| p == 102).unwrap();
+        // Any H.264 PT should appear after H.265
+        for (pt, codec) in [(96, "96"), (98, "98")] {
+            if let Some(pos_264) = pts.iter().position(|&p| p == pt) {
+                assert!(
+                    pos_265 < pos_264,
+                    "H.265 (pos {pos_265}) must come before H.264 PT {codec} (pos {pos_264})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sdp_offer_h264_only_when_not_preferred() {
+        let mut rtc = configure_rtc(REORDERING_FEC, Codec::H264);
+        let mut api = rtc.sdp_api();
+        api.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
+        let (offer, _) = api.apply().expect("sdp offer");
+        let sdp = offer.to_sdp_string();
+
+        assert!(!sdp.contains("H265"), "should not offer H.265:\n{sdp}");
+        assert!(sdp.contains("H264/90000"), "missing H.264 rtpmap:\n{sdp}");
     }
 }

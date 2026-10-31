@@ -104,6 +104,22 @@ pub fn classify(codec: Codec, nal: &[u8]) -> NalKind {
     }
 }
 
+/// The codec an access unit is really in, judged by its first parameter set. H.264 SPS/PPS
+/// headers are never H.265 parameter sets; H.264 slices with `nal_ref_idc` 2 look like
+/// H.265 VPS/SPS/PPS by type, so H.265 also needs layer 0 and TemporalId 0 (second byte
+/// `0x01`), which parameter sets always have. `None` for frames without parameter sets.
+pub fn sniff_codec(data: &[u8]) -> Option<Codec> {
+    nal_units(data).find_map(|nal| {
+        if classify(Codec::H264, nal) == NalKind::ParamSet {
+            Some(Codec::H264)
+        } else if classify(Codec::H265, nal) == NalKind::ParamSet && nal.get(1) == Some(&0x01) {
+            Some(Codec::H265)
+        } else {
+            None
+        }
+    })
+}
+
 /// One access unit split for VideoToolbox.
 #[derive(Debug, Default)]
 pub struct Split<'a> {
@@ -233,5 +249,21 @@ mod tests {
         assert!(!s.idr);
         assert!(s.param_sets.is_empty());
         assert_eq!(s.avcc.len(), 2 * (4 + P.len()));
+    }
+
+    #[test]
+    fn sniffs_codec_from_parameter_sets() {
+        // What the device sends on a socket that offered "h264" with `video_format=1`.
+        let vps: &[u8] = &[0x40, 0x01, 0x0c];
+        let hevc_idr: &[u8] = &[0x26, 0x01, 0xaf];
+        assert_eq!(
+            sniff_codec(&annexb(&[vps, hevc_idr], true)),
+            Some(Codec::H265)
+        );
+        assert_eq!(
+            sniff_codec(&annexb(&[AUD, SPS, PPS, IDR], true)),
+            Some(Codec::H264)
+        );
+        assert_eq!(sniff_codec(&annexb(&[P], false)), None);
     }
 }

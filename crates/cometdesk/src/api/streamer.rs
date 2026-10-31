@@ -16,6 +16,13 @@ pub struct StreamerState {
     pub streamer: Option<StreamerRuntime>,
 }
 
+impl StreamerState {
+    /// Refresh rate of the HDMI input, or `None` if the streamer is idle or doesn't say.
+    pub fn source_fps(&self) -> Option<u32> {
+        self.streamer.as_ref().and_then(|rt| rt.source_fps())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct StreamerFeatures {
@@ -93,13 +100,15 @@ pub struct Hdmi {
     pub out_signal: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct Source {
     pub online: bool,
     pub captured_fps: i64,
     pub desired_fps: i64,
     pub resolution: Resolution,
+    /// Input mode as `WIDTHxHEIGHT@HZ`, e.g. `2560x1440@60`.
+    pub real_resolution: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -113,6 +122,13 @@ impl StreamerRuntime {
     /// A picture is actually being captured.
     pub fn has_signal(&self) -> bool {
         self.hdmi.signal && self.source.online
+    }
+
+    /// Refresh rate of the HDMI input (from `real_resolution`). Not `captured_fps`: that is
+    /// a measured rate that dips below the input rate and follows `desired_fps`.
+    pub fn source_fps(&self) -> Option<u32> {
+        let (_, hz) = self.source.real_resolution.rsplit_once('@')?;
+        hz.trim().parse().ok().filter(|&hz| hz > 0)
     }
 }
 
@@ -134,8 +150,8 @@ pub struct StreamerUpdate {
     pub quality: Option<i64>,
 }
 
-/// Named quality levels. They are ours, not GL's: bitrate is placed inside the device's
-/// reported `h264_bitrate` limits, so they fit any firmware.
+/// Named bitrate levels. They are ours, not GL's: the bitrate is placed inside the device's
+/// reported `h264_bitrate` limits, so they fit any firmware. The frame rate is set on its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QualityPreset {
     Low,
@@ -145,22 +161,25 @@ pub enum QualityPreset {
 }
 
 impl QualityPreset {
-    pub fn update(self, limits: &StreamerLimits) -> StreamerUpdate {
-        let (bitrate_pct, fps): (i64, i64) = match self {
-            QualityPreset::Low => (15, 30),
-            QualityPreset::Medium => (40, 30),
-            QualityPreset::High => (70, limits.desired_fps.max),
-            QualityPreset::Max => (100, limits.desired_fps.max),
+    pub const ALL: [QualityPreset; 4] = [
+        QualityPreset::Low,
+        QualityPreset::Medium,
+        QualityPreset::High,
+        QualityPreset::Max,
+    ];
+
+    /// H.264 bitrate in kbit/s for this level.
+    pub fn bitrate(self, limits: &StreamerLimits) -> i64 {
+        let pct = match self {
+            QualityPreset::Low => 15,
+            QualityPreset::Medium => 40,
+            QualityPreset::High => 70,
+            QualityPreset::Max => 100,
         };
         // The limits come from the device, so guard against an overflowing range.
         let b = limits.h264_bitrate;
         let span = b.max.saturating_sub(b.min);
-        let bitrate = b.min.saturating_add(span.saturating_mul(bitrate_pct) / 100);
-        StreamerUpdate {
-            h264_bitrate: Some(bitrate),
-            desired_fps: Some(fps),
-            ..Default::default()
-        }
+        b.min.saturating_add(span.saturating_mul(pct) / 100)
     }
 }
 
@@ -249,6 +268,7 @@ mod tests {
     fn parses_idle_streamer() {
         let s: StreamerState = fixtures::load("streamer_idle");
         assert!(s.streamer.is_none());
+        assert_eq!(s.source_fps(), None);
         assert!(s.features.h264 && s.features.h265 && !s.features.resolution);
         assert_eq!(s.limits.h264_bitrate, Range { min: 0, max: 20000 });
         assert_eq!(s.params.venc_mode.as_deref(), Some("smart"));
@@ -258,7 +278,10 @@ mod tests {
     #[test]
     fn parses_running_streamer() {
         let s: StreamerState = fixtures::load("streamer_running");
+        assert_eq!(s.source_fps(), Some(60));
         let rt = s.streamer.expect("running");
+        assert_eq!(rt.source_fps(), Some(60));
+        assert_eq!(StreamerRuntime::default().source_fps(), None);
         assert!(rt.has_signal());
         assert_eq!(rt.encoder.kind, "RV1126-H264");
         assert!(rt.h264.online && rt.h264.fps > 0);
@@ -289,20 +312,12 @@ mod quality_tests {
 
     #[test]
     fn presets_stay_inside_limits() {
-        for p in [
-            QualityPreset::Low,
-            QualityPreset::Medium,
-            QualityPreset::High,
-            QualityPreset::Max,
-        ] {
-            let u = p.update(&limits());
-            assert_eq!(u, u.clamped(&limits()), "{p:?}");
+        for p in QualityPreset::ALL {
+            let b = p.bitrate(&limits());
+            assert!((1000..=21000).contains(&b), "{p:?}: {b}");
         }
-        assert_eq!(
-            QualityPreset::Max.update(&limits()).h264_bitrate,
-            Some(21000)
-        );
-        assert_eq!(QualityPreset::Low.update(&limits()).desired_fps, Some(30));
+        assert_eq!(QualityPreset::Low.bitrate(&limits()), 4000);
+        assert_eq!(QualityPreset::Max.bitrate(&limits()), 21000);
     }
 
     #[test]

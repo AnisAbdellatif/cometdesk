@@ -173,6 +173,11 @@ impl App {
                     c.show_stats = !c.show_stats;
                 }
             }
+            Shortcut::Palette => {
+                if let Some(c) = &mut self.console {
+                    c.open_palette();
+                }
+            }
             Shortcut::ShowToolbar => {
                 if let Some(c) = &mut self.console {
                     c.fullscreen = false;

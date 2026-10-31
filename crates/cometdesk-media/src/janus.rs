@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use tokio::time::{MissedTickBehavior, interval, timeout};
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::Codec;
 use crate::audio::AudioSession;
 use crate::rtc::{self, AbortOnDrop, Negotiated, Peer, proto};
 use crate::source::MediaSession;
@@ -28,10 +29,10 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 const KEEPALIVE: Duration = Duration::from_secs(25);
 
 /// Starts the Janus source on the current tokio runtime.
-pub fn start(session: Session) -> MediaSession {
-    MediaSession::spawn(|ends| {
+pub fn start(session: Session, prefer: Codec) -> MediaSession {
+    MediaSession::spawn(move |ends| {
         rtc::supervise("janus", ends, move || {
-            negotiate(session.clone(), MediaKind::Video)
+            negotiate(session.clone(), MediaKind::Video, prefer)
         })
     })
 }
@@ -41,7 +42,7 @@ pub fn start(session: Session) -> MediaSession {
 pub fn start_audio(session: Session) -> AudioSession {
     AudioSession::spawn(|packets, state| {
         rtc::supervise_audio("janus", packets, state, move || {
-            negotiate(session.clone(), MediaKind::Audio)
+            negotiate(session.clone(), MediaKind::Audio, Codec::H264)
         })
     })
 }
@@ -133,7 +134,7 @@ async fn wait_for<T>(
     .map_err(|_| Error::Protocol(format!("janus: no {what} (is gl_webrtc enabled?)")))?
 }
 
-async fn negotiate(session: Session, kind: MediaKind) -> Result<Negotiated> {
+async fn negotiate(session: Session, kind: MediaKind, prefer: Codec) -> Result<Negotiated> {
     let video = kind == MediaKind::Video;
     let mut ws = session
         .ws_connect_protocol("janus/ws", Some(PROTOCOL))
@@ -165,11 +166,13 @@ async fn negotiate(session: Session, kind: MediaKind) -> Result<Negotiated> {
         .ok()
         .and_then(|c| c.orientation)
         .unwrap_or(0);
+    let video_format = if video && prefer == Codec::H265 { 1 } else { 0 };
     ws.send(msg(json!({
         "janus": "message", "session_id": session_id, "handle_id": handle_id,
         "transaction": tx.next(),
         "body": {"request": "watch", "params": {
             "orientation": orientation, "audio": !video, "video": video, "mic": false, "camera": false,
+            "video_format": video_format,
         }},
     })))
     .await?;
@@ -179,7 +182,7 @@ async fn negotiate(session: Session, kind: MediaKind) -> Result<Negotiated> {
     })
     .await?;
 
-    let mut peer = Peer::new(session.host(), rtc::REORDERING_PLAIN).await?;
+    let mut peer = Peer::new(session.host(), rtc::REORDERING_PLAIN, prefer).await?;
     let offer = SdpOffer::from_sdp_string(&offer).map_err(proto)?;
     let answer = peer.rtc.sdp_api().accept_offer(offer).map_err(proto)?;
     ws.send(msg(json!({

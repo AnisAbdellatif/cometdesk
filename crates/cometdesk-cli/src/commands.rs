@@ -11,7 +11,7 @@ use cometdesk::api::bridge;
 use cometdesk::api::capabilities::Feature;
 use cometdesk::api::hid::PrintOptions;
 use cometdesk::api::streamer::{QualityPreset, SnapshotOptions, StreamerUpdate};
-use cometdesk::api::system::{LatencyMode, Orientation, VencMode};
+use cometdesk::api::system::{LatencyMode, Orientation, VencMode, VideoFormat};
 use cometdesk::api::wol::Mac;
 use cometdesk::events::{ConnState, EventOptions, EventSession};
 use serde_json::{Value, json};
@@ -215,6 +215,36 @@ pub async fn latency_mode(session: &Session, mode: Option<LatencyMode>, yes: boo
     Ok(())
 }
 
+pub async fn codec(session: &Session, format: Option<VideoFormat>, yes: bool) -> Result<()> {
+    let current = session.video_format().await?;
+    let st = session.streamer_state().await.ok();
+    let h265_supported = st.as_ref().map(|s| s.features.h265).unwrap_or(false);
+    println!(
+        "codec: {} (H.265 supported: {})",
+        current.map_or("unknown", |f| f.name()),
+        if h265_supported { "yes" } else { "no" },
+    );
+    let Some(format) = format else { return Ok(()) };
+    if current == Some(format) {
+        println!("already {}", format.name());
+        return Ok(());
+    }
+    if format == VideoFormat::H265 && !h265_supported {
+        bail!("device does not support H.265 (features.h265 is false)");
+    }
+    confirm(
+        &format!(
+            "Switch the encoder codec to \"{}\"? This is device-wide and persisted: \
+             other viewers are affected and the encoder restarts.",
+            format.name(),
+        ),
+        yes,
+    )?;
+    session.set_video_format(format).await?;
+    println!("codec: {} (confirmed)", format.name());
+    Ok(())
+}
+
 pub async fn orientation(session: &Session, o: Option<Orientation>, yes: bool) -> Result<()> {
     let current = session.system_config().await?.orientation;
     println!(
@@ -304,7 +334,10 @@ pub async fn quality(
         );
     };
     show(&st);
-    let mut update = preset.map(|p| p.update(&st.limits)).unwrap_or_default();
+    let mut update = StreamerUpdate {
+        h264_bitrate: preset.map(|p| p.bitrate(&st.limits)),
+        ..Default::default()
+    };
     for (dst, src) in [
         (&mut update.desired_fps, manual.desired_fps),
         (&mut update.h264_bitrate, manual.h264_bitrate),

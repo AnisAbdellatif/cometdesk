@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::Codec;
 use crate::audio::AudioSession;
 use crate::rtc::{self, AbortOnDrop, Negotiated, Peer, proto};
 use crate::source::MediaSession;
@@ -29,10 +30,10 @@ use crate::source::MediaSession;
 const SIGNALING_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Starts the Pion source on the current tokio runtime.
-pub fn start(session: Session) -> MediaSession {
-    MediaSession::spawn(|ends| {
+pub fn start(session: Session, prefer: Codec) -> MediaSession {
+    MediaSession::spawn(move |ends| {
         rtc::supervise("pion", ends, move || {
-            negotiate(session.clone(), MediaKind::Video)
+            negotiate(session.clone(), MediaKind::Video, prefer)
         })
     })
 }
@@ -42,7 +43,7 @@ pub fn start(session: Session) -> MediaSession {
 pub fn start_audio(session: Session) -> AudioSession {
     AudioSession::spawn(|packets, state| {
         rtc::supervise_audio("pion", packets, state, move || {
-            negotiate(session.clone(), MediaKind::Audio)
+            negotiate(session.clone(), MediaKind::Audio, Codec::H264)
         })
     })
 }
@@ -152,7 +153,7 @@ fn add_flexfec(sdp: &str) -> Option<(String, u8)> {
     Some((lines.join("\r\n") + "\r\n", pt))
 }
 
-async fn negotiate(session: Session, kind: MediaKind) -> Result<Negotiated> {
+async fn negotiate(session: Session, kind: MediaKind, prefer: Codec) -> Result<Negotiated> {
     let ws = session.ws_connect("pion/ws").await?;
     let (mut sink, mut stream) = ws.split();
     let mut peer = Peer::new(
@@ -162,6 +163,7 @@ async fn negotiate(session: Session, kind: MediaKind) -> Result<Negotiated> {
         } else {
             rtc::REORDERING_PLAIN
         },
+        prefer,
     )
     .await?;
 
@@ -295,5 +297,34 @@ mod tests {
     fn ignores_noise() {
         assert_eq!(parse_signal("not json"), Signal::Other);
         assert_eq!(parse_signal(r#"{"type":"pong"}"#), Signal::Other);
+    }
+
+    #[test]
+    fn flexfec_munging_with_h265_offer() {
+        let sdp = "\
+v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 102 103 96 97\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtpmap:102 H265/90000\r\n\
+a=rtpmap:103 rtx/90000\r\n\
+a=rtpmap:96 H264/90000\r\n\
+a=rtpmap:97 rtx/90000\r\n";
+        let (munged, pt) = add_flexfec(sdp).expect("flexfec munging");
+        assert!(![102, 103, 96, 97].contains(&pt), "pt {pt} collision");
+        assert!(
+            munged.contains(&format!("m=video 9 UDP/TLS/RTP/SAVPF 102 103 96 97 {pt}")),
+            "m-line missing pt:\n{munged}"
+        );
+        assert!(
+            munged.contains(&format!("a=rtpmap:{pt} flexfec-03/90000")),
+            "missing rtpmap:\n{munged}"
+        );
+        assert!(
+            munged.contains(&format!("a=fmtp:{pt} repair-window=10000000")),
+            "missing fmtp:\n{munged}"
+        );
     }
 }

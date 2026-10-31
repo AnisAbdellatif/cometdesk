@@ -430,7 +430,7 @@ Each item lists what triggers it. Nothing here is planned until it's pulled.
 | Relative mouse + pointer lock | Depends on U6; needed for games or some BIOSes |
 | Local cursor overlay | Pointer lag noticeable |
 | Microphone, camera passthrough | Concrete use case |
-| H.265 | Only if U5 says Direct or Pion can carry it |
+| H.265 | In progress: codec switching (SDK, CLI, GUI) and frame stats implemented; WebRTC transports concurrently in development; Direct H.265 support unverified on device (U5). |
 | mDNS discovery (`mdns-sd`) | More than a couple of devices |
 | Multiple devices / screen wall | More than one device in daily use |
 | Settings screens (MSD, EDID, HID settings, users/2FA, upgrade, network, VPN, switch/GPIO) | One at a time, only when the web UI becomes the bottleneck for that task |

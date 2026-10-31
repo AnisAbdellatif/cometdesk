@@ -34,6 +34,7 @@ fn main() -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_name("cometdesk-io")
+        .on_thread_start(cometdesk_view::set_user_interactive_qos)
         .enable_all()
         .build()?;
     let pins = Arc::new(PinStore::load_default()?);

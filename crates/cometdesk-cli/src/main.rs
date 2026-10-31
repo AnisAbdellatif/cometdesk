@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use cometdesk::api::atx::{AtxButton, PowerAction};
 use cometdesk::api::streamer::{QualityPreset, StreamerUpdate};
-use cometdesk::api::system::{LatencyMode, Orientation, VencMode, VideoMode};
+use cometdesk::api::system::{LatencyMode, Orientation, VencMode, VideoFormat, VideoMode};
 use cometdesk::events::{EventOptions, EventSession};
 use cometdesk::tls::PinStore;
 use cometdesk::{Credentials, Session};
@@ -56,9 +56,9 @@ enum Cmd {
         /// Wheel units per scroll step. Defaults to the device's `scroll_rate`.
         #[arg(long)]
         scroll_rate: Option<u32>,
-        /// Preferred codec when the device offers both.
-        #[arg(long, value_enum, default_value_t = CodecArg::H264)]
-        codec: CodecArg,
+        /// Preferred codec when the device offers both (defaults to device's video_format).
+        #[arg(long, value_enum)]
+        codec: Option<CodecArg>,
         /// How video reaches us: direct (`/api/media/ws`), pion (WebRTC FEC), janus (WebRTC).
         #[arg(long, value_enum, default_value_t = TransportArg::Direct)]
         transport: TransportArg,
@@ -76,6 +76,9 @@ enum Cmd {
     Probe {
         #[arg(long, default_value_t = 10)]
         frames: usize,
+        /// Ask for a keyframe after this many frames, to see how fast the encoder answers.
+        #[arg(long, value_name = "FRAME")]
+        key_request_at: Option<usize>,
     },
     /// Model, firmware, features and target status.
     Info,
@@ -106,6 +109,14 @@ enum Cmd {
     VideoMode {
         #[arg(value_enum)]
         mode: Option<VideoModeArg>,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Show the encoder codec, or change it (device-wide, asks for confirmation).
+    Codec {
+        /// Named format: h264 or h265.
+        #[arg(value_enum)]
+        format: Option<CodecArg>,
         #[arg(long)]
         yes: bool,
     },
@@ -141,7 +152,7 @@ enum Cmd {
     },
     /// Show or change encoder quality (device-wide, asks for confirmation).
     Quality {
-        /// Named level; sets bitrate (inside the device limits) and fps.
+        /// Named bitrate level (inside the device limits). The frame rate is `--fps`.
         #[arg(value_enum)]
         preset: Option<PresetArg>,
         /// Frames per second.
@@ -351,6 +362,7 @@ fn main() -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_name("cometdesk-io")
+        .on_thread_start(cometdesk_view::set_user_interactive_qos)
         .enable_all()
         .build()?;
     let pins = Arc::new(PinStore::load_default()?);
@@ -383,7 +395,10 @@ fn main() -> Result<()> {
                 bench.map(Duration::from_secs),
             )
         }
-        Cmd::Probe { frames } => rt.block_on(probe(session, frames)),
+        Cmd::Probe {
+            frames,
+            key_request_at,
+        } => rt.block_on(probe(session, frames, key_request_at)),
         cmd => rt.block_on(async {
             let result = one_shot(&session, cmd).await;
             let _ = session.logout().await;
@@ -450,6 +465,13 @@ async fn one_shot(session: &Session, cmd: Cmd) -> Result<()> {
             };
             commands::quality(session, preset, manual, yes).await
         }
+        Cmd::Codec { format, yes } => {
+            let format = format.map(|f| match f {
+                CodecArg::H264 => VideoFormat::H264,
+                CodecArg::H265 => VideoFormat::H265,
+            });
+            commands::codec(session, format, yes).await
+        }
         Cmd::VencMode { mode, yes } => {
             let mode = mode.map(|m| match m {
                 VencModeArg::Smart => VencMode::Smart,
@@ -509,7 +531,7 @@ fn view(
     rt: &tokio::runtime::Runtime,
     session: Session,
     (swap_cmd_ctrl, iso_fix, scroll_rate): (bool, Toggle, Option<u32>),
-    (codec, transport, audio): (CodecArg, TransportArg, bool),
+    (codec, transport, audio): (Option<CodecArg>, TransportArg, bool),
     render: RenderPath,
     bench: Option<Duration>,
 ) -> Result<()> {
@@ -551,8 +573,12 @@ fn view(
     // Streaming on: the device only runs its video streamer while such a session exists.
     let events = EventSession::spawn(session.clone(), EventOptions::default());
     let prefer = match codec {
-        CodecArg::H264 => Codec::H264,
-        CodecArg::H265 => Codec::H265,
+        Some(CodecArg::H264) => Codec::H264,
+        Some(CodecArg::H265) => Codec::H265,
+        None => match config.video_format {
+            Some(1) => Codec::H265,
+            _ => Codec::H264,
+        },
     };
     let transport = match transport {
         TransportArg::Direct => Transport::Direct,
@@ -597,7 +623,7 @@ fn view(
     result
 }
 
-async fn probe(session: Session, frames: usize) -> Result<()> {
+async fn probe(session: Session, frames: usize, key_request_at: Option<usize>) -> Result<()> {
     use cometdesk_media::annexb::{nal_type, nal_units};
 
     let config = session.system_config().await?;
@@ -651,6 +677,10 @@ async fn probe(session: Session, frames: usize) -> Result<()> {
             f.data.starts_with(&[0, 0, 0, 1]) || f.data.starts_with(&[0, 0, 1]),
             gap,
         );
+        if key_request_at == Some(i) {
+            println!("requesting a keyframe");
+            media.control.request_keyframe();
+        }
     }
     println!("media state: {:?}", *media.state.borrow());
     let streamer = session.streamer_state().await?;

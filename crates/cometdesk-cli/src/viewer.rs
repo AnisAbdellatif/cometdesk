@@ -136,7 +136,7 @@ const BENCH_WARMUP: Duration = Duration::from_secs(3);
 struct Bench {
     duration: Duration,
     first_frame: Option<Instant>,
-    start: Option<(Instant, Duration)>,
+    start: Option<(Instant, Duration, MediaStats)>,
     frames: u32,
     frame_work: Duration,
     net_to_screen: Duration,
@@ -163,12 +163,20 @@ impl Bench {
     }
 
     /// Records one presented frame. Returns the report when the window is over.
-    fn frame(&mut self, now: Instant, work: Duration, net_to_screen: Duration) -> Option<String> {
+    fn frame(
+        &mut self,
+        now: Instant,
+        work: Duration,
+        net_to_screen: Duration,
+        media: &MediaStats,
+    ) -> Option<String> {
         let first = *self.first_frame.get_or_insert(now);
         if now - first < BENCH_WARMUP {
             return None;
         }
-        let (start, cpu0) = *self.start.get_or_insert_with(|| (now, process_cpu_time()));
+        let (start, cpu0, start_media) = *self
+            .start
+            .get_or_insert_with(|| (now, process_cpu_time(), *media));
         self.frames += 1;
         self.frame_work += work;
         self.net_to_screen += net_to_screen;
@@ -178,8 +186,16 @@ impl Bench {
         }
         let cpu = process_cpu_time() - cpu0;
         let n = f64::from(self.frames.max(1));
+        let codec = media.codec.map_or("unknown", cometdesk_media::Codec::label);
+        let keys = media.keyframes_total - start_media.keyframes_total;
+        let key_bytes = media.keyframe_bytes_total - start_media.keyframe_bytes_total;
+        let deltas = media.delta_frames_total - start_media.delta_frames_total;
+        let delta_bytes = media.delta_bytes_total - start_media.delta_bytes_total;
+        let avg_key = key_bytes.checked_div(keys).unwrap_or(0);
+        let avg_delta = delta_bytes.checked_div(deltas).unwrap_or(0);
+        let kbps = (key_bytes + delta_bytes) as f64 * 8.0 / 1000.0 / wall.as_secs_f64();
         Some(format!(
-            "frames={} fps={:.1} cpu={:.1}% of one core ({:.2} ms CPU/frame) \
+            "codec={codec} kbps={kbps:.0} keyframes={keys} avg_keyframe={avg_key}B avg_delta={avg_delta}B frames={} fps={:.1} cpu={:.1}% of one core ({:.2} ms CPU/frame) \
              main-thread work/frame={:.3} ms net->screen={:.2} ms",
             self.frames,
             n / wall.as_secs_f64(),
@@ -228,10 +244,14 @@ impl App {
         self.draw();
 
         let now = Instant::now();
-        let report = self
-            .bench
-            .as_mut()
-            .and_then(|b| b.frame(now, now - work_start, now - decoded.received_at));
+        let report = self.bench.as_mut().and_then(|b| {
+            b.frame(
+                now,
+                now - work_start,
+                now - decoded.received_at,
+                &self.media_stats.borrow(),
+            )
+        });
         self.stats.frames += 1;
         self.stats.net_to_screen += now - decoded.received_at;
         self.stats.decode += decoded.decoded_at - decoded.received_at;
@@ -246,8 +266,19 @@ impl App {
         let secs = (now - s.window_start).as_secs_f64();
         let n = s.frames.max(1);
         let media = *self.media_stats.borrow();
+        let codec_prefix = media
+            .codec
+            .map_or(String::new(), |c| format!("{} · ", c.label()));
+        let frame_sizes = if media.avg_keyframe_bytes > 0 || media.avg_delta_bytes > 0 {
+            format!(
+                " · key {} B · delta {} B",
+                media.avg_keyframe_bytes, media.avg_delta_bytes
+            )
+        } else {
+            String::new()
+        };
         let title = format!(
-            "{} — {}×{} · {:.0} fps · {:.1} Mb/s · net→screen {:.1} ms · decode {:.1} ms · dropped {}",
+            "{} — {codec_prefix}{}×{} · {:.0} fps · {:.1} Mb/s{frame_sizes} · net→screen {:.1} ms · decode {:.1} ms · dropped {}",
             self.title,
             video.0,
             video.1,
