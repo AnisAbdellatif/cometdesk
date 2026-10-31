@@ -1,5 +1,9 @@
 //! Start screen: saved devices, add/edit form, password and 2FA prompts.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
 use tokio::runtime::Handle;
 use winit::event_loop::EventLoopProxy;
 
@@ -68,9 +72,57 @@ pub struct DevicesUi {
     /// A keychain password read is in flight for this device (connect is waiting on it).
     looking_up: Option<SavedDevice>,
     logo: Option<egui::TextureHandle>,
+    /// Reachability of each saved host: when it was probed, and the answer (`None` while
+    /// the probe runs).
+    probes: Probes,
+    /// Index of the device whose removal waits for confirmation.
+    confirm_remove: Option<usize>,
+}
+
+type Probes = Arc<Mutex<HashMap<String, (Instant, Option<bool>)>>>;
+
+const PROBE_TTL: Duration = Duration::from_secs(30);
+
+/// Whether something answers on the device's HTTPS port (a quick, quiet TCP connect).
+fn reachable(host: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    let addr = if host.contains(':') {
+        host.to_owned()
+    } else {
+        format!("{host}:443")
+    };
+    addr.to_socket_addrs().is_ok_and(|mut it| {
+        it.any(|a| std::net::TcpStream::connect_timeout(&a, Duration::from_millis(1500)).is_ok())
+    })
 }
 
 impl DevicesUi {
+    /// Starts a probe for every saved host that has none or a stale one.
+    fn probe_hosts(&self, ctx: &egui::Context) {
+        let mut probes = self.probes.lock().unwrap();
+        for d in &self.store.devices {
+            let stale = probes
+                .get(&d.host)
+                .is_none_or(|(at, answer)| answer.is_some() && at.elapsed() > PROBE_TTL);
+            if !stale {
+                continue;
+            }
+            probes.insert(d.host.clone(), (Instant::now(), None));
+            let (host, map, ctx) = (d.host.clone(), self.probes.clone(), ctx.clone());
+            self.rt.spawn_blocking(move || {
+                let up = reachable(&host);
+                map.lock().unwrap().insert(host, (Instant::now(), Some(up)));
+                ctx.request_repaint();
+            });
+        }
+        // Come back to refresh stale answers while this screen is open.
+        ctx.request_repaint_after(PROBE_TTL);
+    }
+
+    fn reachability(&self, host: &str) -> Option<bool> {
+        self.probes.lock().unwrap().get(host).and_then(|(_, a)| *a)
+    }
+
     pub fn new(store: Store, rt: Handle, proxy: EventLoopProxy<UserEvent>) -> Self {
         let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
         let env_password = match (env("COMETDESK_HOST"), env("COMETDESK_PASSWORD")) {
@@ -91,6 +143,8 @@ impl DevicesUi {
             env_password,
             looking_up: None,
             logo: None,
+            probes: Arc::default(),
+            confirm_remove: None,
         };
         if ui.store.devices.is_empty() {
             // First run: prefill from the environment (developer convenience) or blank.
@@ -229,7 +283,7 @@ impl DevicesUi {
             .frame(egui::Frame::NONE.fill(theme::BG))
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    let width = ui.available_width().min(560.0);
+                    let width = ui.available_width().min(720.0);
                     let side = (ui.available_width() - width) / 2.0;
                     ui.horizontal_top(|ui| {
                         ui.add_space(side);
@@ -260,13 +314,18 @@ impl DevicesUi {
         } else {
             busy
         };
-        ui.add_space(40.0);
+        ui.add_space(32.0);
         ui.horizontal(|ui| {
-            ui.add(egui::Image::new(logo).fit_to_exact_size(egui::Vec2::splat(56.0)));
+            ui.add(egui::Image::new(logo).fit_to_exact_size(egui::Vec2::splat(48.0)));
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
-                ui.label(egui::RichText::new("CometDesk").size(28.0).strong());
+                ui.label(theme::sign("CometDesk", 32.0).strong().color(theme::TEXT));
                 ui.label(egui::RichText::new("Remote console for GL.iNet KVM").color(theme::MUTED));
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.form.is_none() && ui.add(egui::Button::new("Add device")).clicked() {
+                    self.form = Some(Form::blank());
+                }
             });
         });
         ui.add_space(24.0);
@@ -285,30 +344,39 @@ impl DevicesUi {
             ui.add_space(8.0);
         }
 
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("DEVICES")
-                    .small()
-                    .strong()
-                    .color(theme::MUTED),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if self.form.is_none() && ui.add(theme::ghost("+ Add device")).clicked() {
-                    self.form = Some(Form::blank());
-                }
-            });
-        });
-
+        self.probe_hosts(ui.ctx());
         let mut connect = None;
         let mut edit = None;
         let mut remove = None;
+        // One cobalt action per screen: Connect on the first device that answers.
+        let lead = self
+            .store
+            .devices
+            .iter()
+            .position(|d| self.reachability(&d.host) == Some(true))
+            .unwrap_or(0);
         for (i, d) in self.store.devices.iter().enumerate() {
+            let up = self.reachability(&d.host);
             theme::card().show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
+                    theme::badge(ui, &d.host, d.display_name(), 52.0);
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
-                        ui.label(egui::RichText::new(d.display_name()).size(16.0).strong());
+                        ui.horizontal(|ui| {
+                            ui.label(theme::sign(d.display_name(), 20.0).strong());
+                            match up {
+                                Some(true) => theme::status_dot(ui, theme::OK, "Reachable"),
+                                Some(false) => theme::status_dot(ui, theme::WARN, "Not reachable"),
+                                None => {
+                                    ui.label(
+                                        egui::RichText::new("Checking…")
+                                            .small()
+                                            .color(theme::MUTED),
+                                    );
+                                }
+                            }
+                        });
                         ui.label(
                             egui::RichText::new(format!(
                                 "{}@{}  ·  {}",
@@ -316,28 +384,52 @@ impl DevicesUi {
                                 d.host,
                                 d.target.label()
                             ))
+                            .small()
                             .color(theme::MUTED),
                         );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add_enabled(busy.is_none(), theme::primary("Connect"))
-                            .clicked()
-                        {
+                        let button = if i == lead {
+                            theme::primary("Connect")
+                        } else {
+                            egui::Button::new("Connect")
+                        };
+                        if ui.add_enabled(busy.is_none(), button).clicked() {
                             connect = Some(i);
                         }
-                        if ui.add(theme::ghost("Remove")).clicked() {
-                            remove = Some(i);
-                        }
-                        if ui.add(theme::ghost("Edit")).clicked() {
-                            edit = Some(i);
-                        }
+                        ui.menu_button(egui::RichText::new("•••").color(theme::MUTED), |ui| {
+                            if ui.button("Edit…").clicked() {
+                                edit = Some(i);
+                                ui.close();
+                            }
+                            if ui
+                                .button(egui::RichText::new("Remove…").color(theme::ERR))
+                                .clicked()
+                            {
+                                remove = Some(i);
+                                ui.close();
+                            }
+                        });
                     });
                 });
             });
         }
         if self.store.devices.is_empty() && self.form.is_none() {
-            ui.label(egui::RichText::new("No devices yet.").color(theme::MUTED));
+            theme::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(theme::sign("Add your Comet", 20.0).strong());
+                ui.label(
+                    egui::RichText::new(
+                        "Enter its address and password. Over USB or its own Wi-Fi it is \
+                         usually 192.168.200.1.",
+                    )
+                    .color(theme::MUTED),
+                );
+                ui.add_space(4.0);
+                if ui.add(theme::primary("Add device")).clicked() {
+                    self.form = Some(Form::blank());
+                }
+            });
         }
         if let Some(i) = connect {
             self.connect(self.store.devices[i].clone());
@@ -350,17 +442,59 @@ impl DevicesUi {
                 remember: true,
             });
         }
-        if let Some(i) = remove
-            && let Some(d) = self.store.remove(i)
-        {
-            self.forget_password(d);
-            self.save();
+        if remove.is_some() {
+            self.confirm_remove = remove;
         }
+        self.remove_dialog(ui.ctx());
         if let Some(r) = self.form_ui(ui) {
             request = Some(r);
         }
         ui.add_space(24.0);
         request
+    }
+
+    /// Asks before deleting a saved device: its keychain password goes with it.
+    fn remove_dialog(&mut self, ctx: &egui::Context) {
+        let Some(i) = self.confirm_remove else { return };
+        let Some(device) = self.store.devices.get(i) else {
+            self.confirm_remove = None;
+            return;
+        };
+        let name = device.display_name();
+        let (mut confirm, mut cancel) = (false, false);
+        egui::Modal::new(egui::Id::unique("remove-device")).show(ctx, |ui| {
+            ui.set_width(340.0);
+            ui.label(
+                egui::RichText::new(format!("Remove {name}?"))
+                    .size(16.0)
+                    .strong(),
+            );
+            ui.label("The device and its saved password are deleted from this Mac.");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                cancel = ui.button("Keep").clicked();
+                confirm = ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new("Remove")
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(theme::ERR.gamma_multiply(0.7)),
+                    )
+                    .clicked();
+            });
+        });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+        if confirm && let Some(d) = self.store.remove(i) {
+            self.forget_password(d);
+            self.save();
+        }
+        if confirm || cancel {
+            self.confirm_remove = None;
+        }
     }
 
     fn form_ui(&mut self, ui: &mut egui::Ui) -> Option<ConnectRequest> {
@@ -393,7 +527,7 @@ impl DevicesUi {
                     ui.add(
                         egui::TextEdit::singleline(&mut form.device.host)
                             .desired_width(f32::INFINITY)
-                            .hint_text("192.168.8.1 or host:port"),
+                            .hint_text("192.168.200.1 or host:port"),
                     );
                     ui.end_row();
                     ui.label("User");

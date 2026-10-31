@@ -351,6 +351,7 @@ impl SensitiveChecker {
         if self.atom_hint.is_none() {
             if let Ok(reply) = conn
                 .intern_atom(true, b"x-kde-passwordManagerHint")
+                .map_err(x11rb::errors::ReplyError::from)
                 .and_then(|c| c.reply())
             {
                 if reply.atom != x11rb::NONE {
@@ -370,7 +371,8 @@ impl SensitiveChecker {
         // Check if CLIPBOARD has an owner.
         let Ok(owner_reply) = conn
             .get_selection_owner(self.atom_clipboard)
-            .and_then(|c| c.reply())
+            .map_err(x11rb::errors::ReplyError::from)
+                .and_then(|c| c.reply())
         else {
             return false;
         };
@@ -398,7 +400,8 @@ impl SensitiveChecker {
                 if sn.property != x11rb::NONE {
                     if let Ok(prop) = conn
                         .get_property(false, self.window, sn.property, AtomEnum::ATOM, 0, 1024)
-                        .and_then(|c| c.reply())
+                        .map_err(x11rb::errors::ReplyError::from)
+                .and_then(|c| c.reply())
                     {
                         if let Some(atoms) = prop.value32() {
                             for atom in atoms {

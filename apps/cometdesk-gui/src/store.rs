@@ -274,8 +274,60 @@ fn unlock() -> keyring::Result<()> {
     Ok(())
 }
 
+/// Debug builds keep credentials in a plain file instead of the keychain, so restarting during
+/// development never prompts for Touch ID or the keychain password. Never compiled into release.
+#[cfg(debug_assertions)]
+mod dev {
+    use std::collections::BTreeMap;
+
+    fn path() -> Option<std::path::PathBuf> {
+        cometdesk::tls::app_dir().map(|d| d.join("dev-credentials.json"))
+    }
+
+    fn read() -> BTreeMap<String, String> {
+        path()
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn get(account: &str) -> Option<String> {
+        read().remove(account)
+    }
+
+    pub fn set(account: &str, raw: Option<&str>) -> Result<(), String> {
+        let mut map = read();
+        match raw {
+            Some(r) => map.insert(account.to_owned(), r.to_owned()),
+            None => map.remove(account),
+        };
+        let p = path().ok_or("no config dir")?;
+        if let Some(dir) = p.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        let json = serde_json::to_vec_pretty(&map).map_err(|e| e.to_string())?;
+        std::fs::write(&p, json).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
+}
+
 fn load(device: &SavedDevice) -> keyring::Result<Credentials> {
     let account = device.keychain_account();
+    #[cfg(debug_assertions)]
+    return Ok(dev::get(&account)
+        .map(|raw| Credentials::parse(&raw))
+        .unwrap_or_default());
+    #[cfg(not(debug_assertions))]
+    load_keychain(device, account)
+}
+
+#[cfg_attr(debug_assertions, allow(dead_code))]
+fn load_keychain(device: &SavedDevice, account: String) -> keyring::Result<Credentials> {
     if let Some(c) = CACHE.lock().unwrap().get(&account) {
         return Ok(c.clone());
     }
@@ -312,6 +364,21 @@ fn load(device: &SavedDevice) -> keyring::Result<Credentials> {
 
 fn save(device: &SavedDevice, creds: &Credentials) -> keyring::Result<()> {
     let account = device.keychain_account();
+    #[cfg(debug_assertions)]
+    return dev::set(
+        &account,
+        (*creds != Credentials::default())
+            .then(|| creds.encode())
+            .as_deref(),
+    )
+    .map_err(|e| keyring::Error::NoStorageAccess(e.into()));
+    #[cfg(not(debug_assertions))]
+    save_keychain(&account, creds)
+}
+
+#[cfg_attr(debug_assertions, allow(dead_code))]
+fn save_keychain(account: &str, creds: &Credentials) -> keyring::Result<()> {
+    let account = account.to_owned();
     tracing::debug!(%account, "keychain write");
     if *creds == Credentials::default() {
         match entry(&account)?.delete_credential() {
@@ -342,6 +409,9 @@ pub fn set_password(device: &SavedDevice, password: &str) -> Result<(), String> 
 /// Removes the device's password and pairing secret.
 pub fn delete_password(device: &SavedDevice) {
     let _ = save(device, &Credentials::default());
+    if cfg!(debug_assertions) {
+        return;
+    }
     for account in [
         device.legacy_clip_keychain_account(),
         device.keychain_account(),

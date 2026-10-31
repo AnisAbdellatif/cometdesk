@@ -4,6 +4,7 @@
 //! Background tasks write into [`Shared`] and wake the UI; the menu only reads it. The state
 //! is fetched when the menu opens (if older than [`STALE`]) and after every action.
 
+use crate::theme;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -279,7 +280,7 @@ impl Media {
             None if state.as_ref().and_then(MsdState::mounted).is_some() => "Media ●".into(),
             None => "Media".into(),
         };
-        ui.menu_button(title, |ui| {
+        theme::section(ui, title, |ui| {
             let stale = {
                 let s = self.lock();
                 s.fetched.is_none_or(|t| t.elapsed() > STALE)

@@ -27,6 +27,13 @@ if [ -f /etc/kvmd/override.d/90-glkvm-rs-rndis.yaml ]; then
 fi
 
 mkdir -p "$BASE/target" "$BASE/agents" "$EXTRA" /etc/cometdesk-bridge /etc/kvmd/override.d
+# The daemon drops to an unprivileged user: it must be able to traverse every parent of
+# $BASE to read the installers and agents (a 0700 /usr/local/lib gave the target 404s).
+d=$BASE
+while [ "$d" != / ]; do
+	chmod o+x "$d" 2>/dev/null || true
+	d=$(dirname "$d")
+done
 for u in kvmd nobody; do
 	if id -u "$u" >/dev/null 2>&1; then
 		chown -R "$u" "$BASE/agents" 2>/dev/null || true

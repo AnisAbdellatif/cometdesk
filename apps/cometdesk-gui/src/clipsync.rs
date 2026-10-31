@@ -44,6 +44,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(15);
 const RETRY_SLOW: Duration = Duration::from_secs(30);
+/// While waiting to reconnect, how often to look for an agent already waiting on the relay.
+const AGENT_CHECK: Duration = Duration::from_secs(2);
 const INSERT_TIMEOUT: Duration = Duration::from_secs(5);
 /// A 4K screenshot is several MB through the relay.
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -538,9 +540,21 @@ async fn supervise(
         };
         // Inserts asked for while disconnected fail now rather than after the wait.
         let deadline = tokio::time::Instant::now() + wait;
+        // A freshly installed agent is waiting on the relay: don't make it wait out a long
+        // backoff (up to RETRY_SLOW) that started before it existed.
+        let mut agent_check = tokio::time::interval(AGENT_CHECK);
+        agent_check.tick().await;
         loop {
             tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => break,
+                _ = agent_check.tick() => {
+                    if let Ok(Some(st)) = session.bridge_status().await
+                        && st.agent.connected
+                        && !st.client.connected
+                    {
+                        break;
+                    }
+                }
                 Some(req) = inserts.recv() => {
                     let _ = req.reply.send(Err("the agent is not connected".into()));
                 }
