@@ -33,5 +33,3 @@ data flow, `PLAN.md` for goals and decisions, `docs/protocol.md` for the device 
 | GUI: widgets, colours, icons | `apps/cometdesk-gui/src/theme/` |
 | CLI | `crates/cometdesk-cli/` |
 | KVM-side bridge (RNDIS, Python) | `bridge/`, `docs/clipboard-bridge.md` |
-
-(Directories above are the target layout; until a split lands the path is the file of the same name.)

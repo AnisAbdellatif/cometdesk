@@ -142,8 +142,7 @@ mod tests {
 
     #[test]
     fn secret_round_trip_and_permissions() {
-        let dir =
-            std::env::temp_dir().join(format!("cometdesk-cfg-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cometdesk-cfg-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let secret = Secret::generate();
 

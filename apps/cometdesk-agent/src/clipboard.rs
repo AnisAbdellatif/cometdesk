@@ -64,7 +64,9 @@ fn run(mut clip: Clipboard, cmds: mpsc::Receiver<ClipCommand>, local: mpsc::Send
     let mut sensitive_checker = SensitiveChecker::new();
     let mut tick = 0u32;
     // Whatever is on the clipboard at start-up counts as already seen.
-    if !sensitive_checker.is_sensitive() && let Some(c) = read(&mut clip, true) {
+    if !sensitive_checker.is_sensitive()
+        && let Some(c) = read(&mut clip, true)
+    {
         dedup.observe_local(c.key());
     }
     let mut restore: Option<Restore> = None;
@@ -337,8 +339,8 @@ impl SensitiveChecker {
 
     fn is_sensitive(&mut self) -> bool {
         use x11rb::connection::Connection;
-        use x11rb::protocol::xproto::*;
         use x11rb::protocol::Event;
+        use x11rb::protocol::xproto::*;
 
         let Some(ref conn) = self.conn else {
             return false;
@@ -372,7 +374,7 @@ impl SensitiveChecker {
         let Ok(owner_reply) = conn
             .get_selection_owner(self.atom_clipboard)
             .map_err(x11rb::errors::ReplyError::from)
-                .and_then(|c| c.reply())
+            .and_then(|c| c.reply())
         else {
             return false;
         };
@@ -401,7 +403,7 @@ impl SensitiveChecker {
                     if let Ok(prop) = conn
                         .get_property(false, self.window, sn.property, AtomEnum::ATOM, 0, 1024)
                         .map_err(x11rb::errors::ReplyError::from)
-                .and_then(|c| c.reply())
+                        .and_then(|c| c.reply())
                     {
                         if let Some(atoms) = prop.value32() {
                             for atom in atoms {

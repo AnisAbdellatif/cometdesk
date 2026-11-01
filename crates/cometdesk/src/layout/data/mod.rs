@@ -3,33 +3,33 @@
 
 use super::{Platform, Table};
 
-mod en_us;
-mod en_gb;
+mod cz;
+mod da;
 mod de;
 mod de_ch;
+mod en_gb;
+mod en_us;
+mod es;
+mod et;
+mod fi;
 mod fr;
 mod fr_be;
-mod fr_ch;
 mod fr_ca;
-mod es;
-mod it;
-mod pt;
-mod pt_br;
-mod nl;
-mod da;
-mod no;
-mod sv;
-mod fi;
-mod pl;
-mod cz;
+mod fr_ch;
 mod hu;
-mod tr;
-mod ru;
 mod is;
-mod et;
-mod sl;
+mod it;
 mod lt;
 mod lv;
+mod nl;
+mod no;
+mod pl;
+mod pt;
+mod pt_br;
+mod ru;
+mod sl;
+mod sv;
+mod tr;
 
 pub(super) static CODES: [&str; 49] = [
     "Space",

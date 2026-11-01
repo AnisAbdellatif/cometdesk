@@ -63,19 +63,18 @@ impl Drop for InstanceGuard {
 
 #[cfg(unix)]
 pub fn socket_path() -> PathBuf {
-    let candidate = if let Some(runtime) =
-        std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty())
-    {
-        PathBuf::from(runtime).join("cometdesk-agent.sock")
-    } else if let Some(state) = std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
-        PathBuf::from(state)
-            .join("cometdesk-agent")
-            .join("cometdesk-agent.sock")
-    } else if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
-        PathBuf::from(home).join(".local/state/cometdesk-agent/cometdesk-agent.sock")
-    } else {
-        PathBuf::new()
-    };
+    let candidate =
+        if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+            PathBuf::from(runtime).join("cometdesk-agent.sock")
+        } else if let Some(state) = std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
+            PathBuf::from(state)
+                .join("cometdesk-agent")
+                .join("cometdesk-agent.sock")
+        } else if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+            PathBuf::from(home).join(".local/state/cometdesk-agent/cometdesk-agent.sock")
+        } else {
+            PathBuf::new()
+        };
     if !candidate.as_os_str().is_empty() && candidate.as_os_str().len() < 100 {
         return candidate;
     }
@@ -89,7 +88,9 @@ pub fn socket_path() -> PathBuf {
 #[cfg(windows)]
 pub fn token_path() -> PathBuf {
     if let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
-        return PathBuf::from(local).join("cometdesk-agent").join("ipc.token");
+        return PathBuf::from(local)
+            .join("cometdesk-agent")
+            .join("ipc.token");
     }
     if let Some(user) = std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
         return PathBuf::from(user)
@@ -315,8 +316,7 @@ pub fn send(title: &str, body: &str) -> Result<(), String> {
 
 #[cfg(unix)]
 pub fn send_to_path(path: &Path, title: &str, body: &str) -> Result<(), String> {
-    let mut conn =
-        UnixStream::connect(path).map_err(|_| "the agent is not running".to_string())?;
+    let mut conn = UnixStream::connect(path).map_err(|_| "the agent is not running".to_string())?;
     conn.set_read_timeout(Some(IO_TIMEOUT)).ok();
     let title = title.replace('\n', " ");
     conn.write_all(format!("notify\n{title}\n{body}").as_bytes())
@@ -332,8 +332,8 @@ pub fn send_to_path(path: &Path, title: &str, body: &str) -> Result<(), String> 
 
 #[cfg(windows)]
 pub fn send_windows(token_path: &Path, title: &str, body: &str) -> Result<(), String> {
-    let content = std::fs::read_to_string(token_path)
-        .map_err(|_| "the agent is not running".to_string())?;
+    let content =
+        std::fs::read_to_string(token_path).map_err(|_| "the agent is not running".to_string())?;
     let mut lines = content.lines();
     let port = lines
         .next()

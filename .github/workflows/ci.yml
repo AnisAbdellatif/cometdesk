@@ -17,6 +17,7 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - run: ./scripts/check-file-size.sh
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # Device tests are #[ignore]d and need COMETDESK_* credentials; they don't run here.

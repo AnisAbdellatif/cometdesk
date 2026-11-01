@@ -383,4 +383,3 @@ pub(super) static MAC: Table = &[
     ('◊', &[S(39, 3)]),
     ('\u{f8ff}', &[S(47, 3)]),
 ];
-

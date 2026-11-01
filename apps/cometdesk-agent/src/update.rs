@@ -50,8 +50,8 @@ fn verify_candidate(new: &Path, exe: &Path) -> Result<(), String> {
     }
 
     let mut header = [0u8; 64];
-    let mut file = std::fs::File::open(new)
-        .map_err(|e| format!("cannot open update candidate: {e}"))?;
+    let mut file =
+        std::fs::File::open(new).map_err(|e| format!("cannot open update candidate: {e}"))?;
     use std::io::Read;
     file.read_exact(&mut header)
         .map_err(|e| format!("cannot read update header: {e}"))?;
@@ -98,15 +98,23 @@ fn verify_format(new_header: &[u8; 64], _new: &Path, exe: &Path) -> Result<(), S
             let magic = u32::from_ne_bytes([h[0], h[1], h[2], h[3]]);
             matches!(
                 magic,
-                0xFEEDFACF | 0xCFFAEDFE | 0xFEEDFACE | 0xCEFAEDFE | 0xCAFEBABE | 0xBEBAFECA | 0xCAFEBABF
+                0xFEEDFACF
+                    | 0xCFFAEDFE
+                    | 0xFEEDFACE
+                    | 0xCEFAEDFE
+                    | 0xCAFEBABE
+                    | 0xBEBAFECA
+                    | 0xCAFEBABF
             )
         };
         if !is_macho(new_header) {
             return Err("update candidate is not a Mach-O binary".into());
         }
         if is_macho(&exe_header) {
-            let magic_new = u32::from_ne_bytes([new_header[0], new_header[1], new_header[2], new_header[3]]);
-            let magic_exe = u32::from_ne_bytes([exe_header[0], exe_header[1], exe_header[2], exe_header[3]]);
+            let magic_new =
+                u32::from_ne_bytes([new_header[0], new_header[1], new_header[2], new_header[3]]);
+            let magic_exe =
+                u32::from_ne_bytes([exe_header[0], exe_header[1], exe_header[2], exe_header[3]]);
             if (magic_new == 0xFEEDFACF || magic_new == 0xFEEDFACE)
                 && (magic_exe == 0xFEEDFACF || magic_exe == 0xFEEDFACE)
                 && new_header[4..8] != exe_header[4..8]
@@ -183,7 +191,8 @@ fn check(new: &Path) -> Result<(), String> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let out = cmd.output()
+    let out = cmd
+        .output()
         .map_err(|e| format!("the new agent does not run here: {e}"))?;
     if out.status.success() && String::from_utf8_lossy(&out.stdout).starts_with("cometdesk-agent ")
     {
@@ -265,9 +274,7 @@ mod tests {
         std::fs::write(&fake_bin, &fake_content).unwrap();
         let err = verify_candidate(&fake_bin, &exe).unwrap_err();
         assert!(
-            err.contains("not an ELF")
-                || err.contains("not a Mach-O")
-                || err.contains("not a PE")
+            err.contains("not an ELF") || err.contains("not a Mach-O") || err.contains("not a PE")
         );
 
         let _ = std::fs::remove_dir_all(&dir);
