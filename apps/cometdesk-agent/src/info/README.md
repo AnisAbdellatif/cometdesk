@@ -1,0 +1,4 @@
+- `mod.rs` — Polling `Probe`, shared helpers, and OS-specific `sys` dispatch.
+- `linux.rs` — Linux target probing (`gsettings`/`setxkbmap`, `loginctl`, X11 focus, `/proc` load, sysfs battery).
+- `macos.rs` — macOS target probing (HIToolbox layouts, `sysctl` uptime/load, `pmset` battery).
+- `windows.rs` — Windows target probing (Win32 keyboard layouts, desktop lock state, IME, focus, load, battery).
