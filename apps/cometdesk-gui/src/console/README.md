@@ -1,0 +1,32 @@
+# console
+
+- `mod.rs` — `Console`, `Connected`, `ConsoleAction`, `Console::new`, timing constants and debug-view helper.
+- `state.rs` — Internal state types (`Stream`, `Audio`, `Typing`, `RegionPick`, `Confirm`, `VideoChange`, `VideoInfo`, `FrameStats`, `Tab`).
+- `stream.rs` — Video stream lifecycle, watcher task, frame intake, layout geometry, visibility and power suspension.
+- `audio.rs` — Target audio playback, output device enumeration and master volume row.
+- `video.rs` — Viewer transport selection and device-wide video configuration reads and writes.
+- `input.rs` — Keyboard/mouse input forwarding, shortcuts, modal hit-testing and automation hooks.
+- `typing.rs` — Clipboard paste delivery via the target agent or key-by-key HID typing.
+- `capture.rs` — Device snapshots, exact agent screenshots, region selection overlay and screen OCR.
+- `files.rs` — Sending files to the target through the agent and rendering transfer progress.
+- `clip.rs` — Clipboard bridge lifecycle, pairing management and the Clipboard card in the Target tab.
+- `target.rs` — Target OS selection, agent telemetry adoption and target installer commands.
+- `target_setup.rs` — Target agent pairing and installation modal dialog.
+- `session.rs` — Session teardown, ATX power actions and agent RPC requests.
+- `menus/mod.rs` — Module index for dropdown menu helpers and drawer menu cards.
+- `menus/widgets.rs` — Shared popup menu frame, separator and button item widgets.
+- `menus/video_menu.rs` — Video tab in the right-hand drawer (viewer source/audio and whole-device encoder settings).
+- `menus/info_menu.rs` — System info and virtual media collapsible sections in the Target drawer tab.
+- `menus/session_menu.rs` — OS session actions card (lock, sleep, log off, restart, shut down) and target notifications.
+- `menus/display_menu.rs` — Per-display resolution picker, EDID matching and primary display toggle.
+- `ui/mod.rs` — Per-frame egui entry point (`Console::ui`) and toolbar visibility check.
+- `ui/status.rs` — Connection, stream, signal and HID status line computation.
+- `ui/toolbar.rs` — Top toolbar: device badge, status pill, Keys/Paste/Capture/Power menus and viewer controls.
+- `ui/panels.rs` — Target and Settings tab bodies inside the right-hand drawer.
+- `ui/overlays.rs` — Video canvas overlays: signal messages, region selection, fullscreen status, stats, typing and toasts.
+- `ui/drawer.rs` — Right-hand side drawer container and Target / Video / Settings tab switcher.
+- `ui/dialogs.rs` — Confirmation modal dialogs for typing, ATX power, OS session actions, bridge setup and video changes.
+- `palette/mod.rs` — Action search palette types (`Cmd`, `CmdGroup`) and metadata.
+- `palette/commands.rs` — Available palette commands and execution dispatch.
+- `palette/view.rs` — Modal UI for the action search palette (`Console::palette_ui`).
+- `tests.rs` — Unit tests for target agent installer command generation.
