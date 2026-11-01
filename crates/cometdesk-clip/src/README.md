@@ -1,0 +1,11 @@
+- `lib.rs` — Crate documentation and public API re-exports (`cometdesk_clip::*`).
+- `limits.rs` — Protocol version constants, frame sizes, and payload/file caps.
+- `error.rs` — `Error` and `Result` types for session, framing, and image failures.
+- `protocol.rs` — Public data types (`Hello`, `Info`, `Listing`, `PowerAction`, `Policy`, `PastePref`, `Purpose`).
+- `wire.rs` — Postcard wire `Msg`, caller-facing `Event`, Noise state, and frame helpers.
+- `endpoint/` — Sans-IO `Endpoint` state machine (`handshake`, `send_loop`, `recv_loop`).
+- `content.rs` — Clipboard `Content` representation, PNG encoding, and echo deduplication (`Dedup`).
+- `pairing.rs` — 32-byte `Secret` generation and 52-char base32 pairing code encoding.
+- `receive.rs` — `FileReceiver` for saving incoming transfers and staging clipboard files.
+- `send.rs` — `FileSender` chunked file streamer and directory tree expansion (`expand`).
+- `tests/` — Unit and round-trip tests for the protocol and file transfers.

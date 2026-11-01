@@ -1,0 +1,2 @@
+- `mod.rs` — Session pair/pump helpers plus handshake, framing, clipboard item, insert, and protocol mismatch tests.
+- `control.rs` — Target info, power/layout/volume/display, directory listing, file transfer, screenshot, and notification tests.

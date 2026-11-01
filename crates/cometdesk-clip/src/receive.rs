@@ -114,7 +114,8 @@ impl FileReceiver {
             }
         };
         if purpose == Purpose::Save {
-            fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+            fs::create_dir_all(&dir)
+                .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
         } else {
             create_restricted_dir_all(&dir)
                 .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
