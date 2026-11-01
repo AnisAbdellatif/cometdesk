@@ -1,0 +1,4 @@
+- `mod.rs` — `Endpoint` struct definition, readiness checks, and outgoing buffer drainage.
+- `handshake.rs` — `Endpoint::new` Noise `NNpsk0` handshake setup and transition to transport mode.
+- `send_loop.rs` — Outbound `send_*` methods, clipboard/screenshot chunking, and Noise encryption.
+- `recv_loop.rs` — `Endpoint::receive` frame reader, Noise decryption, and `Msg` to `Event` dispatch.
