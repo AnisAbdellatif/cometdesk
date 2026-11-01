@@ -1,3 +1,7 @@
+//! Crate-wide `Error` and `Result` (re-exported from the crate root). Every fallible API in
+//! `cometdesk` and the crates built on it returns these. To add a failure mode, add a variant
+//! here; login/TLS variants are produced in `client/` and `tls.rs`.
+
 use tokio_tungstenite::tungstenite;
 
 #[derive(Debug, thiserror::Error)]

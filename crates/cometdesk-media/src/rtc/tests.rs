@@ -3,7 +3,7 @@
 //! To change the WebRTC engine, read `mod.rs` and `audio.rs`.
 
 use super::*;
-use str0m::media::Direction;
+use str0m::media::{Direction, MediaKind};
 
 #[test]
 fn codec_aware_keyframe_detection() {
