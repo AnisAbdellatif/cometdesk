@@ -10,28 +10,44 @@
 //! step instead of a stream of key presses that a window switch could misdirect. When the
 //! agent asks for a paste keystroke, this task sends it over the KVM's keyboard.
 
+mod bridge;
+mod settings;
+mod state;
+mod supervise;
+mod types;
+mod update;
+
+pub use bridge::ClipBridge;
+pub use settings::Settings;
+pub use state::BridgeState;
+pub use types::{
+    AckResult, CaptureResult, FileSend, InsertResult, ListResult, Note, Request, TransferProgress,
+};
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cometdesk::Session;
-use cometdesk::api::bridge::BRIDGE_WS;
 use cometdesk::client::WsStream;
 use cometdesk::events::HidSender;
 use cometdesk_clip::{
-    Content, Dedup, DirTarget, Endpoint, Error, Event, FileReceiver, FileSender, Hello, Info,
-    InsertReply, Listing, PasteKey, PastePref, Policy, PowerAction, Pump, Purpose, Role, Secret,
+    Content, Dedup, Endpoint, Error, Event, FileReceiver, FileSender, Hello, Info, InsertReply,
+    Pump, Purpose, Role, Secret,
 };
 use futures_util::{SinkExt, StreamExt};
-use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior, interval};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::store::ClipDirection;
+use supervise::End;
+use types::{
+    AckRequest, ActiveFile, Batch, CaptureRequest, DirRequest, FileRequest, InsertRequest, Memory,
+    paste_keys, restarted,
+};
+use update::queue_update;
 
 const POLL: Duration = Duration::from_millis(300);
 const PING: Duration = Duration::from_secs(15);
@@ -41,539 +57,12 @@ const STATUS_EVERY: Duration = Duration::from_secs(5);
 /// Agent connected per the relay, but no answer to our handshake for this long: assume a
 /// dead connection and reset the session.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
-const BACKOFF_MIN: Duration = Duration::from_secs(1);
-const BACKOFF_MAX: Duration = Duration::from_secs(15);
-const RETRY_SLOW: Duration = Duration::from_secs(30);
-/// While waiting to reconnect, how often to look for an agent already waiting on the relay.
-const AGENT_CHECK: Duration = Duration::from_secs(2);
 const INSERT_TIMEOUT: Duration = Duration::from_secs(5);
 /// A 4K screenshot is several MB through the relay.
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Outcome of an insert: a short description, or why it failed.
-pub type InsertResult = Result<String, String>;
-
-/// PNG bytes of the target's screen, or why there are none.
-pub type CaptureResult = Result<Vec<u8>, String>;
-
-/// Whether the agent's OS accepted a request, or why not.
-pub type AckResult = Result<(), String>;
-
-/// Something the agent does to the target and answers with a plain yes or no.
-pub enum Request {
-    Power(PowerAction),
-    Layout(String),
-    Volume {
-        level: Option<u8>,
-        muted: Option<bool>,
-    },
-    /// Resolution and/or primary status of display `index` (of `Info::displays`).
-    Display {
-        index: u32,
-        mode: Option<(u32, u32)>,
-        primary: bool,
-    },
-    /// Download `name` from folder `dir` of the target into Downloads.
-    Fetch {
-        dir: String,
-        name: String,
-    },
-}
-
-/// A folder of the target, or why it cannot be listed.
-pub type ListResult = Result<Listing, String>;
-
-struct DirRequest {
-    target: DirTarget,
-    reply: oneshot::Sender<ListResult>,
-}
-
-/// What the bridge remembers across connections, for noticing reboots and for not offering
-/// the same agent update twice.
-#[derive(Default)]
-struct Memory {
-    /// The target's uptime in its last report.
-    uptime: Option<u64>,
-    /// The agent (version, protocol) an update was already sent to.
-    update_tried: Option<(String, u16)>,
-}
-
-/// The target's uptime went down since the last report: it restarted (a sleep does not
-/// reset it).
-fn restarted(last: Option<u64>, uptime: u64) -> bool {
-    last.is_some_and(|prev| uptime + 5 < prev)
-}
-
-/// Queues the agent program this app ships for `peer`, if `peer` is older and no update was
-/// sent to that version yet. Whether anything was queued.
-fn queue_update(
-    peer: &Hello,
-    memory: &mut Memory,
-    queue: &mut VecDeque<FileRequest>,
-    notes: &mpsc::UnboundedSender<Note>,
-) -> bool {
-    let tried = (peer.version.clone(), peer.protocol);
-    if !agent_is_older(peer) || memory.update_tried.as_ref() == Some(&tried) {
-        return false;
-    }
-    let Some(path) = crate::setup::agent_binary(&peer.os, &peer.arch) else {
-        return false;
-    };
-    let Ok(meta) = std::fs::metadata(&path) else {
-        return false;
-    };
-    memory.update_tried = Some(tried);
-    let (reply, _) = oneshot::channel();
-    queue.push_front(FileRequest {
-        progress: Arc::new(TransferProgress {
-            name: "cometdesk-agent".into(),
-            total: meta.len(),
-            sent: AtomicU64::new(0),
-            cancel: AtomicBool::new(false),
-        }),
-        path,
-        reply,
-        batch: None,
-        update: true,
-    });
-    let _ = notes.send(Note::Info(format!(
-        "Updating the agent on the target ({} to {})",
-        peer.version,
-        env!("CARGO_PKG_VERSION")
-    )));
-    true
-}
-
-/// Whether `peer` runs an older agent than this app ships.
-fn agent_is_older(peer: &Hello) -> bool {
-    let version = |v: &str| -> Vec<u32> { v.split('.').filter_map(|p| p.parse().ok()).collect() };
-    match peer.protocol.cmp(&cometdesk_clip::PROTOCOL) {
-        std::cmp::Ordering::Equal => version(&peer.version) < version(env!("CARGO_PKG_VERSION")),
-        o => o.is_lt(),
-    }
-}
-
 /// How long the agent gets to verify, sync and rename a file after its last byte.
 const FILE_FINISH_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Shared view of a running file transfer, for the UI.
-pub struct TransferProgress {
-    pub name: String,
-    pub total: u64,
-    pub sent: AtomicU64,
-    pub cancel: AtomicBool,
-}
-
-/// A file on its way to the target. `result` holds where the agent saved it.
-pub struct FileSend {
-    pub progress: Arc<TransferProgress>,
-    pub result: oneshot::Receiver<Result<String, String>>,
-}
-
-struct FileRequest {
-    path: PathBuf,
-    progress: Arc<TransferProgress>,
-    reply: oneshot::Sender<Result<String, String>>,
-    /// Part of a clipboard batch (its number): the files are staged on the target and put on
-    /// its clipboard together.
-    batch: Option<u32>,
-    /// A new agent program, to replace the one running on the target.
-    update: bool,
-}
-
-/// The transfer being streamed, or waiting for the agent's verdict.
-struct ActiveFile {
-    sender: FileSender,
-    req: FileRequest,
-    finished_at: Option<Instant>,
-}
-
-impl ActiveFile {
-    fn fail(self, why: impl Into<String>) {
-        let _ = self.req.reply.send(Err(why.into()));
-    }
-}
-
-/// A clipboard batch in flight: its files' transfer ids as they complete.
-struct Batch {
-    ids: Vec<u32>,
-    remaining: usize,
-}
-
-/// Something the bridge wants the user to hear about.
-pub enum Note {
-    /// From the app itself, such as copied files it could not send.
-    Info(String),
-    /// From the target: a script's `cometdesk-agent notify`, or the agent's own alert.
-    Target { title: String, body: String },
-}
-
-struct AckRequest {
-    request: Request,
-    reply: oneshot::Sender<AckResult>,
-}
-
-struct CaptureRequest {
-    display: Option<u32>,
-    reply: oneshot::Sender<CaptureResult>,
-}
-
-struct InsertRequest {
-    text: String,
-    paste: PastePref,
-    /// The console's current keyboard path (it is replaced when the console reconnects).
-    hid: HidSender,
-    reply: oneshot::Sender<InsertResult>,
-}
-
-/// Keys for the paste keystroke the agent asks for.
-fn paste_keys(key: PasteKey) -> &'static [&'static str] {
-    match key {
-        PasteKey::CtrlV => &["ControlLeft", "KeyV"],
-        PasteKey::CtrlShiftV => &["ControlLeft", "ShiftLeft", "KeyV"],
-        PasteKey::CmdV => &["MetaLeft", "KeyV"],
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(clippy::large_enum_variant)]
-pub enum BridgeState {
-    Connecting,
-    /// The relay is not installed on this device (`bridge/install.sh`).
-    NotInstalled,
-    /// Relay reached; no agent connected on the target.
-    WaitingForAgent,
-    /// The agent answered with a different pairing code.
-    Mismatch,
-    /// The agent speaks another protocol version: set up the target again.
-    AgentOutdated(u16),
-    /// The agent is older than this app and is being sent a new program.
-    Updating,
-    /// The agent's hello, and what it last told us about the target.
-    Connected(Hello, Info),
-    Error(String),
-}
-
-impl BridgeState {
-    pub fn label(&self) -> String {
-        match self {
-            BridgeState::Connecting => "connecting…".into(),
-            BridgeState::NotInstalled => "bridge not installed on this device".into(),
-            BridgeState::WaitingForAgent => "waiting for the agent on the target".into(),
-            BridgeState::Mismatch => "agent has a different pairing code".into(),
-            BridgeState::AgentOutdated(_) => {
-                "the agent on the target is outdated: set up the target again".into()
-            }
-            BridgeState::Updating => "updating the agent on the target…".into(),
-            BridgeState::Connected(h, _) => format!("connected to {} ({})", h.name, h.os),
-            BridgeState::Error(e) => format!("error: {e}"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Settings {
-    pub direction: ClipDirection,
-    pub paused: bool,
-}
-
-impl Settings {
-    fn sends(self) -> bool {
-        !self.paused && self.direction.sends()
-    }
-    fn receives(self) -> bool {
-        !self.paused && self.direction.receives()
-    }
-    fn policy(self) -> Policy {
-        Policy {
-            agent_may_send: self.receives(),
-        }
-    }
-}
-
-pub struct ClipBridge {
-    state: watch::Receiver<BridgeState>,
-    settings: watch::Sender<Settings>,
-    inserts: mpsc::UnboundedSender<InsertRequest>,
-    captures: mpsc::UnboundedSender<CaptureRequest>,
-    acks: mpsc::UnboundedSender<AckRequest>,
-    dirs: mpsc::UnboundedSender<DirRequest>,
-    files: mpsc::UnboundedSender<FileRequest>,
-    notes: Mutex<mpsc::UnboundedReceiver<Note>>,
-    task: JoinHandle<()>,
-}
-
-impl ClipBridge {
-    /// `wake` is called whenever the state changes, to refresh the UI.
-    pub fn spawn(
-        rt: &Handle,
-        session: Session,
-        secret: Secret,
-        settings: Settings,
-        wake: impl Fn() + Send + Sync + 'static,
-    ) -> ClipBridge {
-        let (state_tx, state) = watch::channel(BridgeState::Connecting);
-        let (settings, settings_rx) = watch::channel(settings);
-        let (inserts, inserts_rx) = mpsc::unbounded_channel();
-        let (captures, captures_rx) = mpsc::unbounded_channel();
-        let (acks, acks_rx) = mpsc::unbounded_channel();
-        let (dirs, dirs_rx) = mpsc::unbounded_channel();
-        let (files, files_rx) = mpsc::unbounded_channel();
-        let (notes_tx, notes) = mpsc::unbounded_channel();
-        let task = rt.spawn(supervise(
-            session,
-            secret,
-            settings_rx,
-            inserts_rx,
-            captures_rx,
-            acks_rx,
-            dirs_rx,
-            files_rx,
-            notes_tx,
-            state_tx,
-            wake,
-        ));
-        ClipBridge {
-            state,
-            settings,
-            inserts,
-            captures,
-            acks,
-            dirs,
-            files,
-            notes: Mutex::new(notes),
-            task,
-        }
-    }
-
-    pub fn state(&self) -> BridgeState {
-        self.state.borrow().clone()
-    }
-
-    pub fn settings(&self) -> Settings {
-        *self.settings.borrow()
-    }
-
-    pub fn set_settings(&self, s: Settings) {
-        self.settings.send_replace(s);
-    }
-
-    /// Whether text can be inserted through the agent right now.
-    pub fn can_insert(&self) -> bool {
-        matches!(*self.state.borrow(), BridgeState::Connected(..))
-    }
-
-    /// Asks the agent for a pixel-exact screenshot (PNG). `display` indexes the agent's
-    /// reported displays; `None` takes all of them.
-    pub fn capture(&self, display: Option<u32>) -> oneshot::Receiver<CaptureResult> {
-        let (reply, rx) = oneshot::channel();
-        let _ = self.captures.send(CaptureRequest { display, reply });
-        rx
-    }
-
-    /// Streams a file to the target's Downloads folder through the agent. Files queue and go
-    /// one at a time.
-    pub fn send_file(&self, path: PathBuf) -> Result<FileSend, String> {
-        let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
-        if !meta.is_file() {
-            return Err("not a file".into());
-        }
-        if meta.len() > cometdesk_clip::MAX_FILE {
-            return Err("the file is too large".into());
-        }
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or("the file name is not valid UTF-8")?
-            .to_owned();
-        let progress = Arc::new(TransferProgress {
-            name,
-            total: meta.len(),
-            sent: AtomicU64::new(0),
-            cancel: AtomicBool::new(false),
-        });
-        let (reply, result) = oneshot::channel();
-        let req = FileRequest {
-            path,
-            progress: progress.clone(),
-            reply,
-            batch: None,
-            update: false,
-        };
-        self.files
-            .send(req)
-            .map_err(|_| "the clipboard bridge is stopped".to_string())?;
-        Ok(FileSend { progress, result })
-    }
-
-    /// Things the bridge wants the user to hear about, such as copied files it could not send.
-    pub fn take_notes(&self) -> Vec<Note> {
-        let mut rx = self.notes.lock().unwrap();
-        std::iter::from_fn(|| rx.try_recv().ok()).collect()
-    }
-
-    /// Asks the agent to lock, sleep, log off, restart or shut down the target, or to
-    /// switch its keyboard layout.
-    pub fn request(&self, request: Request) -> oneshot::Receiver<AckResult> {
-        let (reply, rx) = oneshot::channel();
-        let _ = self.acks.send(AckRequest { request, reply });
-        rx
-    }
-
-    /// Lists a folder of the target's file system.
-    pub fn list_dir(&self, target: DirTarget) -> oneshot::Receiver<ListResult> {
-        let (reply, rx) = oneshot::channel();
-        let _ = self.dirs.send(DirRequest { target, reply });
-        rx
-    }
-
-    /// Inserts `text` at the target's focus through the agent. The receiver gets the
-    /// outcome (an error if the connection drops first).
-    pub fn insert(
-        &self,
-        text: String,
-        paste: PastePref,
-        hid: HidSender,
-    ) -> oneshot::Receiver<InsertResult> {
-        let (reply, rx) = oneshot::channel();
-        let _ = self.inserts.send(InsertRequest {
-            text,
-            paste,
-            hid,
-            reply,
-        });
-        rx
-    }
-}
-
-impl Drop for ClipBridge {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-enum End {
-    Mismatch,
-    NotInstalled,
-    AgentOutdated(u16),
-    /// Reason, and whether a session had been established.
-    Lost(String, bool),
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn supervise(
-    session: Session,
-    secret: Secret,
-    mut settings: watch::Receiver<Settings>,
-    mut inserts: mpsc::UnboundedReceiver<InsertRequest>,
-    mut captures: mpsc::UnboundedReceiver<CaptureRequest>,
-    mut acks: mpsc::UnboundedReceiver<AckRequest>,
-    mut dirs: mpsc::UnboundedReceiver<DirRequest>,
-    mut files: mpsc::UnboundedReceiver<FileRequest>,
-    notes: mpsc::UnboundedSender<Note>,
-    state: watch::Sender<BridgeState>,
-    wake: impl Fn() + Send + Sync + 'static,
-) {
-    let set = |s: BridgeState| {
-        if state.send_if_modified(|cur| {
-            let changed = *cur != s;
-            *cur = s;
-            changed
-        }) {
-            wake();
-        }
-    };
-    let mut local = LocalClipboard::new().await;
-    let mut memory = Memory::default();
-    let mut backoff = BACKOFF_MIN;
-    loop {
-        set(BridgeState::Connecting);
-        let end = match session.bridge_status().await {
-            Ok(None) => End::NotInstalled,
-            Err(e) => End::Lost(e.to_string(), false),
-            Ok(Some(_)) => match session.ws_connect(BRIDGE_WS).await {
-                Ok(ws) => {
-                    run(
-                        ws,
-                        &session,
-                        &secret,
-                        &mut settings,
-                        &mut inserts,
-                        &mut captures,
-                        &mut acks,
-                        &mut dirs,
-                        &mut files,
-                        &notes,
-                        &mut local,
-                        &mut memory,
-                        &set,
-                        &wake,
-                    )
-                    .await
-                }
-                Err(e) => End::Lost(e.to_string(), false),
-            },
-        };
-        let wait = match end {
-            End::NotInstalled => {
-                set(BridgeState::NotInstalled);
-                RETRY_SLOW
-            }
-            End::Mismatch => {
-                set(BridgeState::Mismatch);
-                RETRY_SLOW
-            }
-            End::AgentOutdated(v) => {
-                set(BridgeState::AgentOutdated(v));
-                RETRY_SLOW
-            }
-            End::Lost(reason, was_up) => {
-                tracing::info!(%reason, "clipboard bridge connection lost");
-                set(BridgeState::Error(reason));
-                if was_up {
-                    backoff = BACKOFF_MIN;
-                }
-                let w = backoff;
-                backoff = (backoff * 2).min(BACKOFF_MAX);
-                w
-            }
-        };
-        // Inserts asked for while disconnected fail now rather than after the wait.
-        let deadline = tokio::time::Instant::now() + wait;
-        // A freshly installed agent is waiting on the relay: don't make it wait out a long
-        // backoff (up to RETRY_SLOW) that started before it existed.
-        let mut agent_check = tokio::time::interval(AGENT_CHECK);
-        agent_check.tick().await;
-        loop {
-            tokio::select! {
-                _ = tokio::time::sleep_until(deadline) => break,
-                _ = agent_check.tick() => {
-                    if let Ok(Some(st)) = session.bridge_status().await
-                        && st.agent.connected
-                        && !st.client.connected
-                    {
-                        break;
-                    }
-                }
-                Some(req) = inserts.recv() => {
-                    let _ = req.reply.send(Err("the agent is not connected".into()));
-                }
-                Some(req) = captures.recv() => {
-                    let _ = req.reply.send(Err("the agent is not connected".into()));
-                }
-                Some(req) = acks.recv() => {
-                    let _ = req.reply.send(Err("the agent is not connected".into()));
-                }
-                Some(req) = dirs.recv() => {
-                    let _ = req.reply.send(Err("the agent is not connected".into()));
-                }
-                Some(req) = files.recv() => {
-                    let _ = req.reply.send(Err("the agent is not connected".into()));
-                }
-            }
-        }
-    }
-}
 
 #[allow(clippy::too_many_arguments)]
 async fn run(
@@ -1279,6 +768,7 @@ fn stream_file(
 
 #[cfg(test)]
 mod update_tests {
+    use super::types::agent_is_older;
     use super::*;
 
     fn hello(protocol: u16, version: &str) -> Hello {
