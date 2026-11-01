@@ -12,9 +12,6 @@ pub(in crate::console) fn show_dropdown_menu(
 ) {
     let is_open = egui::Popup::is_id_open(ui.ctx(), id);
     let resp = theme::dropdown_button(ui, label, is_open);
-    if resp.clicked() {
-        egui::Popup::toggle_id(ui.ctx(), id);
-    }
     let frame = egui::Frame::NONE
         .fill(theme::CARD)
         .stroke(egui::Stroke::new(1.0, theme::BORDER))

@@ -1,5 +1,5 @@
-//! Transport selection and device-wide video configuration reads and writes.
-//! Entry points: `Console::set_transport`, `Console::refresh_video_info`, `Console::apply_video`.
+//! Device-wide video configuration reads/writes and viewer transport mapping.
+//! Entry points: `transport_for_mode`, `Console::refresh_video_info`, `Console::apply_video`.
 
 use cometdesk::Session;
 use cometdesk::api::system::{LatencyMode, Orientation, VencMode, VideoFormat, VideoMode};
@@ -8,6 +8,22 @@ use cometdesk_media::Transport;
 use super::Console;
 use super::state::{VideoChange, VideoInfo};
 use crate::app::UserEvent;
+
+/// Maps the device's `video_mode` (`COMETDESK_TRANSPORT` overrides it for debugging) to the
+/// viewer transport.
+pub(super) fn transport_for_mode(mode: Option<VideoMode>) -> Transport {
+    if let Some(t) = std::env::var("COMETDESK_TRANSPORT")
+        .ok()
+        .and_then(|t| t.parse().ok())
+    {
+        return t;
+    }
+    match mode {
+        Some(VideoMode::FlexFec) => Transport::Pion,
+        Some(VideoMode::Webrtc) => Transport::Janus,
+        Some(VideoMode::DirectH264 | VideoMode::GlWebrtc) | None => Transport::Direct,
+    }
+}
 
 /// Reads the device-wide video settings.
 async fn read_video_info(session: &Session) -> VideoInfo {
@@ -39,18 +55,6 @@ async fn read_video_info(session: &Session) -> VideoInfo {
 }
 
 impl Console {
-    pub(super) fn set_transport(&mut self, transport: Transport) {
-        if transport == self.transport {
-            return;
-        }
-        self.transport = transport;
-        self.device.transport = transport.name().into();
-        self.target_changed = true;
-        self.stream = None;
-        self.start_stream();
-        self.notify(format!("Video source: {}", transport.name()));
-    }
-
     /// Reads the device-wide video mode and encoder settings in the background.
     pub(super) fn refresh_video_info(&mut self) {
         let (tx, rx) = tokio::sync::oneshot::channel();

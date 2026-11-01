@@ -160,9 +160,6 @@ pub fn show_dropdown_row(
 ) {
     let is_open = egui::Popup::is_id_open(ui.ctx(), id);
     let resp = dropdown_row(ui, label, value, is_open);
-    if resp.clicked() {
-        egui::Popup::toggle_id(ui.ctx(), id);
-    }
     let frame = egui::Frame::NONE
         .fill(CARD)
         .stroke(Stroke::new(1.0, BORDER))

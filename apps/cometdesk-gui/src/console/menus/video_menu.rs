@@ -1,10 +1,9 @@
-//! The Video tab in the right-hand drawer: viewer transport/audio and whole-device encoder settings.
+//! The Video tab in the right-hand drawer: viewer audio and whole-device encoder settings.
 //! Entry point: `Console::video_menu`.
 
 use cometdesk::api::edid;
 use cometdesk::api::streamer::StreamerUpdate;
 use cometdesk::api::system::{LatencyMode, Orientation, VencMode, VideoFormat, VideoMode};
-use cometdesk_media::Transport;
 
 use super::widgets::menu_button_item;
 use crate::console::Console;
@@ -22,21 +21,6 @@ impl Console {
 
     fn viewer_video_section(&mut self, ui: &mut egui::Ui) {
         theme::caption(ui, "THIS VIEWER");
-
-        theme::field_label(ui, "Video source");
-        let mut trans_idx = match self.transport {
-            Transport::Direct => 0,
-            Transport::Pion => 1,
-            Transport::Janus => 2,
-        };
-        if theme::segmented(ui, &mut trans_idx, &["Direct", "WebRTC", "Janus"]).changed() {
-            let t = match trans_idx {
-                0 => Transport::Direct,
-                1 => Transport::Pion,
-                _ => Transport::Janus,
-            };
-            self.set_transport(t);
-        }
 
         let mut audio = self.audio_on;
         let audio_enabled = matches!(

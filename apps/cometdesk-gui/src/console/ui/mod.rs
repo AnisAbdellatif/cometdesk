@@ -82,17 +82,25 @@ impl Console {
         if let Some(rx) = self.video_info_rx.as_mut() {
             match rx.try_recv() {
                 Ok(info) => {
+                    let new_transport = super::video::transport_for_mode(info.mode);
+                    let transport_changed = new_transport != self.transport;
                     // WebRTC sources get the angle in their handshake: restart to apply it.
                     let rotated = info.orientation != self.video_info.orientation
-                        && self.video_info.mode.is_some()
-                        && self.transport != Transport::Direct;
-                    let codec_changed =
-                        info.codec != self.video_info.codec && self.video_info.mode.is_some();
+                        && new_transport != Transport::Direct;
+                    let codec_changed = info.codec != self.video_info.codec;
+                    let mode_changed = info.mode != self.video_info.mode;
+                    // Venc and latency changes restart the device-side encoder; the existing
+                    // connection goes stale unless the client reconnects.
+                    let encoder_restarted = info.venc != self.video_info.venc
+                        || info.latency != self.video_info.latency;
+                    self.transport = new_transport;
                     self.video_info = info;
                     self.video_info_rx = None;
-                    if rotated || codec_changed {
+                    if transport_changed || rotated || codec_changed || encoder_restarted {
                         self.stream = None;
                         self.start_stream();
+                    } else if mode_changed && self.audio_on {
+                        self.set_audio(true);
                     }
                     // The mode picks the audio source, so a saved "on" waits for it.
                     if self.audio_on && self.stream.as_ref().is_some_and(|s| s.audio.is_none()) {

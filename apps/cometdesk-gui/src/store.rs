@@ -89,8 +89,6 @@ pub struct SavedDevice {
     pub clip_direction: ClipDirection,
     /// Paste keystroke for "Insert clipboard" on Linux targets.
     pub insert_paste: cometdesk_clip::PastePref,
-    /// Video source (`direct`, `webrtc-fec`, `webrtc`); empty: Direct.
-    pub transport: String,
     /// Play the target's audio (WebRTC FEC source only).
     pub audio: bool,
     /// Output device name for the target's audio; empty: the system default.
@@ -456,7 +454,6 @@ mod tests {
             keymap: Some("de".into()),
             clip_direction: ClipDirection::ToTarget,
             insert_paste: cometdesk_clip::PastePref::CtrlShiftV,
-            transport: String::new(),
             audio: false,
             audio_output: String::new(),
         }

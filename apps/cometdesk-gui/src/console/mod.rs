@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cometdesk::api::capabilities::Capabilities;
-use cometdesk::api::system::VideoFormat;
+use cometdesk::api::system::{VideoFormat, VideoMode};
 use cometdesk::events::{ConnState, DeviceState, EventOptions, EventSession, HidSender};
 use cometdesk::hid::HidCommand;
 use cometdesk::{Session, SystemConfig};
@@ -179,6 +179,7 @@ impl Console {
             })
         };
         let media = Media::new(c.session.clone(), rt.clone(), proxy.clone());
+        let mode = c.config.video_mode.as_deref().and_then(VideoMode::parse);
         let mut console = Console {
             hid: events.hid(),
             conn: events.conn_state(),
@@ -232,10 +233,11 @@ impl Console {
             setup,
             repair_noticed: false,
             target_changed: false,
-            transport: Transport::default(),
+            transport: video::transport_for_mode(mode),
             audio_on: false,
             video_info: VideoInfo {
                 codec: c.config.video_format.and_then(VideoFormat::from_wire),
+                mode,
                 ..VideoInfo::default()
             },
             video_info_rx: None,
@@ -250,11 +252,6 @@ impl Console {
             info_expanded: false,
             media_expanded: false,
         };
-        console.transport = std::env::var("COMETDESK_TRANSPORT")
-            .ok()
-            .and_then(|t| t.parse().ok())
-            .or_else(|| console.device.transport.parse().ok())
-            .unwrap_or_default();
         console.audio_on = console.device.audio;
         console.refresh_video_info();
         console.media.refresh();

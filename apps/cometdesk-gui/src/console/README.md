@@ -4,7 +4,7 @@
 - `state.rs` — Internal state types (`Stream`, `Audio`, `Typing`, `RegionPick`, `Confirm`, `VideoChange`, `VideoInfo`, `FrameStats`, `Tab`).
 - `stream.rs` — Video stream lifecycle, watcher task, frame intake, layout geometry, visibility and power suspension.
 - `audio.rs` — Target audio playback, output device enumeration and master volume row.
-- `video.rs` — Viewer transport selection and device-wide video configuration reads and writes.
+- `video.rs` — Device-wide video configuration reads/writes and viewer transport mapping.
 - `input.rs` — Keyboard/mouse input forwarding, shortcuts, modal hit-testing and automation hooks.
 - `typing.rs` — Clipboard paste delivery via the target agent or key-by-key HID typing.
 - `capture.rs` — Device snapshots, exact agent screenshots, region selection overlay and screen OCR.
@@ -15,7 +15,7 @@
 - `session.rs` — Session teardown, ATX power actions and agent RPC requests.
 - `menus/mod.rs` — Module index for dropdown menu helpers and drawer menu cards.
 - `menus/widgets.rs` — Shared popup menu frame, separator and button item widgets.
-- `menus/video_menu.rs` — Video tab in the right-hand drawer (viewer source/audio and whole-device encoder settings).
+- `menus/video_menu.rs` — Video tab in the right-hand drawer (viewer audio and whole-device encoder settings).
 - `menus/info_menu.rs` — System info and virtual media collapsible sections in the Target drawer tab.
 - `menus/session_menu.rs` — OS session actions card (lock, sleep, log off, restart, shut down) and target notifications.
 - `menus/display_menu.rs` — Per-display resolution picker, EDID matching and primary display toggle.

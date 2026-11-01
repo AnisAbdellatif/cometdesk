@@ -138,8 +138,11 @@ impl VtDecoder {
     pub fn decode(&mut self, frame: &EncodedFrame) -> Result<(), DecodeError> {
         let split = split_access_unit(frame.codec, &frame.data, std::mem::take(&mut self.avcc));
 
+        // A dead session (invalidated by sleep/wake or a GPU reset) is rebuilt from the next
+        // parameter sets even when they are unchanged.
         if !split.param_sets.is_empty()
-            && (self.codec != Some(frame.codec)
+            && (self.session.is_none()
+                || self.codec != Some(frame.codec)
                 || split.param_sets.len() != self.param_sets.len()
                 || split
                     .param_sets
@@ -334,6 +337,9 @@ impl VtDecoder {
             )
         };
         if status != 0 {
+            // Drop the session (e.g. kVTInvalidSessionErr after wake); the next keyframe
+            // with parameter sets rebuilds it.
+            self.invalidate();
             return Err(DecodeError::Os(status));
         }
         Ok(())
