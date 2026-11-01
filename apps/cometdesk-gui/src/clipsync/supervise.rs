@@ -9,12 +9,13 @@ use cometdesk::api::bridge::BRIDGE_WS;
 use cometdesk_clip::Secret;
 use tokio::sync::{mpsc, watch};
 
+use super::LocalClipboard;
+use super::run::run;
 use super::settings::Settings;
 use super::state::BridgeState;
 use super::types::{
     AckRequest, CaptureRequest, DirRequest, FileRequest, InsertRequest, Memory, Note,
 };
-use super::{LocalClipboard, run};
 
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(15);
