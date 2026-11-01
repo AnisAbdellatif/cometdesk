@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<title>Console with Video panel and Keys menu</title>
+<script src="a65b3ae5-a7be-412d-b785-dec541ae677c"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+body{margin:0;background:#0B0B09}
+button{font-family:inherit}
+</style>
+</helmet>
+<div style="width:1280px;height:832px;box-sizing:border-box;background:#0B0B09;color:#F4F1E3;font-family:Inter,system-ui,sans-serif;position:relative;overflow:hidden">
+
+  <div style="position:absolute;left:0;right:0;top:49px;bottom:0;background:#2b3442">
+    <div style="position:absolute;left:0;top:0;right:0;height:28px;background:#1d222b"></div>
+    <div style="position:absolute;left:60px;top:80px;width:640px;height:380px;background:#14181f;border-radius:8px;border:1px solid #3d4757"><div style="height:28px;background:#232a35;border-radius:8px 8px 0 0"></div></div>
+    <!-- stats readout -->
+    <div style="position:absolute;right:340px;bottom:16px;font-family:'JetBrains Mono',monospace;font-size:12px;line-height:1.5;background:#0B0B09;color:#F4F1E3;border-radius:6px;padding:8px 10px;opacity:0.92">60 fps · 8.2 Mbit/s · 24 ms</div>
+    <!-- notice toast -->
+    <div style="position:absolute;left:50%;top:16px;transform:translateX(-50%);margin-left:-160px;background:#1A1A15;border:1px solid #3A392E;border-radius:8px;padding:10px 16px;font-size:13px;display:flex;align-items:center;gap:10px"><span style="width:8px;height:8px;border-radius:50%;background:#3FD38A"></span>Typed the clipboard</div>
+  </div>
+
+  <!-- top bar -->
+  <div style="position:absolute;left:0;right:0;top:0;height:48px;background:#12120F;display:flex;align-items:center;justify-content:space-between;padding:0 12px;gap:8px">
+    <div style="display:flex;align-items:center;gap:8px">
+      <button style="height:32px;display:flex;align-items:center;gap:6px;padding:0 12px 0 8px;background:transparent;border:0;border-radius:6px;color:#F4F1E3;font-size:13px;font-weight:600;cursor:pointer"><svg width="14" height="14" sc-camel-view-box="0 0 14 14" aria-hidden="true"><path d="M9 2L4 7l5 5" fill="none" stroke="#F4F1E3" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg>Devices</button>
+      <div style="width:1px;height:20px;background:#3A392E"></div>
+      <div style="display:flex;align-items:center;gap:8px;padding:0 8px"><div style="width:24px;height:24px;border-radius:6px;background:#6AA3FF;color:#0B0B09;font-size:13px;font-weight:700;display:flex;align-items:center;justify-content:center">O</div><div style="font-size:14px;font-weight:600">Office Comet</div></div>
+      <div style="width:132px;display:flex;align-items:center;gap:7px;font-size:13px"><span style="width:8px;height:8px;border-radius:50%;background:#3FD38A"></span>Connected</div>
+      <div style="width:1px;height:20px;background:#3A392E"></div>
+      <button style="height:32px;display:flex;align-items:center;gap:8px;padding:0 8px 0 12px;background:#3A392E;border:1px solid #F4F1E3;border-radius:6px;color:#F4F1E3;font-size:13px;font-weight:500;cursor:pointer">Keys<svg width="10" height="6" sc-camel-view-box="0 0 10 6" aria-hidden="true"><path d="M1 5l4-4 4 4" fill="none" stroke="#F4F1E3" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path></svg></button>
+      <button style="height:32px;padding:0 12px;background:transparent;border:1px solid transparent;border-radius:6px;color:#F4F1E3;font-size:13px;font-weight:500;cursor:pointer">Paste</button>
+      <button style="height:32px;display:flex;align-items:center;gap:8px;padding:0 8px 0 12px;background:#1A1A15;border:1px solid #3A392E;border-radius:6px;color:#F4F1E3;font-size:13px;font-weight:500;cursor:pointer">Capture<svg width="10" height="6" sc-camel-view-box="0 0 10 6" aria-hidden="true"><path d="M1 1l4 4 4-4" fill="none" stroke="#A8A48C" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path></svg></button>
+      <button style="height:32px;display:flex;align-items:center;gap:8px;padding:0 8px 0 12px;background:#1A1A15;border:1px solid #3A392E;border-radius:6px;color:#F4F1E3;font-size:13px;font-weight:500;cursor:pointer">Power<svg width="10" height="6" sc-camel-view-box="0 0 10 6" aria-hidden="true"><path d="M1 1l4 4 4-4" fill="none" stroke="#A8A48C" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path></svg></button>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px">
+      <button style="height:32px;display:flex;align-items:center;gap:10px;padding:0 6px 0 12px;background:#1A1A15;border:1px solid #3A392E;border-radius:6px;color:#A8A48C;font-size:13px;cursor:pointer">Actions<span style="font-family:'JetBrains Mono',monospace;font-size:11px;background:#24241C;border:1px solid #3A392E;border-radius:4px;padding:2px 6px;color:#F4F1E3">⌘K</span></button>
+      <button style="height:32px;padding:0 12px;background:#3A392E;border:1px solid #3A392E;border-radius:6px;color:#F4F1E3;font-size:13px;font-weight:600;cursor:pointer">Panel</button>
+      <button aria-label="Fullscreen" style="height:32px;width:32px;display:flex;align-items:center;justify-content:center;background:transparent;border:0;border-radius:6px;cursor:pointer"><svg width="14" height="14" sc-camel-view-box="0 0 14 14" aria-hidden="true"><path d="M1 5V1h4M9 1h4v4M13 9v4H9M5 13H1V9" fill="none" stroke="#F4F1E3" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path></svg></button>
+    </div>
+  </div>
+  <div style="position:absolute;left:0;right:0;top:48px;height:1px;background:#3FD38A"></div>
+
+  <!-- Keys menu open -->
+  <div style="position:absolute;left:372px;top:54px;width:260px;background:#24241C;border:1px solid #3A392E;border-radius:10px;padding:6px;z-index:5">
+    <div style="height:34px;padding:0 12px;display:flex;align-items:center;justify-content:space-between;font-size:13px;border-radius:6px;background:#3A392E">Ctrl+Alt+Del</div>
+    <div style="height:34px;padding:0 12px;display:flex;align-items:center;font-size:13px">Win / Super</div>
+    <div style="height:34px;padding:0 12px;display:flex;align-items:center;font-size:13px">Alt+Tab</div>
+    <div style="height:34px;padding:0 12px;display:flex;align-items:center;font-size:13px">Alt+F4</div>
+    <div style="height:34px;padding:0 12px;display:flex;align-items:center;font-size:13px">Print Screen</div>
+    <div style="height:1px;background:#3A392E;margin:4px 6px"></div>
+    <div style="height:34px;padding:0 12px;display:flex;align-items:center;justify-content:space-between;font-size:13px">Linux TTY (Ctrl+Alt+F1)<span style="color:#A8A48C;font-size:12px">Linux</span></div>
+    <div style="height:34px;padding:0 12px;display:flex;align-items:center;justify-content:space-between;font-size:13px">Function keys<svg width="6" height="10" sc-camel-view-box="0 0 6 10" aria-hidden="true"><path d="M1 1l4 4-4 4" fill="none" stroke="#A8A48C" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path></svg></div>
+  </div>
+
+  <!-- side panel: Video tab -->
+  <div style="position:absolute;right:0;top:49px;bottom:0;width:320px;box-sizing:border-box;background:#12120F;border-left:1px solid #3A392E;display:flex;flex-direction:column">
+    <div style="display:flex;padding:0 12px;border-bottom:1px solid #3A392E">
+      <div style="padding:14px 12px 12px;font-size:14px;color:#A8A48C">Target</div>
+      <div style="padding:14px 12px 12px;font-size:14px;font-weight:600;border-bottom:2px solid #FFD21F;margin-bottom:-1px">Video</div>
+      <div style="padding:14px 12px 12px;font-size:14px;color:#A8A48C">Settings</div>
+    </div>
+    <div style="flex:1;overflow:hidden;padding:16px;display:flex;flex-direction:column;gap:18px">
+
+      <div style="display:flex;flex-direction:column;gap:12px">
+        <div style="font-size:12px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:#A8A48C">This viewer</div>
+        <div style="display:flex;flex-direction:column;gap:6px;font-size:13px;color:#A8A48C">Video source
+          <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));background:#0B0B09;border:1px solid #3A392E;border-radius:8px;padding:3px;gap:3px">
+            <div style="height:32px;border-radius:6px;background:#3A392E;color:#F4F1E3;font-size:12px;font-weight:600;display:flex;align-items:center;justify-content:center">Direct</div>
+            <div style="height:32px;border-radius:6px;font-size:12px;display:flex;align-items:center;justify-content:center">WebRTC</div>
+            <div style="height:32px;border-radius:6px;font-size:12px;display:flex;align-items:center;justify-content:center">Janus</div>
+          </div>
+        </div>
+        <div style="display:flex;align-items:center;justify-content:space-between;font-size:13px">Play audio
+          <span style="width:36px;height:20px;border-radius:10px;background:#FFD21F;position:relative"><span style="position:absolute;right:3px;top:3px;width:14px;height:14px;border-radius:50%;background:#0B0B09"></span></span></div>
+        <div style="height:36px;padding:0 12px;display:flex;align-items:center;justify-content:space-between;background:#1A1A15;border:1px solid #3A392E;border-radius:8px;font-size:13px"><span style="color:#A8A48C">Audio output</span>System default<svg width="10" height="6" sc-camel-view-box="0 0 10 6" aria-hidden="true"><path d="M1 1l4 4 4-4" fill="none" stroke="#A8A48C" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path></svg></div>
+      </div>
+
+      <div style="border:1px solid #FF8F2B;border-radius:10px;padding:14px;display:flex;flex-direction:column;gap:12px">
+        <div>
+          <div style="font-size:13px;font-weight:700;color:#FF8F2B">Whole device</div>
+          <div style="font-size:12px;color:#A8A48C;margin-top:2px">Applies to every viewer, after you confirm.</div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <div style="height:36px;padding:0 12px;display:flex;align-items:center;justify-content:space-between;background:#1A1A15;border:1px solid #3A392E;border-radius:8px;font-size:13px"><span style="color:#A8A48C">Codec</span>H.264<svg width="10" height="6" sc-camel-view-box="0 0 10 6" aria-hidden="true"><path d="M1 1l4 4 4-4" fill="none" stroke="#A8A48C" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path></svg></div>
+          <div style="height:36px;padding:0 12px;display:flex;align-items:center;justify-content:space-between;background:#1A1A15;border:1px solid #3A392E;border-radius:8px;font-size:13px"><span style="color:#A8A48C">Latency</span>Lowest<svg width="10" height="6" sc-camel-view-box="0 0 10 6" aria-hidden="true"><path d="M1 1l4 4 4-4" fill="none" stroke="#A8A48C" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path></svg></div>
+          <div style="height:36px;padding:0 12px;display:flex;align-items:center;justify-content:space-between;background:#1A1A15;border:1px solid #3A392E;border-radius:8px;font-size:13px"><span style="color:#A8A48C">Resolution</span>1920×1080<svg width="10" height="6" sc-camel-view-box="0 0 10 6" aria-hidden="true"><path d="M1 1l4 4 4-4" fill="none" stroke="#A8A48C" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path></svg></div>
+        </div>
+        <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:#A8A48C">Encoder: 60 fps · 8000 kbit/s · keyframe 60</div>
+        <div style="display:flex;gap:8px">
+          <div style="flex:1;height:36px;box-sizing:border-box;border:1px solid #3A392E;border-radius:8px;background:#0B0B09;padding:0 12px;display:flex;align-items:center;justify-content:space-between;font-size:13px"><span style="color:#A8A48C">fps</span>60</div>
+          <div style="flex:1;height:36px;box-sizing:border-box;border:1px solid #3A392E;border-radius:8px;background:#0B0B09;padding:0 12px;display:flex;align-items:center;justify-content:space-between;font-size:13px"><span style="color:#A8A48C">kbit/s</span>8000</div>
+        </div>
+        <button style="height:40px;background:#FFD21F;color:#0B0B09;border:0;border-radius:8px;font-size:14px;font-weight:700;cursor:pointer">Apply…</button>
+      </div>
+    </div>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script="" data-props="{&quot;$preview&quot;:{&quot;width&quot;:1280,&quot;height&quot;:832}}">
+class Component extends DCLogic {
+renderVals() { return {}; }
+}
+</script>
+
+
+</body></html>

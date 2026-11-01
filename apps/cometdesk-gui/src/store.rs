@@ -65,20 +65,6 @@ pub enum ClipDirection {
 }
 
 impl ClipDirection {
-    pub const ALL: [ClipDirection; 3] = [
-        ClipDirection::Both,
-        ClipDirection::ToTarget,
-        ClipDirection::FromTarget,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            ClipDirection::Both => "Both ways",
-            ClipDirection::ToTarget => "Only to the target",
-            ClipDirection::FromTarget => "Only from the target",
-        }
-    }
-
     pub fn sends(self) -> bool {
         self != ClipDirection::FromTarget
     }

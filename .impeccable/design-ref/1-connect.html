@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<title>Connect screen</title>
+<script src="451d382b-53a9-4f96-9446-8ee24173edfc"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+body{margin:0;background:#0B0B09}
+button{font-family:inherit}
+</style>
+</helmet>
+<div style="width:1280px;height:832px;box-sizing:border-box;background:#0B0B09;color:#F4F1E3;font-family:Inter,system-ui,sans-serif;display:flex;flex-direction:column;position:relative;overflow:hidden">
+
+  <!-- header -->
+  <div style="height:80px;flex:none;display:flex;align-items:center;justify-content:space-between;padding:0 56px;border-bottom:1px solid #3A392E;background:#12120F">
+    <div style="display:flex;align-items:center;gap:16px">
+      <svg width="40" height="40" sc-camel-view-box="0 0 40 40" role="img" aria-label="CometDesk logo">
+        <rect x="3" y="6" width="34" height="23" rx="4" fill="none" stroke="#6AA3FF" stroke-width="2.5"></rect>
+        <path d="M14 34h12M20 29v5" stroke="#6AA3FF" stroke-width="2.5" stroke-linecap="round"></path>
+        <path d="M17 11l9 7.5-4 .8 2.6 5-2.2 1.1-2.6-5-3.3 2.6z" fill="#6AA3FF"></path>
+      </svg>
+      <div>
+        <div style="font-size:22px;font-weight:700;letter-spacing:-0.01em">CometDesk</div>
+        <div style="font-size:13px;color:#A8A48C;margin-top:2px">Remote console for GL.iNet KVM</div>
+      </div>
+    </div>
+    <button style="height:40px;padding:0 18px 0 14px;display:flex;align-items:center;gap:10px;background:#1A1A15;color:#F4F1E3;border:1px solid #3A392E;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer">
+      <svg width="16" height="16" sc-camel-view-box="0 0 16 16" aria-hidden="true"><path d="M8 2v12M2 8h12" stroke="#FFD21F" stroke-width="2" stroke-linecap="round"></path></svg>
+      Add device
+    </button>
+  </div>
+
+  <!-- body -->
+  <div style="flex:1;padding:40px 56px 0;display:flex;flex-direction:column;gap:24px">
+    <div style="display:flex;align-items:baseline;justify-content:space-between">
+      <div style="font-size:13px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:#A8A48C">Your devices · 3</div>
+      <div style="font-size:13px;color:#A8A48C">Reachability is probed every 30 s</div>
+    </div>
+
+    <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px">
+
+      <!-- card 1 -->
+      <div style="background:#1A1A15;border:1px solid #3A392E;border-radius:12px;padding:24px;display:flex;flex-direction:column;gap:20px;height:188px;box-sizing:border-box">
+        <div style="display:flex;gap:18px;align-items:center">
+          <div style="width:60px;height:60px;border-radius:12px;background:#6AA3FF;color:#0B0B09;font-size:28px;font-weight:700;display:flex;align-items:center;justify-content:center">O</div>
+          <div style="flex:1;min-width:0">
+            <div style="font-size:22px;font-weight:600">Office Comet</div>
+            <div style="font-family:'JetBrains Mono',monospace;font-size:13px;color:#A8A48C;margin-top:4px">admin@192.168.200.1 · Linux</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;font-size:14px"><span style="width:10px;height:10px;border-radius:50%;background:#3FD38A"></span>Reachable</div>
+        </div>
+        <div style="display:flex;gap:12px;margin-top:auto">
+          <button style="flex:1;height:44px;background:#FFD21F;color:#0B0B09;border:0;border-radius:8px;font-size:15px;font-weight:700;cursor:pointer">Connect</button>
+          <button aria-label="More actions" style="width:44px;height:44px;background:#24241C;border:1px solid #3A392E;border-radius:8px;display:flex;align-items:center;justify-content:center;cursor:pointer">
+            <svg width="18" height="4" sc-camel-view-box="0 0 18 4" aria-hidden="true"><circle cx="2" cy="2" r="2" fill="#F4F1E3"></circle><circle cx="9" cy="2" r="2" fill="#F4F1E3"></circle><circle cx="16" cy="2" r="2" fill="#F4F1E3"></circle></svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- card 2 with menu open -->
+      <div style="position:relative;background:#1A1A15;border:1px solid #3A392E;border-radius:12px;padding:24px;display:flex;flex-direction:column;gap:20px;height:188px;box-sizing:border-box">
+        <div style="display:flex;gap:18px;align-items:center">
+          <div style="width:60px;height:60px;border-radius:12px;background:#A98BFF;color:#0B0B09;font-size:28px;font-weight:700;display:flex;align-items:center;justify-content:center">W</div>
+          <div style="flex:1;min-width:0">
+            <div style="font-size:22px;font-weight:600">Workshop PC</div>
+            <div style="font-family:'JetBrains Mono',monospace;font-size:13px;color:#A8A48C;margin-top:4px">admin@10.0.4.21 · Windows</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;font-size:14px"><span style="width:10px;height:10px;border-radius:50%;background:#3FD38A"></span>Reachable</div>
+        </div>
+        <div style="display:flex;gap:12px;margin-top:auto">
+          <button style="flex:1;height:44px;background:#24241C;color:#F4F1E3;border:1px solid #3A392E;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer">Connect</button>
+          <button aria-label="More actions" style="width:44px;height:44px;background:#24241C;border:1px solid #F4F1E3;border-radius:8px;display:flex;align-items:center;justify-content:center;cursor:pointer">
+            <svg width="18" height="4" sc-camel-view-box="0 0 18 4" aria-hidden="true"><circle cx="2" cy="2" r="2" fill="#F4F1E3"></circle><circle cx="9" cy="2" r="2" fill="#F4F1E3"></circle><circle cx="16" cy="2" r="2" fill="#F4F1E3"></circle></svg>
+          </button>
+        </div>
+        <div style="position:absolute;right:24px;bottom:-4px;width:180px;background:#24241C;border:1px solid #3A392E;border-radius:10px;padding:6px;box-shadow:0 0 0 1px #0B0B09">
+          <div style="height:38px;display:flex;align-items:center;gap:10px;padding:0 12px;border-radius:6px;background:#3A392E;font-size:14px">
+            <svg width="14" height="14" sc-camel-view-box="0 0 14 14" aria-hidden="true"><path d="M2 12l1-3.5L9.5 2l2.5 2.5L5.5 11z" fill="none" stroke="#F4F1E3" stroke-width="1.5" stroke-linejoin="round"></path></svg>Edit…</div>
+          <div style="height:38px;display:flex;align-items:center;gap:10px;padding:0 12px;font-size:14px;color:#FF5A52">
+            <svg width="14" height="14" sc-camel-view-box="0 0 14 14" aria-hidden="true"><path d="M3 4h8M5.5 4V2.5h3V4M4 4l.5 8h5L10 4" fill="none" stroke="#FF5A52" stroke-width="1.5" stroke-linejoin="round"></path></svg>Remove…</div>
+        </div>
+      </div>
+
+      <!-- card 3 not reachable -->
+      <div style="background:#1A1A15;border:1px solid #3A392E;border-radius:12px;padding:24px;display:flex;flex-direction:column;gap:20px;height:188px;box-sizing:border-box">
+        <div style="display:flex;gap:18px;align-items:center">
+          <div style="width:60px;height:60px;border-radius:12px;background:#E879C6;color:#0B0B09;font-size:28px;font-weight:700;display:flex;align-items:center;justify-content:center">R</div>
+          <div style="flex:1;min-width:0">
+            <div style="font-size:22px;font-weight:600">Rack server</div>
+            <div style="font-family:'JetBrains Mono',monospace;font-size:13px;color:#A8A48C;margin-top:4px">root@comet-rack.lan · BIOS / other</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;font-size:14px"><span style="width:10px;height:10px;border-radius:50%;background:#FF8F2B"></span>Not reachable</div>
+        </div>
+        <div style="display:flex;gap:12px;margin-top:auto">
+          <button style="flex:1;height:44px;background:#24241C;color:#F4F1E3;border:1px solid #3A392E;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer">Connect</button>
+          <button aria-label="More actions" style="width:44px;height:44px;background:#24241C;border:1px solid #3A392E;border-radius:8px;display:flex;align-items:center;justify-content:center;cursor:pointer">
+            <svg width="18" height="4" sc-camel-view-box="0 0 18 4" aria-hidden="true"><circle cx="2" cy="2" r="2" fill="#F4F1E3"></circle><circle cx="9" cy="2" r="2" fill="#F4F1E3"></circle><circle cx="16" cy="2" r="2" fill="#F4F1E3"></circle></svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- add card -->
+      <button style="height:188px;box-sizing:border-box;background:transparent;border:1.5px dashed #3A392E;border-radius:12px;color:#A8A48C;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;font-size:15px;font-weight:600;cursor:pointer">
+        <svg width="28" height="28" sc-camel-view-box="0 0 28 28" aria-hidden="true"><path d="M14 4v20M4 14h20" stroke="#FFD21F" stroke-width="2.5" stroke-linecap="round"></path></svg>
+        Add another Comet
+      </button>
+    </div>
+  </div>
+
+  <!-- footer hint -->
+  <div style="height:56px;flex:none;border-top:1px solid #3A392E;display:flex;align-items:center;justify-content:space-between;padding:0 56px;font-size:13px;color:#A8A48C;background:#12120F">
+    <div>First time? A new Comet answers at <span style="font-family:'JetBrains Mono',monospace;color:#F4F1E3">192.168.200.1</span> over USB or its own Wi-Fi.</div>
+    <div style="display:flex;gap:20px"><span>Passwords stay in the macOS keychain</span><span>v0.1</span></div>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script="" data-props="{&quot;$preview&quot;:{&quot;width&quot;:1280,&quot;height&quot;:832}}">
+class Component extends DCLogic {
+renderVals() { return {}; }
+}
+</script>
+
+
+</body></html>

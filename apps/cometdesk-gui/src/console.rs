@@ -13,9 +13,7 @@ use cometdesk::api::bridge::Health;
 use cometdesk::api::capabilities::{Capabilities, Feature};
 use cometdesk::api::edid::{self, EdidPreset};
 use cometdesk::api::hid::PrintOptions;
-use cometdesk::api::streamer::{
-    QualityPreset, SnapshotOptions, StreamerLimits, StreamerParams, StreamerUpdate,
-};
+use cometdesk::api::streamer::{SnapshotOptions, StreamerLimits, StreamerParams, StreamerUpdate};
 use cometdesk::api::system::{LatencyMode, Orientation, VencMode, VideoFormat, VideoMode};
 use cometdesk::events::{ConnState, DeviceState, EventOptions, EventSession, HidSender};
 use cometdesk::hid::{HidCommand, MouseButton};
@@ -126,7 +124,6 @@ struct VideoInfo {
     edid_presets: Vec<EdidPreset>,
     params: StreamerParams,
     limits: StreamerLimits,
-    source_fps: Option<u32>,
 }
 
 /// Reads the device-wide video settings.
@@ -139,7 +136,6 @@ async fn read_video_info(session: &Session) -> VideoInfo {
     );
     let cfg = cfg.ok().unwrap_or_default();
     let st = st.unwrap_or_default();
-    let source_fps = st.source_fps();
     let codec = cfg.video_format.and_then(VideoFormat::from_wire);
     let h265_supported = st.features.h265;
     VideoInfo {
@@ -156,7 +152,6 @@ async fn read_video_info(session: &Session) -> VideoInfo {
         edid_presets: presets.unwrap_or_default(),
         params: st.params,
         limits: st.limits,
-        source_fps,
     }
 }
 
@@ -259,6 +254,121 @@ pub struct Console {
     /// What the agent last said about the session, to announce changes.
     last_session: Option<SessionState>,
     agent_was_up: bool,
+    clip_expanded: bool,
+    info_expanded: bool,
+    media_expanded: bool,
+}
+
+fn show_dropdown_menu(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    label: &str,
+    width: f32,
+    content: impl FnOnce(&mut egui::Ui),
+) {
+    let is_open = egui::Popup::is_id_open(ui.ctx(), id);
+    let resp = theme::dropdown_button(ui, label, is_open);
+    if resp.clicked() {
+        egui::Popup::toggle_id(ui.ctx(), id);
+    }
+    let frame = egui::Frame::NONE
+        .fill(theme::CARD)
+        .stroke(egui::Stroke::new(1.0, theme::BORDER))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::same(6));
+    egui::Popup::menu(&resp).id(id).frame(frame).show(|ui| {
+        ui.set_width(width);
+        let style = ui.style_mut();
+        style.spacing.item_spacing = egui::vec2(0.0, 1.0);
+        style.spacing.button_padding = egui::vec2(10.0, 4.0);
+        style.visuals.widgets.hovered.weak_bg_fill = theme::CARD_HOVER;
+        style.visuals.widgets.hovered.bg_fill = theme::CARD_HOVER;
+        style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
+        style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
+        content(ui);
+    });
+}
+
+fn menu_separator(ui: &mut egui::Ui) {
+    ui.add_space(4.0);
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::ZERO, theme::BORDER);
+    ui.add_space(4.0);
+}
+
+fn menu_button_item(ui: &mut egui::Ui, label: &str, note: Option<&str>) -> egui::Response {
+    let height = 28.0;
+    let width = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        if resp.hovered() {
+            ui.painter()
+                .rect_filled(rect, egui::CornerRadius::same(6), theme::CARD_HOVER);
+        }
+        let font_id = egui::FontId::new(13.0, egui::FontFamily::Proportional);
+        let label_galley = ui
+            .painter()
+            .layout_no_wrap(label.to_owned(), font_id, theme::TEXT);
+        let label_pos = egui::pos2(
+            rect.min.x + 10.0,
+            rect.center().y - label_galley.size().y * 0.5,
+        );
+        ui.painter().galley(label_pos, label_galley, theme::TEXT);
+
+        if let Some(note_text) = note {
+            let note_font = egui::FontId::new(12.0, egui::FontFamily::Proportional);
+            let note_galley =
+                ui.painter()
+                    .layout_no_wrap(note_text.to_owned(), note_font, theme::MUTED);
+            let note_pos = egui::pos2(
+                rect.max.x - 10.0 - note_galley.size().x,
+                rect.center().y - note_galley.size().y * 0.5,
+            );
+            ui.painter().galley(note_pos, note_galley, theme::MUTED);
+        }
+    }
+    resp
+}
+
+fn menu_button_item_enabled(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    label: &str,
+    tooltip: &str,
+    disabled_reason: &str,
+) -> egui::Response {
+    let height = 28.0;
+    let width = ui.available_width();
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, height), sense);
+    if ui.is_rect_visible(rect) {
+        if enabled && resp.hovered() {
+            ui.painter()
+                .rect_filled(rect, egui::CornerRadius::same(6), theme::CARD_HOVER);
+        }
+        let font_id = egui::FontId::new(13.0, egui::FontFamily::Proportional);
+        let color = if enabled { theme::TEXT } else { theme::MUTED };
+        let label_galley = ui
+            .painter()
+            .layout_no_wrap(label.to_owned(), font_id, color);
+        let label_pos = egui::pos2(
+            rect.min.x + 10.0,
+            rect.center().y - label_galley.size().y * 0.5,
+        );
+        ui.painter().galley(label_pos, label_galley, color);
+    }
+    let tip = if enabled { tooltip } else { disabled_reason };
+    if !tip.is_empty() {
+        resp.on_hover_text(tip)
+    } else {
+        resp
+    }
 }
 
 impl Console {
@@ -298,8 +408,16 @@ impl Console {
             menu_open: false,
             toolbar_rect: None,
             edge_since: None,
-            drawer: None,
-            palette: None,
+            drawer: debug_view()
+                .filter(|v| v.starts_with("panel"))
+                .map(|v| match v.as_str() {
+                    "panel-video" => Tab::Video,
+                    "panel-settings" => Tab::Settings,
+                    _ => Tab::Target,
+                }),
+            palette: debug_view()
+                .filter(|v| v == "palette")
+                .map(|_| String::new()),
             typing: None,
             inserting: None,
             confirm: None,
@@ -334,6 +452,9 @@ impl Console {
             uptime_seen: None,
             last_session: None,
             agent_was_up: false,
+            clip_expanded: true,
+            info_expanded: false,
+            media_expanded: false,
         };
         console.transport = std::env::var("COMETDESK_TRANSPORT")
             .ok()
@@ -503,108 +624,260 @@ impl Console {
 
     fn clip_menu(&mut self, ui: &mut egui::Ui) -> ConsoleAction {
         let mut action = ConsoleAction::None;
-        let needs_device = self.bridge_action().is_some();
-        // The label takes the sync state's color: green synced, amber needs attention.
+        let needs_device =
+            self.bridge_action().is_some() || debug_view().as_deref() == Some("panel-target");
         let (state_text, tint) = match self.clip.as_ref().map(ClipBridge::state) {
-            _ if self.setup.progress().is_some() => ("setting up…", Some(theme::WARN)),
-            Some(_) if needs_device => ("needs repair", Some(theme::WARN)),
-            None => ("off", None),
-            Some(_) if self.clip_paused => ("paused", None),
-            Some(BridgeState::Connected(..)) => ("synced", Some(theme::OK)),
-            Some(_) => ("not connected", Some(theme::WARN)),
+            _ if debug_view().as_deref() == Some("panel-target") => {
+                ("Needs repair", Some(theme::WARN))
+            }
+            _ if self.setup.progress().is_some() => ("Setting up…", Some(theme::WARN)),
+            Some(_) if needs_device => ("Needs repair", Some(theme::WARN)),
+            None => ("Off", None),
+            Some(_) if self.clip_paused => ("Paused", None),
+            Some(BridgeState::Connected(..)) => ("Synced", Some(theme::OK)),
+            Some(_) => ("Not connected", Some(theme::WARN)),
         };
-        let mut title = egui::RichText::new("Clipboard");
-        if let Some(c) = tint {
-            title = title.color(c);
-        }
-        theme::section(ui, title, |ui| {
-            ui.set_min_width(260.0);
-            ui.label(egui::RichText::new(format!("Clipboard: {state_text}")).strong());
-            // The Comet side.
-            if let Some(p) = self.setup.progress() {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(p);
-                });
-            } else {
-                match self.setup.health() {
-                    None => {
-                        ui.label("Checking the Comet…");
-                    }
-                    Some(Health::Ok) => {
-                        let fw = self
-                            .setup
-                            .status()
-                            .and_then(|s| s.firmware)
-                            .unwrap_or_default();
-                        ui.label(format!("Comet: bridge ready {fw}"));
-                    }
-                    Some(h) => {
-                        ui.colored_label(theme::WARN, health_text(&h));
-                    }
-                }
-                if let Some(label) = self.bridge_action()
-                    && ui.button(label).clicked()
-                {
-                    self.confirm = Some(Confirm::BridgeSetup(label.trim_end_matches('…').into()));
-                    ui.close();
-                }
-            }
-            ui.separator();
 
-            // The target side.
-            let Some(state) = self.clip.as_ref().map(ClipBridge::state) else {
-                ui.label("Shares the clipboard with the target.");
-                if ui
-                    .add_enabled(!needs_device, egui::Button::new("Set up the target…"))
-                    .clicked()
-                {
-                    self.start_target_setup();
-                    ui.close();
+        let card_frame = egui::Frame::NONE
+            .fill(theme::CARD)
+            .stroke(egui::Stroke::new(1.0, theme::BORDER))
+            .corner_radius(egui::CornerRadius::same(10))
+            .inner_margin(egui::Margin::ZERO);
+
+        card_frame.show(ui, |ui| {
+            // Header: height 44px
+            let (head_rect, head_resp) = ui
+                .allocate_exact_size(egui::vec2(ui.available_width(), 44.0), egui::Sense::click());
+            if ui.is_rect_visible(head_rect) {
+                if head_resp.hovered() {
+                    ui.painter().rect_filled(
+                        head_rect,
+                        egui::CornerRadius::same(10),
+                        theme::CARD_HOVER,
+                    );
                 }
-                return;
-            };
-            ui.label(format!("Target: {}", state.label()));
-            let before = self.device.clip_direction;
-            for d in ClipDirection::ALL {
-                ui.radio_value(&mut self.device.clip_direction, d, d.label());
-            }
-            if self.device.clip_direction != before {
-                action = ConsoleAction::TargetChanged;
-            }
-            ui.checkbox(&mut self.clip_paused, "Pause");
-            if self.device.target == TargetOs::Linux {
-                ui.separator();
-                ui.label("Insert clipboard pastes with:");
-                let before = self.device.insert_paste;
-                for (p, l) in [
-                    (PastePref::Auto, "Auto (Ctrl+Shift+V in terminals)"),
-                    (PastePref::CtrlV, "Ctrl+V"),
-                    (PastePref::CtrlShiftV, "Ctrl+Shift+V"),
-                ] {
-                    ui.radio_value(&mut self.device.insert_paste, p, l);
+                let title_font = egui::FontId::new(14.0, theme::bold_family());
+                let title_galley =
+                    ui.painter()
+                        .layout_no_wrap("Clipboard".to_owned(), title_font, theme::TEXT);
+                let title_pos = egui::pos2(
+                    head_rect.min.x + 14.0,
+                    head_rect.center().y - title_galley.size().y * 0.5,
+                );
+                let title_w = title_galley.size().x;
+                ui.painter().galley(title_pos, title_galley, theme::TEXT);
+
+                if let Some(color) = tint {
+                    let bg_color = if color == theme::WARN {
+                        egui::Color32::from_rgb(0x2A, 0x1D, 0x0C)
+                    } else {
+                        color.gamma_multiply(0.18)
+                    };
+                    let tag_font = egui::FontId::new(12.0, theme::bold_family());
+                    let tag_galley =
+                        ui.painter()
+                            .layout_no_wrap(state_text.to_owned(), tag_font, color);
+                    let tag_w = tag_galley.size().x + 16.0;
+                    let tag_h = 20.0;
+                    let tag_rect = egui::Rect::from_center_size(
+                        egui::pos2(
+                            head_rect.min.x + 14.0 + title_w + 8.0 + tag_w * 0.5,
+                            head_rect.center().y,
+                        ),
+                        egui::vec2(tag_w, tag_h),
+                    );
+                    ui.painter()
+                        .rect_filled(tag_rect, egui::CornerRadius::same(10), bg_color);
+                    ui.painter().galley(
+                        egui::pos2(
+                            tag_rect.min.x + 8.0,
+                            tag_rect.center().y - tag_galley.size().y * 0.5,
+                        ),
+                        tag_galley,
+                        color,
+                    );
                 }
-                if self.device.insert_paste != before {
-                    action = ConsoleAction::TargetChanged;
-                }
+
+                let chevron_dir = if self.clip_expanded {
+                    theme::ChevronDir::Down
+                } else {
+                    theme::ChevronDir::Right
+                };
+                let chevron_pos = egui::pos2(head_rect.max.x - 14.0 - 4.0, head_rect.center().y);
+                theme::chevron(ui.painter(), chevron_pos, 4.0, chevron_dir, theme::MUTED);
             }
-            if let Some(c) = &self.clip
-                && c.settings() != self.clip_settings()
-            {
-                c.set_settings(self.clip_settings());
+            if head_resp.clicked() {
+                self.clip_expanded = !self.clip_expanded;
             }
-            ui.separator();
-            if ui
-                .button("Set up the target again…")
-                .on_hover_text("Reinstalls the agent on the target with a new pairing code")
-                .clicked()
-            {
-                self.start_target_setup();
-                ui.close();
-            }
-            if ui.button("Forget pairing").clicked() {
-                self.forget_clipboard_pairing();
-                ui.close();
+
+            if self.clip_expanded {
+                egui::Frame::NONE
+                    .inner_margin(egui::Margin {
+                        left: 14,
+                        right: 14,
+                        top: 0,
+                        bottom: 14,
+                    })
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(0.0, 12.0);
+
+                        // Comet and Target label/value rows
+                        let comet_val = if let Some(p) = self.setup.progress() {
+                            p.to_owned()
+                        } else {
+                            match self.setup.health() {
+                                None => "Checking the Comet…".to_string(),
+                                Some(Health::Ok) => {
+                                    let fw = self
+                                        .setup
+                                        .status()
+                                        .and_then(|s| s.firmware)
+                                        .unwrap_or_else(|| "1.8.2".into());
+                                    format!("Bridge ready · fw {fw}")
+                                }
+                                Some(h) => health_text(&h).to_string(),
+                            }
+                        };
+                        let target_val = if debug_view().as_deref() == Some("panel-target") {
+                            "workstation (Linux)".to_string()
+                        } else if let Some((hello, _)) = self.agent() {
+                            format!("{} ({})", hello.name, hello.os)
+                        } else if let Some(state) = self.clip.as_ref().map(ClipBridge::state) {
+                            state.label().to_string()
+                        } else {
+                            "Not paired".to_string()
+                        };
+
+                        egui::Grid::new("clip_rows")
+                            .num_columns(2)
+                            .spacing(egui::vec2(12.0, 4.0))
+                            .min_col_width(64.0)
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new("Comet")
+                                        .font(egui::FontId::new(
+                                            13.0,
+                                            egui::FontFamily::Proportional,
+                                        ))
+                                        .color(theme::MUTED),
+                                );
+                                ui.label(
+                                    egui::RichText::new(comet_val)
+                                        .font(egui::FontId::new(
+                                            13.0,
+                                            egui::FontFamily::Proportional,
+                                        ))
+                                        .color(theme::TEXT),
+                                );
+                                ui.end_row();
+
+                                ui.label(
+                                    egui::RichText::new("Target")
+                                        .font(egui::FontId::new(
+                                            13.0,
+                                            egui::FontFamily::Proportional,
+                                        ))
+                                        .color(theme::MUTED),
+                                );
+                                ui.label(
+                                    egui::RichText::new(target_val)
+                                        .font(egui::FontId::new(
+                                            13.0,
+                                            egui::FontFamily::Proportional,
+                                        ))
+                                        .color(theme::TEXT),
+                                );
+                                ui.end_row();
+                            });
+
+                        if let Some(label) = self.bridge_action()
+                            && theme::secondary_button(ui, label, 32.0, false).clicked()
+                        {
+                            self.confirm =
+                                Some(Confirm::BridgeSetup(label.trim_end_matches('…').into()));
+                        }
+
+                        // Segmented direction control
+                        let mut dir_idx = match self.device.clip_direction {
+                            ClipDirection::Both => 0,
+                            ClipDirection::ToTarget => 1,
+                            ClipDirection::FromTarget => 2,
+                        };
+                        if theme::segmented(
+                            ui,
+                            &mut dir_idx,
+                            &["Both ways", "To target", "From target"],
+                        )
+                        .changed()
+                        {
+                            self.device.clip_direction = match dir_idx {
+                                0 => ClipDirection::Both,
+                                1 => ClipDirection::ToTarget,
+                                _ => ClipDirection::FromTarget,
+                            };
+                            action = ConsoleAction::TargetChanged;
+                        }
+
+                        // Pause sync switch
+                        if theme::labelled_switch(ui, "Pause sync", &mut self.clip_paused).changed()
+                            && let Some(c) = &self.clip
+                        {
+                            c.set_settings(self.clip_settings());
+                        }
+
+                        // Linux paste preference if target is Linux
+                        if self.device.target == TargetOs::Linux
+                            && debug_view().as_deref() != Some("panel-target")
+                        {
+                            ui.label(
+                                egui::RichText::new("Insert clipboard pastes with:")
+                                    .font(egui::FontId::new(12.0, theme::bold_family()))
+                                    .color(theme::MUTED),
+                            );
+                            let before = self.device.insert_paste;
+                            for (p, l) in [
+                                (PastePref::Auto, "Auto (Ctrl+Shift+V in terminals)"),
+                                (PastePref::CtrlV, "Ctrl+V"),
+                                (PastePref::CtrlShiftV, "Ctrl+Shift+V"),
+                            ] {
+                                if ui
+                                    .radio_value(&mut self.device.insert_paste, p, l)
+                                    .clicked()
+                                    && self.device.insert_paste != before
+                                {
+                                    action = ConsoleAction::TargetChanged;
+                                }
+                            }
+                        }
+
+                        if let Some(c) = &self.clip
+                            && c.settings() != self.clip_settings()
+                        {
+                            c.set_settings(self.clip_settings());
+                        }
+
+                        // Set up the target again… button
+                        let setup_label = if self.clip.is_none() {
+                            "Set up the target…"
+                        } else {
+                            "Set up the target again…"
+                        };
+                        if theme::secondary_button(ui, setup_label, 36.0, true)
+                            .on_hover_text(
+                                "Reinstalls the agent on the target with a new pairing code",
+                            )
+                            .clicked()
+                        {
+                            self.start_target_setup();
+                        }
+
+                        if self.clip.is_some()
+                            && debug_view().as_deref() != Some("panel-target")
+                            && ui.add(theme::ghost("Forget pairing")).clicked()
+                        {
+                            self.forget_clipboard_pairing();
+                        }
+                    });
             }
         });
 
@@ -624,94 +897,124 @@ impl Console {
         let state = self.clip.as_ref().map(ClipBridge::state);
         let connected = matches!(state, Some(BridgeState::Connected(..)));
         let mut close = false;
-        egui::Modal::new(egui::Id::unique("target-setup")).show(ctx, |ui| {
-            ui.set_max_width(560.0);
-            ui.label(egui::RichText::new("Set up the target").size(17.0).strong());
-            ui.horizontal(|ui| {
-                ui.label("The target runs:");
-                for os in [TargetOs::Linux, TargetOs::Windows, TargetOs::MacOs] {
-                    ui.selectable_value(&mut chosen, os, os.label());
-                }
-            });
-            if connected {
-                ui.colored_label(
-                    theme::OK,
-                    "The agent is connected: the clipboard is shared now.",
+        egui::Modal::new(egui::Id::unique("target-setup"))
+            .frame(theme::modal_frame())
+            .show(ctx, |ui| {
+                ui.set_max_width(560.0);
+                ui.label(
+                    egui::RichText::new("Set up the target")
+                        .font(egui::FontId::new(18.0, theme::bold_family()))
+                        .color(theme::TEXT),
                 );
-            }
-            let Some(command) = &command else {
-                ui.label(format!(
-                    "The clipboard agent does not run on {} targets yet. \
-                     Pick the target's OS in the toolbar if it is wrong.",
-                    os.label()
-                ));
-                ui.label("Manual pairing on a supported system:");
-                ui.monospace(format!("cometdesk-agent pair {code}"));
-                if ui.button("Close").clicked() {
-                    close = true;
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("The target runs:")
+                            .font(egui::FontId::new(13.5, egui::FontFamily::Proportional))
+                            .color(theme::MUTED),
+                    );
+                    for os in [TargetOs::Linux, TargetOs::Windows, TargetOs::MacOs] {
+                        ui.selectable_value(&mut chosen, os, os.label());
+                    }
+                });
+                if connected {
+                    ui.colored_label(
+                        theme::OK,
+                        "The agent is connected: the clipboard is shared now.",
+                    );
                 }
-                return;
-            };
-            if missing_agent {
-                ui.colored_label(
-                    theme::WARN,
-                    "The Comet has no agent program for this system yet: build it with \
-                     scripts/build-agents.sh, then update the Comet's bridge.",
+                let Some(command) = &command else {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "The clipboard agent does not run on {} targets yet. \
+                             Pick the target's OS in the toolbar if it is wrong.",
+                            os.label()
+                        ))
+                        .color(theme::MUTED),
+                    );
+                    ui.label(
+                        egui::RichText::new("Manual pairing on a supported system:")
+                            .color(theme::MUTED),
+                    );
+                    ui.monospace(format!("cometdesk-agent pair {code}"));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Close").clicked() {
+                            close = true;
+                        }
+                    });
+                    return;
+                };
+                if missing_agent {
+                    ui.colored_label(
+                        theme::WARN,
+                        "The Comet has no agent program for this system yet: build it with \
+                         scripts/build-agents.sh, then update the Comet's bridge.",
+                    );
+                }
+                ui.label(
+                    egui::RichText::new(format!(
+                        "1. Open a {} on the target and click into it.",
+                        if os == TargetOs::Windows {
+                            "Run dialog or PowerShell"
+                        } else {
+                            "terminal"
+                        }
+                    ))
+                    .color(theme::MUTED),
                 );
-            }
-            ui.label(format!(
-                "1. Open a {} on the target and click into it.",
-                if os == TargetOs::Windows {
-                    "Run dialog or PowerShell"
-                } else {
-                    "terminal"
+                let (open_label, open_keys): (&str, &[&'static str]) = match os {
+                    TargetOs::Windows => ("Open the Run dialog (Win+R)", &["MetaLeft", "KeyR"]),
+                    _ => (
+                        "Open a terminal (Ctrl+Alt+T)",
+                        &["ControlLeft", "AltLeft", "KeyT"],
+                    ),
+                };
+                if ui.button(open_label).clicked() {
+                    self.send_combo(open_keys);
                 }
-            ));
-            let (open_label, open_keys): (&str, &[&'static str]) = match os {
-                TargetOs::Windows => ("Open the Run dialog (Win+R)", &["MetaLeft", "KeyR"]),
-                _ => (
-                    "Open a terminal (Ctrl+Alt+T)",
-                    &["ControlLeft", "AltLeft", "KeyT"],
-                ),
-            };
-            if ui.button(open_label).clicked() {
-                self.send_combo(open_keys);
-            }
-            ui.label(
-                "2. Run this command there. It downloads the agent from the Comet over the \
-                      USB cable, pairs it and starts it (also at every login). No admin rights \
-                      or internet needed.",
-            );
-            ui.add(
-                egui::TextEdit::multiline(&mut command.as_str())
-                    .font(egui::TextStyle::Monospace)
-                    .desired_rows(2)
-                    .desired_width(f32::INFINITY),
-            );
-            ui.horizontal(|ui| {
-                if ui
-                    .button("Run it on the target")
-                    .on_hover_text("Types the command and presses Enter in the focused window")
-                    .clicked()
+                ui.label(
+                    egui::RichText::new(
+                        "2. Run this command there. It downloads the agent from the Comet over the \
+                              USB cable, pairs it and starts it (also at every login). No admin rights \
+                              or internet needed.",
+                    )
+                    .color(theme::MUTED),
+                );
+                ui.add(
+                    egui::TextEdit::multiline(&mut command.as_str())
+                        .font(egui::TextStyle::Monospace)
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("Run it on the target")
+                        .on_hover_text("Types the command and presses Enter in the focused window")
+                        .clicked()
+                    {
+                        self.start_typing(format!("{command}\n"));
+                    }
+                    if ui.button("Copy").clicked() {
+                        ui.ctx().copy_text(command.clone());
+                    }
+                });
+                if let Some(s) = &state
+                    && !connected
                 {
-                    self.start_typing(format!("{command}\n"));
+                    ui.label(
+                        egui::RichText::new(format!("Status: {}", s.label())).color(theme::MUTED),
+                    );
                 }
-                if ui.button("Copy").clicked() {
-                    ui.ctx().copy_text(command.clone());
-                }
+                ui.add_space(8.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(theme::primary(if connected { "Done" } else { "Close" }))
+                        .clicked()
+                    {
+                        close = true;
+                    }
+                });
             });
-            if let Some(s) = &state
-                && !connected
-            {
-                ui.label(format!("Status: {}", s.label()));
-            }
-            if ui
-                .button(if connected { "Done" } else { "Close" })
-                .clicked()
-            {
-                close = true;
-            }
-        });
         if chosen != os {
             self.set_target(chosen);
         }
@@ -890,264 +1193,310 @@ impl Console {
     }
 
     fn video_menu(&mut self, ui: &mut egui::Ui) {
-        ui.label(egui::RichText::new("This viewer").strong());
-        ui.label(
-            egui::RichText::new("Video source")
-                .color(theme::MUTED)
-                .small(),
-        );
-        for t in Transport::ALL {
-            let label = match t {
-                Transport::Direct => "Direct (LAN, lowest latency)",
-                Transport::Pion => "Remote (WebRTC with error correction)",
-                Transport::Janus => "Remote (WebRTC, Janus)",
+        ui.spacing_mut().item_spacing = egui::vec2(0.0, 12.0);
+
+        // --- THIS VIEWER section ---
+        theme::caption(ui, "THIS VIEWER");
+
+        theme::field_label(ui, "Video source");
+        let mut trans_idx = match self.transport {
+            Transport::Direct => 0,
+            Transport::Pion => 1,
+            Transport::Janus => 2,
+        };
+        if theme::segmented(ui, &mut trans_idx, &["Direct", "WebRTC", "Janus"]).changed() {
+            let t = match trans_idx {
+                0 => Transport::Direct,
+                1 => Transport::Pion,
+                _ => Transport::Janus,
             };
-            if ui.radio(self.transport == t, label).clicked() {
-                self.set_transport(t);
-                ui.close();
-            }
+            self.set_transport(t);
         }
+
         let mut audio = self.audio_on;
-        let enabled = matches!(
+        let audio_enabled = matches!(
             self.video_info.mode,
             Some(VideoMode::Webrtc | VideoMode::FlexFec | VideoMode::DirectH264)
         );
-        if ui
-            .add_enabled(enabled, egui::Checkbox::new(&mut audio, "Play audio"))
-            .on_disabled_hover_text(
-                "Audio needs the device in webrtc, flex_fec or direct_h264 video mode",
-            )
-            .changed()
-        {
+        let audio_resp = ui.add_enabled_ui(audio_enabled, |ui| {
+            theme::labelled_switch(ui, "Play audio", &mut audio)
+        });
+        if audio_resp.inner.changed() && audio_enabled {
             self.set_audio(audio);
         }
-        if self.audio_on {
-            let devices = self.audio_outputs();
-            let mut chosen = None;
-            theme::section(ui, "Audio output", |ui| {
-                let current = &self.device.audio_output;
-                if ui.radio(current.is_empty(), "System default").clicked() {
-                    chosen = Some(String::new());
+        if !audio_enabled {
+            audio_resp.response.on_disabled_hover_text(
+                "Audio needs the device in webrtc, flex_fec or direct_h264 video mode",
+            );
+        }
+
+        let devices = self.audio_outputs();
+        let current_out = if self.device.audio_output.is_empty() {
+            "System default"
+        } else {
+            &self.device.audio_output
+        };
+        let mut chosen_audio = None;
+        theme::show_dropdown_row(
+            ui,
+            egui::Id::unique("audio_output_dropdown"),
+            "Audio output",
+            current_out,
+            240.0,
+            |ui| {
+                if menu_button_item(ui, "System default", None).clicked() {
+                    chosen_audio = Some(String::new());
+                    ui.close();
                 }
                 for name in &devices {
-                    if ui.radio(current == name, name).clicked() {
-                        chosen = Some(name.clone());
+                    if menu_button_item(ui, name, None).clicked() {
+                        chosen_audio = Some(name.clone());
+                        ui.close();
                     }
                 }
-            });
-            if let Some(name) = chosen {
-                self.device.audio_output = name;
-                self.target_changed = true;
-                self.set_audio(true);
-                ui.close();
-            }
-        }
-        ui.separator();
-        ui.label(
-            egui::RichText::new("Whole device")
-                .strong()
-                .color(theme::WARN),
+            },
         );
-        ui.label(
-            egui::RichText::new("Changes apply to every viewer, after confirming")
-                .color(theme::MUTED)
-                .small(),
-        );
-        let info = &self.video_info;
-        let mut change = None;
-        theme::section(ui, "Streaming protocol", |ui| {
-            for m in VideoMode::ALL {
-                let on = info.mode == Some(m);
-                if ui
-                    .radio(on, video_mode_label(m))
-                    .on_hover_text(m.wire_name())
-                    .clicked()
-                    && !on
-                {
-                    change = Some(VideoChange::Mode(m));
-                }
-            }
-        });
-        theme::section(ui, "Codec", |ui| {
-            for format in VideoFormat::ALL {
-                let on = info.codec == Some(format);
-                let supported = match format {
-                    VideoFormat::H264 => true,
-                    VideoFormat::H265 => info.h265_supported,
-                };
-                let label = format.label();
-                let radio = egui::RadioButton::new(on, label);
-                if ui
-                    .add_enabled(supported, radio)
-                    .on_disabled_hover_text("H.265 is not supported by this device")
-                    .clicked()
-                    && !on
-                {
-                    change = Some(VideoChange::Codec(format));
-                }
-            }
-        });
-        theme::section(ui, "Bandwidth saving", |ui| {
-            for (m, label) in [
-                (VencMode::Smart, "Smart (less bandwidth)"),
-                (VencMode::Normal, "Normal"),
-            ] {
-                let on = info.venc == Some(m);
-                if ui
-                    .radio(on, label)
-                    .on_hover_text("Encoder mode: Smart reduces bandwidth")
-                    .clicked()
-                    && !on
-                {
-                    change = Some(VideoChange::Venc(m));
-                }
-            }
-        });
-        theme::section(ui, "Latency mode", |ui| {
-            for (m, label) in [
-                (LatencyMode::LowestLatency, "Lowest latency"),
-                (LatencyMode::SmoothDisplay, "Smooth display"),
-            ] {
-                let on = info.latency == Some(m);
-                if ui.radio(on, label).clicked() && !on {
-                    change = Some(VideoChange::Latency(m));
-                }
-            }
-        });
-        theme::section(ui, "Orientation", |ui| {
-            for o in Orientation::ALL {
-                let on = info.orientation == o;
-                if ui.radio(on, format!("{}°", o.degrees())).clicked() && !on {
-                    change = Some(VideoChange::Orientation(o));
-                }
-            }
-        });
-        ui.add_enabled_ui(!info.edid_presets.is_empty(), |ui| {
-            theme::section(ui, "Display resolution", |ui| {
-                egui::ScrollArea::vertical()
-                    .max_height(360.0)
-                    .show(ui, |ui| {
-                        let current = info
-                            .edid_presets
-                            .iter()
-                            .find(|p| edid::normalize(&p.content) == info.edid);
-                        if current.is_none() {
-                            let _ = ui.radio(true, "Custom");
-                        }
-                        for p in &info.edid_presets {
-                            let on = current.is_some_and(|c| c.key == p.key);
-                            let label = if p.audio {
-                                p.label.clone()
-                            } else {
-                                format!("{} (no audio)", p.label)
-                            };
-                            if ui.radio(on, label).clicked() && !on {
-                                change = Some(VideoChange::Edid(p.clone()));
-                            }
-                        }
-                    });
-            });
-        });
-        ui.separator();
-        self.encoder_controls(ui, &mut change);
-        if let Some(c) = change {
-            self.confirm = Some(Confirm::Video(c));
-            ui.close();
+        if let Some(name) = chosen_audio {
+            self.device.audio_output = name;
+            self.target_changed = true;
+            self.set_audio(true);
         }
-    }
 
-    /// Frame rate and bitrate, each set on its own. Edits are kept as a draft until applied.
-    fn encoder_controls(&mut self, ui: &mut egui::Ui, change: &mut Option<VideoChange>) {
-        let info = &self.video_info;
-        let p = &info.params;
-        let (cur_fps, cur_kbps, cur_gop) = (p.desired_fps, p.h264_bitrate, p.h264_gop);
-        let (f, b, g) = (
-            info.limits.desired_fps,
-            info.limits.h264_bitrate,
-            info.limits.h264_gop,
-        );
-        let (fps_min, fps_max) = (f.min.max(1), f.max.max(f.min.max(1)));
-        let (kbps_min, kbps_max) = (b.min, b.max.max(b.min));
-        let (gop_min, gop_max) = (g.min.max(1), g.max.max(g.min.max(1)));
-        let source = info.source_fps.map_or(60, i64::from);
-        let (mut fps, mut kbps, mut gop) = self.encoder_draft.unwrap_or((
-            cur_fps.unwrap_or(30),
-            cur_kbps.unwrap_or(kbps_min),
-            cur_gop.unwrap_or(gop_min),
-        ));
-        let shown = |v: Option<i64>| v.map_or("?".into(), |v| v.to_string());
-        ui.label(format!(
-            "Encoder: {} fps, {} kbit/s, keyframe every {} frames",
-            shown(cur_fps),
-            shown(cur_kbps),
-            shown(cur_gop),
-        ));
-        ui.horizontal(|ui| {
-            ui.label("Frame rate");
-            ui.add(
-                egui::DragValue::new(&mut fps)
-                    .range(fps_min..=fps_max)
-                    .suffix(" fps"),
+        ui.add_space(4.0);
+
+        // --- Whole device card (orange outline) ---
+        let card_frame = theme::panel_card()
+            .stroke(egui::Stroke::new(1.0, theme::WARN))
+            .inner_margin(egui::Margin::same(14));
+
+        card_frame.show(ui, |ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, 10.0);
+
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(0.0, 2.0);
+                ui.label(
+                    egui::RichText::new("Whole device")
+                        .font(egui::FontId::new(13.0, theme::bold_family()))
+                        .color(theme::WARN),
+                );
+                ui.label(
+                    egui::RichText::new("Applies to every viewer, after you confirm.")
+                        .font(egui::FontId::new(12.0, egui::FontFamily::Proportional))
+                        .color(theme::MUTED),
+                );
+            });
+
+            let info = &self.video_info;
+            let mut change = None;
+
+            // Codec dropdown row
+            let codec_val = info.codec.map_or("H.264", |c| c.label());
+            theme::show_dropdown_row(
+                ui,
+                egui::Id::unique("codec_dropdown"),
+                "Codec",
+                codec_val,
+                200.0,
+                |ui| {
+                    for format in VideoFormat::ALL {
+                        let on = info.codec == Some(format);
+                        let supported = match format {
+                            VideoFormat::H264 => true,
+                            VideoFormat::H265 => info.h265_supported,
+                        };
+                        if supported && menu_button_item(ui, format.label(), None).clicked() && !on
+                        {
+                            change = Some(VideoChange::Codec(format));
+                            ui.close();
+                        }
+                    }
+                },
             );
-            for v in [30, source] {
-                if (fps_min..=fps_max).contains(&v) && ui.small_button(v.to_string()).clicked() {
-                    fps = v;
-                }
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label("Bitrate");
-            ui.add(
-                egui::DragValue::new(&mut kbps)
-                    .range(kbps_min..=kbps_max)
-                    .speed(50)
-                    .suffix(" kbit/s"),
+
+            // Latency dropdown row
+            let latency_val = match info.latency {
+                Some(LatencyMode::LowestLatency) => "Lowest",
+                Some(LatencyMode::SmoothDisplay) => "Smooth",
+                None => "Lowest",
+            };
+            theme::show_dropdown_row(
+                ui,
+                egui::Id::unique("latency_dropdown"),
+                "Latency",
+                latency_val,
+                200.0,
+                |ui| {
+                    for (m, label) in [
+                        (LatencyMode::LowestLatency, "Lowest"),
+                        (LatencyMode::SmoothDisplay, "Smooth"),
+                    ] {
+                        let on = info.latency == Some(m);
+                        if menu_button_item(ui, label, None).clicked() && !on {
+                            change = Some(VideoChange::Latency(m));
+                            ui.close();
+                        }
+                    }
+                },
             );
-        });
-        ui.horizontal(|ui| {
-            for p in QualityPreset::ALL {
-                let v = p.bitrate(&info.limits);
-                if ui
-                    .small_button(format!("{p:?}"))
-                    .on_hover_text(format!("{v} kbit/s"))
-                    .clicked()
-                {
-                    kbps = v;
-                }
+
+            // Resolution dropdown row
+            let cur_preset = info
+                .edid_presets
+                .iter()
+                .find(|p| edid::normalize(&p.content) == info.edid);
+            let res_val = cur_preset.map(|p| p.label.as_str()).unwrap_or("1920×1080");
+            theme::show_dropdown_row(
+                ui,
+                egui::Id::unique("resolution_dropdown"),
+                "Resolution",
+                res_val,
+                240.0,
+                |ui| {
+                    for p in &info.edid_presets {
+                        let on = cur_preset.is_some_and(|c| c.key == p.key);
+                        let label = if p.audio {
+                            p.label.clone()
+                        } else {
+                            format!("{} (no audio)", p.label)
+                        };
+                        if menu_button_item(ui, &label, None).clicked() && !on {
+                            change = Some(VideoChange::Edid(p.clone()));
+                            ui.close();
+                        }
+                    }
+                },
+            );
+
+            // Streaming protocol dropdown row
+            let mode_val = info.mode.map_or("Direct H.264", video_mode_label);
+            theme::show_dropdown_row(
+                ui,
+                egui::Id::unique("mode_dropdown"),
+                "Streaming protocol",
+                mode_val,
+                220.0,
+                |ui| {
+                    for m in VideoMode::ALL {
+                        let on = info.mode == Some(m);
+                        if menu_button_item(ui, video_mode_label(m), Some(m.wire_name())).clicked()
+                            && !on
+                        {
+                            change = Some(VideoChange::Mode(m));
+                            ui.close();
+                        }
+                    }
+                },
+            );
+
+            // Bandwidth saving dropdown row
+            let venc_val = match info.venc {
+                Some(VencMode::Smart) => "Smart",
+                Some(VencMode::Normal) => "Normal",
+                None => "Normal",
+            };
+            theme::show_dropdown_row(
+                ui,
+                egui::Id::unique("venc_dropdown"),
+                "Bandwidth saving",
+                venc_val,
+                200.0,
+                |ui| {
+                    for (m, label) in [(VencMode::Smart, "Smart"), (VencMode::Normal, "Normal")] {
+                        let on = info.venc == Some(m);
+                        if menu_button_item(ui, label, None).clicked() && !on {
+                            change = Some(VideoChange::Venc(m));
+                            ui.close();
+                        }
+                    }
+                },
+            );
+
+            // Orientation dropdown row
+            let orient_val = format!("{}°", info.orientation.degrees());
+            theme::show_dropdown_row(
+                ui,
+                egui::Id::unique("orient_dropdown"),
+                "Orientation",
+                &orient_val,
+                160.0,
+                |ui| {
+                    for o in Orientation::ALL {
+                        let on = info.orientation == o;
+                        let label = format!("{}°", o.degrees());
+                        if menu_button_item(ui, &label, None).clicked() && !on {
+                            change = Some(VideoChange::Orientation(o));
+                            ui.close();
+                        }
+                    }
+                },
+            );
+
+            // Monospace encoder summary line
+            let p = &info.params;
+            let (cur_fps, cur_kbps, cur_gop) = (p.desired_fps, p.h264_bitrate, p.h264_gop);
+            let (f, b) = (info.limits.desired_fps, info.limits.h264_bitrate);
+            // Without reported limits a 1..=1 range would clamp the draft to a nonsense value.
+            let (fps_min, fps_max) = if f.max > f.min {
+                (f.min.max(1), f.max)
+            } else {
+                (1, 240)
+            };
+            let (kbps_min, kbps_max) = if b.max > b.min {
+                (b.min, b.max)
+            } else {
+                (100, 100_000)
+            };
+            let (mut fps, mut kbps, gop) = self.encoder_draft.unwrap_or((
+                cur_fps.unwrap_or(60),
+                cur_kbps.unwrap_or(8000),
+                cur_gop.unwrap_or(60),
+            ));
+
+            let summary = format!(
+                "Encoder: {} fps · {} kbit/s · keyframe {}",
+                cur_fps.unwrap_or(60),
+                cur_kbps.unwrap_or(8000),
+                cur_gop.unwrap_or(60),
+            );
+            ui.label(
+                egui::RichText::new(summary)
+                    .font(egui::FontId::new(11.0, egui::FontFamily::Monospace))
+                    .color(theme::MUTED),
+            );
+
+            // Equal-width fps and kbit/s fields
+            let pair_w = (ui.available_width() - 8.0) * 0.5;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
+                theme::field_box(ui, pair_w, "fps", &mut fps, fps_min..=fps_max, 1.0);
+                theme::field_box(ui, pair_w, "kbit/s", &mut kbps, kbps_min..=kbps_max, 50.0);
+            });
+
+            let update = StreamerUpdate {
+                desired_fps: (Some(fps) != cur_fps).then_some(fps),
+                h264_bitrate: (Some(kbps) != cur_kbps).then_some(kbps),
+                h264_gop: (Some(gop) != cur_gop).then_some(gop),
+                ..Default::default()
+            };
+            let edited = update != StreamerUpdate::default();
+            self.encoder_draft =
+                (edited || self.encoder_draft.is_some()).then_some((fps, kbps, gop));
+
+            if theme::yellow_button(ui, "Apply…", 40.0).clicked() {
+                self.encoder_draft = None;
+                let final_update = StreamerUpdate {
+                    desired_fps: Some(fps),
+                    h264_bitrate: Some(kbps),
+                    h264_gop: Some(gop),
+                    ..Default::default()
+                };
+                change = Some(VideoChange::Encoder(final_update));
+            }
+
+            if let Some(c) = change {
+                self.confirm = Some(Confirm::Video(c));
             }
         });
-        // H.265 on this encoder sends every frame of a still screen and a full keyframe
-        // each interval, so the interval sets its idle bitrate (~200 KB per keyframe at
-        // 1440p). Our viewers ask for a keyframe when they need one.
-        ui.horizontal(|ui| {
-            ui.label("Keyframe every");
-            ui.add(
-                egui::DragValue::new(&mut gop)
-                    .range(gop_min..=gop_max)
-                    .suffix(" frames"),
-            )
-            .on_hover_text(format!("{:.1} s at {fps} fps", gop as f64 / fps as f64));
-            for v in [fps, gop_max] {
-                if (gop_min..=gop_max).contains(&v) && ui.small_button(v.to_string()).clicked() {
-                    gop = v;
-                }
-            }
-        });
-        let update = StreamerUpdate {
-            desired_fps: (Some(fps) != cur_fps).then_some(fps),
-            h264_bitrate: (Some(kbps) != cur_kbps).then_some(kbps),
-            h264_gop: (Some(gop) != cur_gop).then_some(gop),
-            ..Default::default()
-        };
-        let edited = update != StreamerUpdate::default();
-        self.encoder_draft = edited.then_some((fps, kbps, gop));
-        if ui
-            .add_enabled(edited, egui::Button::new("Apply…"))
-            .clicked()
-        {
-            self.encoder_draft = None;
-            *change = Some(VideoChange::Encoder(update));
-        }
     }
 
     /// Wakes the UI when something shown in the toolbar changes (not on every event).
@@ -1753,12 +2102,26 @@ impl Console {
         }
         let painter = ui.painter();
         painter.rect_filled(area, 0.0, egui::Color32::from_black_alpha(90));
-        painter.text(
-            area.center_top() + egui::vec2(0.0, 12.0),
-            egui::Align2::CENTER_TOP,
-            "Drag over the part of the screen to copy · Esc cancels",
-            egui::FontId::proportional(15.0),
-            egui::Color32::WHITE,
+        let msg = "Drag over the part of the screen to copy · Esc cancels";
+        let font_id = egui::FontId::new(13.0, egui::FontFamily::Proportional);
+        let galley = painter.layout_no_wrap(msg.to_owned(), font_id, theme::TEXT);
+        let pill_size = egui::vec2(galley.size().x + 24.0, 32.0);
+        let pill_rect =
+            egui::Rect::from_center_size(area.center_top() + egui::vec2(0.0, 24.0), pill_size);
+        painter.rect(
+            pill_rect,
+            egui::CornerRadius::same(8),
+            theme::PANEL,
+            egui::Stroke::new(1.0, theme::BORDER),
+            egui::StrokeKind::Inside,
+        );
+        painter.galley(
+            egui::pos2(
+                pill_rect.min.x + 12.0,
+                pill_rect.center().y - galley.size().y * 0.5,
+            ),
+            galley,
+            theme::TEXT,
         );
         let Some(start) = pick.start else { return };
         let sel = egui::Rect::from_two_pos(start, pick.now).intersect(area);
@@ -1877,130 +2240,282 @@ impl Console {
     /// What the agent reports, as a menu: for checking at a glance that the target is what
     /// the app assumes.
     fn info_menu(&mut self, ui: &mut egui::Ui) {
-        let Some((hello, info)) = self.agent() else {
-            return;
-        };
-        let up = match (info.uptime_secs, self.uptime_seen) {
-            (Some(u), Some((seen, at))) if seen == u => Some(u + at.elapsed().as_secs()),
-            (u, _) => u,
-        };
-        // A fixed title: load figures live in the body so the menu does not change width.
-        let (title, tint) = match info.session {
-            SessionState::Locked => ("System info · locked".to_string(), Some(theme::WARN)),
-            _ => ("System info".to_string(), None),
-        };
-        let mut title = egui::RichText::new(title);
-        if let Some(c) = tint {
-            title = title.color(c);
-        }
-        theme::section(ui, title, |ui| {
-            let layouts: Vec<&str> = info
-                .layouts
-                .iter()
-                .filter_map(|l| cometdesk::layout::keymap_from_native(l))
-                .collect();
-            let mut rows: Vec<(&str, String)> = vec![
-                ("Host", hello.name.clone()),
-                ("OS", info.os_version.clone().unwrap_or(hello.os.clone())),
-                ("User", info.user.clone().unwrap_or_default()),
-                (
-                    "Session",
-                    match info.session {
-                        SessionState::Locked => "locked (lock screen)".into(),
-                        SessionState::Active => "active".into(),
-                        SessionState::Unknown => "unknown".into(),
-                    },
-                ),
-                ("Keyboard", info.keyboard.clone().unwrap_or_default()),
-                ("Layouts", layouts.join(", ")),
-            ];
-            rows.push((
-                "Input method",
-                match info.ime {
-                    Some(true) => "on (typing key by key may be composed)".into(),
-                    Some(false) => "off".into(),
-                    None => String::new(),
-                },
-            ));
-            if let Some(f) = &info.focus {
-                rows.push((
-                    "Focus",
-                    format!("{}{}", f.app, if f.terminal { " (terminal)" } else { "" }),
-                ));
-            }
-            for (i, d) in info.displays.iter().enumerate() {
-                rows.push((
-                    "Display",
-                    format!(
-                        "{}: {}x{} at {},{} · {}%{}",
-                        i + 1,
-                        d.width,
-                        d.height,
-                        d.x,
-                        d.y,
-                        d.scale,
-                        if d.primary { " · main" } else { "" }
-                    ),
-                ));
-            }
-            if let Some(u) = up {
-                rows.push(("Uptime", format!("{}h {:02}m", u / 3600, u / 60 % 60)));
-            }
-            if let Some(b) = info.battery {
-                rows.push((
-                    "Battery",
-                    format!(
-                        "{}%{}",
-                        b.percent,
-                        if b.charging { " (charging)" } else { "" }
-                    ),
-                ));
-            }
-            if let Some(l) = info.load {
-                let usage = |u: cometdesk_clip::Usage| {
-                    format!(
-                        "{:.1} / {:.1} GB ({}%)",
-                        u.used_mb as f64 / 1024.0,
-                        u.total_mb as f64 / 1024.0,
-                        (u.used_mb * 100).checked_div(u.total_mb).unwrap_or(0)
-                    )
+        let has_media =
+            self.caps.supports(Feature::Msd) || debug_view().as_deref() == Some("panel-target");
+
+        let card_frame = egui::Frame::NONE
+            .fill(theme::CARD)
+            .stroke(egui::Stroke::new(1.0, theme::BORDER))
+            .corner_radius(egui::CornerRadius::same(10))
+            .inner_margin(egui::Margin::ZERO);
+
+        card_frame.show(ui, |ui| {
+            // System info row
+            let (info_head_rect, info_resp) = ui
+                .allocate_exact_size(egui::vec2(ui.available_width(), 44.0), egui::Sense::click());
+            if ui.is_rect_visible(info_head_rect) {
+                if info_resp.hovered() {
+                    ui.painter().rect_filled(
+                        info_head_rect,
+                        egui::CornerRadius::same(10),
+                        theme::CARD_HOVER,
+                    );
+                }
+                let title_font = egui::FontId::new(14.0, theme::bold_family());
+                let title_galley =
+                    ui.painter()
+                        .layout_no_wrap("System info".to_owned(), title_font, theme::TEXT);
+                let title_pos = egui::pos2(
+                    info_head_rect.min.x + 14.0,
+                    info_head_rect.center().y - title_galley.size().y * 0.5,
+                );
+                ui.painter().galley(title_pos, title_galley, theme::TEXT);
+
+                let chevron_dir = if self.info_expanded {
+                    theme::ChevronDir::Down
+                } else {
+                    theme::ChevronDir::Right
                 };
-                if let Some(c) = l.cpu_percent {
-                    rows.push(("CPU", format!("{c}%")));
-                }
-                if let Some(m) = l.memory {
-                    rows.push(("Memory", usage(m)));
-                }
-                if let Some(d) = l.disk {
-                    rows.push(("Disk", usage(d)));
-                }
+                let chevron_pos =
+                    egui::pos2(info_head_rect.max.x - 14.0 - 4.0, info_head_rect.center().y);
+                theme::chevron(ui.painter(), chevron_pos, 4.0, chevron_dir, theme::MUTED);
             }
-            egui::Grid::new("agent_info").num_columns(2).show(ui, |ui| {
-                for (k, v) in rows.iter().filter(|(_, v)| !v.is_empty()) {
-                    ui.label(*k);
-                    ui.label(v);
-                    ui.end_row();
-                }
-            });
-            if let Some(v) = info.volume {
-                ui.separator();
-                self.volume_row(ui, v);
+            if info_resp.clicked() {
+                self.info_expanded = !self.info_expanded;
             }
-            for (i, d) in info.displays.iter().enumerate() {
-                self.display_menu(ui, i, d, info.displays.len());
-            }
-            if info.layouts.len() > 1 {
-                ui.separator();
-                theme::section(ui, "Switch the target's layout", |ui| {
-                    for l in &info.layouts {
-                        let label = cometdesk::layout::keymap_from_native(l).unwrap_or(l);
-                        let active = info.keyboard.as_deref() == Some(l.as_str());
-                        if ui.selectable_label(active, label).clicked() && !active {
-                            self.request_layout(l.clone());
-                            ui.close();
+
+            if self.info_expanded {
+                egui::Frame::NONE
+                    .inner_margin(egui::Margin {
+                        left: 14,
+                        right: 14,
+                        top: 0,
+                        bottom: 14,
+                    })
+                    .show(ui, |ui| {
+                        if let Some((hello, info)) = self.agent() {
+                            let up = match (info.uptime_secs, self.uptime_seen) {
+                                (Some(u), Some((seen, at))) if seen == u => {
+                                    Some(u + at.elapsed().as_secs())
+                                }
+                                (u, _) => u,
+                            };
+                            let layouts: Vec<&str> = info
+                                .layouts
+                                .iter()
+                                .filter_map(|l| cometdesk::layout::keymap_from_native(l))
+                                .collect();
+                            let mut rows: Vec<(&str, String)> = vec![
+                                ("Host", hello.name.clone()),
+                                ("OS", info.os_version.clone().unwrap_or(hello.os.clone())),
+                                ("User", info.user.clone().unwrap_or_default()),
+                                (
+                                    "Session",
+                                    match info.session {
+                                        SessionState::Locked => "locked (lock screen)".into(),
+                                        SessionState::Active => "active".into(),
+                                        SessionState::Unknown => "unknown".into(),
+                                    },
+                                ),
+                                ("Keyboard", info.keyboard.clone().unwrap_or_default()),
+                                ("Layouts", layouts.join(", ")),
+                            ];
+                            rows.push((
+                                "Input method",
+                                match info.ime {
+                                    Some(true) => "on (typing key by key may be composed)".into(),
+                                    Some(false) => "off".into(),
+                                    None => String::new(),
+                                },
+                            ));
+                            if let Some(f) = &info.focus {
+                                rows.push((
+                                    "Focus",
+                                    format!(
+                                        "{}{}",
+                                        f.app,
+                                        if f.terminal { " (terminal)" } else { "" }
+                                    ),
+                                ));
+                            }
+                            for (i, d) in info.displays.iter().enumerate() {
+                                rows.push((
+                                    "Display",
+                                    format!(
+                                        "{}: {}x{} at {},{} · {}%{}",
+                                        i + 1,
+                                        d.width,
+                                        d.height,
+                                        d.x,
+                                        d.y,
+                                        d.scale,
+                                        if d.primary { " · main" } else { "" }
+                                    ),
+                                ));
+                            }
+                            if let Some(u) = up {
+                                rows.push(("Uptime", format!("{}h {:02}m", u / 3600, u / 60 % 60)));
+                            }
+                            if let Some(b) = info.battery {
+                                rows.push((
+                                    "Battery",
+                                    format!(
+                                        "{}%{}",
+                                        b.percent,
+                                        if b.charging { " (charging)" } else { "" }
+                                    ),
+                                ));
+                            }
+                            if let Some(l) = info.load {
+                                let usage = |u: cometdesk_clip::Usage| {
+                                    format!(
+                                        "{:.1} / {:.1} GB ({}%)",
+                                        u.used_mb as f64 / 1024.0,
+                                        u.total_mb as f64 / 1024.0,
+                                        (u.used_mb * 100).checked_div(u.total_mb).unwrap_or(0)
+                                    )
+                                };
+                                if let Some(c) = l.cpu_percent {
+                                    rows.push(("CPU", format!("{c}%")));
+                                }
+                                if let Some(m) = l.memory {
+                                    rows.push(("Memory", usage(m)));
+                                }
+                                if let Some(d) = l.disk {
+                                    rows.push(("Disk", usage(d)));
+                                }
+                            }
+                            egui::Grid::new("agent_info")
+                                .num_columns(2)
+                                .spacing(egui::vec2(12.0, 4.0))
+                                .min_col_width(64.0)
+                                .show(ui, |ui| {
+                                    for (k, v) in rows.iter().filter(|(_, v)| !v.is_empty()) {
+                                        ui.label(
+                                            egui::RichText::new(*k)
+                                                .font(egui::FontId::new(
+                                                    13.0,
+                                                    egui::FontFamily::Proportional,
+                                                ))
+                                                .color(theme::MUTED),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(v)
+                                                .font(egui::FontId::new(
+                                                    13.0,
+                                                    egui::FontFamily::Proportional,
+                                                ))
+                                                .color(theme::TEXT),
+                                        );
+                                        ui.end_row();
+                                    }
+                                });
+                            if let Some(v) = info.volume {
+                                ui.separator();
+                                self.volume_row(ui, v);
+                            }
+                            for (i, d) in info.displays.iter().enumerate() {
+                                self.display_menu(ui, i, d, info.displays.len());
+                            }
+                            if info.layouts.len() > 1 {
+                                ui.separator();
+                                theme::section(ui, "Switch the target's layout", |ui| {
+                                    for l in &info.layouts {
+                                        let label =
+                                            cometdesk::layout::keymap_from_native(l).unwrap_or(l);
+                                        let active = info.keyboard.as_deref() == Some(l.as_str());
+                                        if ui.selectable_label(active, label).clicked() && !active {
+                                            self.request_layout(l.clone());
+                                            ui.close();
+                                        }
+                                    }
+                                });
+                            }
+                        } else {
+                            ui.label(
+                                egui::RichText::new("No target agent connected")
+                                    .font(egui::FontId::new(13.0, egui::FontFamily::Proportional))
+                                    .color(theme::MUTED),
+                            );
                         }
+                    });
+            }
+
+            // Divider and Media row
+            if has_media {
+                let (sep_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 1.0),
+                    egui::Sense::hover(),
+                );
+                ui.painter()
+                    .rect_filled(sep_rect, egui::CornerRadius::ZERO, theme::BORDER);
+
+                let (media_head_rect, media_resp) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 44.0),
+                    egui::Sense::click(),
+                );
+                if ui.is_rect_visible(media_head_rect) {
+                    if media_resp.hovered() {
+                        ui.painter().rect_filled(
+                            media_head_rect,
+                            egui::CornerRadius::same(10),
+                            theme::CARD_HOVER,
+                        );
                     }
-                });
+                    let title_font = egui::FontId::new(14.0, theme::bold_family());
+                    let title_galley =
+                        ui.painter()
+                            .layout_no_wrap("Media".to_owned(), title_font, theme::TEXT);
+                    let title_pos = egui::pos2(
+                        media_head_rect.min.x + 14.0,
+                        media_head_rect.center().y - title_galley.size().y * 0.5,
+                    );
+                    ui.painter()
+                        .galley(title_pos, title_galley.clone(), theme::TEXT);
+
+                    let mounted =
+                        self.media.is_mounted() || debug_view().as_deref() == Some("panel-target");
+                    if mounted {
+                        let status_font = egui::FontId::new(12.0, egui::FontFamily::Proportional);
+                        let status_galley = ui.painter().layout_no_wrap(
+                            "● mounted".to_owned(),
+                            status_font,
+                            theme::OK,
+                        );
+                        let status_pos = egui::pos2(
+                            title_pos.x + title_galley.size().x + 8.0,
+                            media_head_rect.center().y - status_galley.size().y * 0.5,
+                        );
+                        ui.painter().galley(status_pos, status_galley, theme::OK);
+                    }
+
+                    let chevron_dir = if self.media_expanded {
+                        theme::ChevronDir::Down
+                    } else {
+                        theme::ChevronDir::Right
+                    };
+                    let chevron_pos = egui::pos2(
+                        media_head_rect.max.x - 14.0 - 4.0,
+                        media_head_rect.center().y,
+                    );
+                    theme::chevron(ui.painter(), chevron_pos, 4.0, chevron_dir, theme::MUTED);
+                }
+                if media_resp.clicked() {
+                    self.media_expanded = !self.media_expanded;
+                }
+
+                if self.media_expanded {
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin {
+                            left: 14,
+                            right: 14,
+                            top: 0,
+                            bottom: 14,
+                        })
+                        .show(ui, |ui| {
+                            self.media.panel_ui(ui);
+                        });
+                }
             }
         });
     }
@@ -2008,30 +2523,64 @@ impl Console {
     /// Lock, sleep, log off, restart and shut down through the agent: the OS closes the
     /// session cleanly, unlike the ATX button. Shown only while the agent is connected.
     fn session_menu(&mut self, ui: &mut egui::Ui) {
-        if !self.inserts_via_agent() {
+        if !self.inserts_via_agent() && debug_view().as_deref() != Some("panel-target") {
             return;
         }
-        theme::section(ui, "Session", |ui| {
-            for a in [
-                SessionAction::Lock,
-                SessionAction::Sleep,
-                SessionAction::Logoff,
-                SessionAction::Restart,
-                SessionAction::Shutdown,
-            ] {
-                let label = if a.destructive() {
-                    format!("{}…", a.label())
-                } else {
-                    a.label().to_string()
-                };
-                if ui.button(label).clicked() {
-                    if a.destructive() {
-                        self.confirm = Some(Confirm::Session(a));
-                    } else {
-                        self.session_action(a);
+
+        let card_frame = egui::Frame::NONE
+            .fill(theme::CARD)
+            .stroke(egui::Stroke::new(1.0, theme::BORDER))
+            .corner_radius(egui::CornerRadius::same(10))
+            .inner_margin(egui::Margin {
+                left: 14,
+                right: 14,
+                top: 12,
+                bottom: 12,
+            });
+
+        card_frame.show(ui, |ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, 10.0);
+            ui.label(
+                egui::RichText::new("Session")
+                    .font(egui::FontId::new(14.0, theme::bold_family()))
+                    .color(theme::TEXT),
+            );
+
+            let btn_w = ((ui.available_width() - 8.0) * 0.5).floor();
+
+            // Row 1: Lock, Sleep
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.allocate_ui(egui::vec2(btn_w, 34.0), |ui| {
+                    if theme::secondary_button(ui, "Lock", 34.0, false).clicked() {
+                        self.session_action(SessionAction::Lock);
                     }
-                    ui.close();
-                }
+                });
+                ui.allocate_ui(egui::vec2(btn_w, 34.0), |ui| {
+                    if theme::secondary_button(ui, "Sleep", 34.0, false).clicked() {
+                        self.session_action(SessionAction::Sleep);
+                    }
+                });
+            });
+
+            // Row 2: Log off…, Restart…
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.allocate_ui(egui::vec2(btn_w, 34.0), |ui| {
+                    if theme::secondary_button(ui, "Log off…", 34.0, false).clicked() {
+                        self.confirm = Some(Confirm::Session(SessionAction::Logoff));
+                    }
+                });
+                ui.allocate_ui(egui::vec2(btn_w, 34.0), |ui| {
+                    if theme::secondary_button(ui, "Restart…", 34.0, false).clicked() {
+                        self.confirm = Some(Confirm::Session(SessionAction::Restart));
+                    }
+                });
+            });
+
+            // Shut down… as full-width row
+            if theme::secondary_button(ui, "Shut down…", 34.0, false).clicked() {
+                self.confirm = Some(Confirm::Session(SessionAction::Shutdown));
             }
         });
     }
@@ -2116,26 +2665,31 @@ impl Console {
         egui::Area::new(egui::Id::unique("transfers"))
             .anchor(egui::Align2::LEFT_BOTTOM, [8.0, -8.0])
             .show(ctx, |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    for p in self.transfers.iter().map(|t| &t.progress) {
-                        let sent = p.sent.load(Ordering::Relaxed);
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::ProgressBar::new(sent as f32 / p.total.max(1) as f32)
-                                    .desired_width(240.0)
-                                    .text(format!(
-                                        "{} · {:.1} / {:.1} MB",
-                                        p.name,
-                                        sent as f64 / 1e6,
-                                        p.total as f64 / 1e6
-                                    )),
-                            );
-                            if ui.button("Cancel").clicked() {
-                                p.cancel.store(true, Ordering::Relaxed);
-                            }
-                        });
-                    }
-                });
+                egui::Frame::NONE
+                    .fill(theme::PANEL)
+                    .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .inner_margin(egui::Margin::symmetric(12, 10))
+                    .show(ui, |ui| {
+                        for p in self.transfers.iter().map(|t| &t.progress) {
+                            let sent = p.sent.load(Ordering::Relaxed);
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::ProgressBar::new(sent as f32 / p.total.max(1) as f32)
+                                        .desired_width(240.0)
+                                        .text(format!(
+                                            "{} · {:.1} / {:.1} MB",
+                                            p.name,
+                                            sent as f64 / 1e6,
+                                            p.total as f64 / 1e6
+                                        )),
+                                );
+                                if ui.button("Cancel").clicked() {
+                                    p.cancel.store(true, Ordering::Relaxed);
+                                }
+                            });
+                        }
+                    });
             });
     }
 
@@ -2464,8 +3018,8 @@ impl Console {
         if self.menu_open || self.toolbar_visible(edge_dwelled) {
             let frame = egui::Frame::NONE
                 .fill(theme::PANEL)
-                .stroke(egui::Stroke::new(1.0, theme::BORDER))
-                .inner_margin(egui::Margin::symmetric(12, 6));
+                .stroke(egui::Stroke::NONE)
+                .inner_margin(egui::Margin::symmetric(12, 8));
             let resp = egui::Panel::top("toolbar").frame(frame).show(ui, |ui| {
                 // Flat buttons: only hover and open states get a background.
                 let w = &mut ui.visuals_mut().widgets;
@@ -2486,10 +3040,11 @@ impl Console {
             ui.painter().hline(
                 rect.x_range(),
                 rect.bottom() - 0.5,
-                egui::Stroke::new(1.5, signal),
+                egui::Stroke::new(1.0, signal),
             );
             self.toolbar_hover = self.fullscreen && resp.response.contains_pointer();
             self.toolbar_rect = Some(resp.response.rect);
+            self.menu_open = egui::Popup::is_any_open(ui.ctx());
         } else {
             self.toolbar_hover = false;
             self.toolbar_rect = None;
@@ -2545,37 +3100,114 @@ impl Console {
 
     fn toolbar(&mut self, ui: &mut egui::Ui) -> ConsoleAction {
         let mut action = ConsoleAction::None;
+        ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
 
         // Left: where am I, and is it working.
-        if ui.button("‹ Devices").clicked() {
+        if theme::back_button(ui, "Devices").clicked() {
             action = ConsoleAction::Disconnect;
         }
-        theme::badge(ui, &self.device.host, self.device.display_name(), 26.0);
+        theme::vdivider(ui, 20.0);
+        theme::badge(ui, &self.device.host, self.device.display_name(), 24.0);
         ui.label(
             egui::RichText::new(self.device.display_name())
-                .size(17.0)
-                .strong(),
+                .font(egui::FontId::new(14.0, theme::bold_family()))
+                .color(theme::TEXT),
         );
         let (text, color) = self.status();
         // Fixed width: a status change must not shift the controls under the pointer.
         ui.allocate_ui_with_layout(
-            egui::vec2(STATUS_WIDTH, ui.spacing().interact_size.y),
+            egui::vec2(STATUS_WIDTH, 32.0),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| theme::status_dot(ui, color, &text),
         );
-        ui.separator();
+        theme::vdivider(ui, 20.0);
 
         // Do things on the target.
-        ui.menu_button("Keys", |ui| {
+        let keys_id = ui.make_persistent_id("keys_menu_popup");
+        #[cfg(debug_assertions)]
+        if debug_view().as_deref() == Some("keys") {
+            let debug_keys_id = ui.make_persistent_id("debug_keys_done");
+            let debug_keys_opened = ui
+                .ctx()
+                .data(|d| d.get_temp::<bool>(debug_keys_id).unwrap_or(false));
+            if !debug_keys_opened {
+                ui.ctx().data_mut(|d| d.insert_temp(debug_keys_id, true));
+                egui::Popup::open_id(ui.ctx(), keys_id);
+            }
+        }
+        show_dropdown_menu(ui, keys_id, "Keys", 260.0, |ui| {
+            let mut separated = false;
             for (label, keys) in actions::COMBOS {
-                if ui.button(*label).clicked() {
+                let is_os = label.contains("Linux") || label.contains("macOS");
+                if is_os && !separated {
+                    menu_separator(ui);
+                    separated = true;
+                }
+                let note = if label.contains("Linux") {
+                    Some("Linux")
+                } else if label.contains("macOS") {
+                    Some("macOS")
+                } else {
+                    None
+                };
+                if menu_button_item(ui, label, note).clicked() {
                     self.send_combo(keys);
                     ui.close();
                 }
             }
-            ui.menu_button("Function keys", |ui| {
+            let right_chevron_atom = egui::AtomKind::closure(|_ui, _args| {
+                let size = egui::vec2(8.0, 10.0);
+                egui::IntoSizedResult {
+                    intrinsic_size: size,
+                    sized: egui::SizedAtomKind::Paint {
+                        paint: std::sync::Arc::new(|ui: &egui::Ui, args: egui::AtomPaintArgs| {
+                            theme::chevron(
+                                ui.painter(),
+                                args.rect.center(),
+                                3.5,
+                                theme::ChevronDir::Right,
+                                theme::MUTED,
+                            );
+                        }),
+                        size,
+                    },
+                }
+            });
+            let sub_btn = egui::Button::new(
+                egui::RichText::new("Function keys")
+                    .font(egui::FontId::new(13.0, egui::FontFamily::Proportional))
+                    .color(theme::TEXT),
+            )
+            .min_size(egui::vec2(ui.available_width(), 28.0))
+            .right_text(right_chevron_atom);
+
+            let sub_menu = egui::containers::menu::SubMenuButton::from_button(sub_btn).config(
+                egui::containers::menu::MenuConfig::new().style(|style: &mut egui::Style| {
+                    egui::containers::menu::menu_style(style);
+                    style.spacing.item_spacing = egui::vec2(0.0, 1.0);
+                    style.spacing.interact_size.y = 28.0;
+                    style.spacing.button_padding = egui::vec2(10.0, 4.0);
+                    style.visuals.widgets.hovered.weak_bg_fill = theme::CARD_HOVER;
+                    style.visuals.widgets.hovered.bg_fill = theme::CARD_HOVER;
+                    style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
+                    style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
+                }),
+            );
+
+            sub_menu.ui(ui, |ui| {
+                ui.set_width(120.0);
                 for key in actions::FUNCTION_KEYS {
-                    if ui.button(key).clicked() {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new(key)
+                                    .font(egui::FontId::new(13.0, egui::FontFamily::Proportional))
+                                    .color(theme::TEXT),
+                            )
+                            .min_size(egui::vec2(ui.available_width(), 28.0)),
+                        )
+                        .clicked()
+                    {
                         self.send_combo(&[key]);
                         ui.close();
                     }
@@ -2587,65 +3219,79 @@ impl Console {
         } else {
             "Type the clipboard key by key: no agent connected on the target (Right Cmd + V)"
         };
-        if ui
-            .add(egui::Button::new("Paste"))
+        if theme::plain_button(ui, "Paste")
             .on_hover_text(hint)
             .clicked()
         {
             self.request_type_clipboard();
         }
         let agent_up = self.inserts_via_agent();
-        ui.menu_button("Capture", |ui| {
-            if ui
-                .button("Save device snapshot")
-                .on_hover_text("JPEG from the KVM capture, saved to ~/Downloads")
-                .clicked()
+        let capture_id = ui.make_persistent_id("capture_menu_popup");
+        show_dropdown_menu(ui, capture_id, "Capture", 240.0, |ui| {
+            if menu_button_item_enabled(
+                ui,
+                true,
+                "Save device snapshot",
+                "JPEG from the KVM capture, saved to ~/Downloads",
+                "",
+            )
+            .clicked()
             {
                 self.snapshot();
                 ui.close();
             }
-            if ui
-                .add_enabled(agent_up, egui::Button::new("Save exact screenshot"))
-                .on_hover_text("Pixel-exact, taken by the agent on the target (all monitors)")
-                .on_disabled_hover_text("Needs the agent connected on the target")
-                .clicked()
+            if menu_button_item_enabled(
+                ui,
+                agent_up,
+                "Save exact screenshot",
+                "Pixel-exact, taken by the agent on the target (all monitors)",
+                "Needs the agent connected on the target",
+            )
+            .clicked()
             {
                 self.exact_screenshot();
                 ui.close();
             }
-            if ui
-                .add_enabled(agent_up, egui::Button::new("Copy region as image"))
-                .on_hover_text(
-                    "Drag a rectangle on the video; copied pixel-exact from the agent's screenshot",
-                )
-                .on_disabled_hover_text("Needs the agent connected on the target")
-                .clicked()
+            if menu_button_item_enabled(
+                ui,
+                agent_up,
+                "Copy region as image",
+                "Drag a rectangle on the video; copied pixel-exact from the agent's screenshot",
+                "Needs the agent connected on the target",
+            )
+            .clicked()
             {
                 self.pick_region();
                 ui.close();
             }
-            if ui
-                .add_enabled(agent_up, egui::Button::new("Copy screenshot as image"))
-                .on_hover_text("The main monitor, pixel-exact, from the agent")
-                .on_disabled_hover_text("Needs the agent connected on the target")
-                .clicked()
+            if menu_button_item_enabled(
+                ui,
+                agent_up,
+                "Copy screenshot as image",
+                "The main monitor, pixel-exact, from the agent",
+                "Needs the agent connected on the target",
+            )
+            .clicked()
             {
                 self.copy_screen_image([0.0, 0.0, 1.0, 1.0]);
                 ui.close();
             }
-            if ui
-                .button("Copy screen text (OCR)")
-                .on_hover_text(
-                    "Recognized on this Mac; from the agent's exact screenshot when available",
-                )
-                .clicked()
+            if menu_button_item_enabled(
+                ui,
+                true,
+                "Copy screen text (OCR)",
+                "Recognized on this Mac; from the agent's exact screenshot when available",
+                "",
+            )
+            .clicked()
             {
                 self.copy_screen_text();
                 ui.close();
             }
         });
         if self.caps.supports(Feature::Atx) {
-            ui.menu_button("Power", |ui| {
+            let power_id = ui.make_persistent_id("power_menu_popup");
+            show_dropdown_menu(ui, power_id, "Power", 200.0, |ui| {
                 let items = [
                     ("Power on", Confirm::Power(PowerAction::On)),
                     ("Shut down", Confirm::Power(PowerAction::Off)),
@@ -2654,7 +3300,7 @@ impl Console {
                     ("Press power button", Confirm::Click(AtxButton::Power)),
                 ];
                 for (label, c) in items {
-                    if ui.button(label).clicked() {
+                    if menu_button_item(ui, label, None).clicked() {
                         self.confirm = Some(c);
                         ui.close();
                     }
@@ -2665,23 +3311,24 @@ impl Console {
         // Right: the viewer itself.
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let (icon, tip) = if self.fullscreen {
-                ("Exit fullscreen", "Right Cmd + F")
+                (
+                    theme::Icon::ExitFullscreen,
+                    "Exit fullscreen (Right Cmd + F)",
+                )
             } else {
-                ("Fullscreen", "Right Cmd + F")
+                (theme::Icon::Fullscreen, "Fullscreen (Right Cmd + F)")
             };
-            if ui.button(icon).on_hover_text(tip).clicked() {
+            if theme::icon_button(ui, icon, tip).clicked() {
                 action = ConsoleAction::ToggleFullscreen;
             }
             let panel_open = self.drawer.is_some();
-            if ui
-                .selectable_label(panel_open, "Panel")
+            if theme::toggle_button(ui, "Panel", panel_open)
                 .on_hover_text("Target, video and settings")
                 .clicked()
             {
                 self.drawer = if panel_open { None } else { Some(Tab::Target) };
             }
-            if ui
-                .button("Actions")
+            if theme::actions_button(ui)
                 .on_hover_text("Search every action (Right Cmd + K)")
                 .clicked()
             {
@@ -2698,42 +3345,44 @@ impl Console {
         let locked = self
             .agent()
             .is_some_and(|(_, i)| matches!(i.session, SessionState::Locked));
+        let debug_target = debug_view().as_deref() == Some("panel-target");
         if locked {
-            theme::banner(ui, theme::WARN, "The target is locked (lock screen).");
-        } else if self.clip.is_some() && self.bridge_action().is_some() {
-            theme::banner(
-                ui,
-                theme::WARN,
-                "Clipboard needs attention: open Clipboard below.",
-            );
+            theme::attention_banner(ui, "The target is locked (lock screen).");
+        } else if debug_target || (self.clip.is_some() && self.bridge_action().is_some()) {
+            theme::attention_banner(ui, "Clipboard needs attention. Open Clipboard below.");
         }
         if self.clip_menu(ui) != ConsoleAction::None {
             changed = true;
         }
-        if self.inserts_via_agent() {
-            if ui
-                .button("Send file…")
-                .on_hover_text(
-                    "Copy a file to the target's Downloads folder (or drop it on the window)",
-                )
-                .clicked()
-            {
-                self.pick_files_to_send();
-            }
-            if ui
-                .button("Browse files…")
-                .on_hover_text("Browse the target's files and download them to this Mac")
-                .clicked()
-                && let Some(clip) = self.clip.as_ref()
-            {
-                self.browser.open(clip);
-            }
+        let show_agent_actions =
+            self.inserts_via_agent() || debug_view().as_deref() == Some("panel-target");
+        if show_agent_actions {
+            let btn_w = ((ui.available_width() - 8.0) * 0.5).floor();
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.allocate_ui(egui::vec2(btn_w, 40.0), |ui| {
+                    if theme::card_button(ui, "Send file…", 40.0)
+                        .on_hover_text(
+                            "Copy a file to the target's Downloads folder (or drop it on the window)",
+                        )
+                        .clicked()
+                    {
+                        self.pick_files_to_send();
+                    }
+                });
+                ui.allocate_ui(egui::vec2(btn_w, 40.0), |ui| {
+                    if theme::card_button(ui, "Browse files…", 40.0)
+                        .on_hover_text("Browse the target's files and download them to this Mac")
+                        .clicked()
+                        && let Some(clip) = self.clip.as_ref()
+                    {
+                        self.browser.open(clip);
+                    }
+                });
+            });
         }
         self.session_menu(ui);
         self.info_menu(ui);
-        if self.caps.supports(Feature::Msd) {
-            self.media.menu(ui);
-        }
         changed
     }
 
@@ -2741,25 +3390,36 @@ impl Console {
     /// device changed.
     fn settings_panel(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
-        {
-            ui.set_min_width(200.0);
-            let before = self.device.target;
-            theme::section(ui, format!("Target OS: {}", before.label()), |ui| {
-                for os in TargetOs::ALL {
-                    if ui
-                        .radio_value(&mut self.device.target, os, os.label())
-                        .clicked()
-                    {
-                        ui.close();
-                    }
-                }
-            });
-            if self.device.target != before {
-                let iso = self.mapper.keys.iso_fix;
-                self.mapper.keys = self.device.target.key_options(iso);
-                changed = true;
-            }
+        ui.spacing_mut().item_spacing = egui::vec2(0.0, 12.0);
 
+        // --- TARGET section ---
+        theme::caption(ui, "TARGET");
+
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, 8.0);
+
+            // Target OS dropdown row
+            theme::show_dropdown_row(
+                ui,
+                egui::Id::unique("settings_target_os"),
+                "Target OS",
+                self.device.target.label(),
+                220.0,
+                |ui| {
+                    for os in TargetOs::ALL {
+                        let on = self.device.target == os;
+                        if menu_button_item(ui, os.label(), None).clicked() && !on {
+                            self.device.target = os;
+                            let iso = self.mapper.keys.iso_fix;
+                            self.mapper.keys = self.device.target.key_options(iso);
+                            changed = true;
+                            ui.close();
+                        }
+                    }
+                },
+            );
+
+            // Keyboard layout dropdown row
             let current = self.keymap().unwrap_or_else(|| "default".into());
             let on_target: Vec<&'static str> = self
                 .agent()
@@ -2770,34 +3430,54 @@ impl Console {
                         .collect()
                 })
                 .unwrap_or_default();
-            let before = self.device.keymap.clone();
-            theme::section(ui, format!("Keyboard layout: {current}"), |ui| {
-                egui::ScrollArea::vertical()
-                    .max_height(320.0)
-                    .show(ui, |ui| {
-                        for k in &self.keymaps {
-                            let label = if on_target.contains(&k.as_str()) {
-                                format!("{k} (on target)")
-                            } else {
-                                k.clone()
-                            };
-                            if ui
-                                .radio_value(&mut self.device.keymap, Some(k.clone()), label)
-                                .clicked()
-                            {
-                                ui.close();
-                            }
-                        }
-                    });
-            })
-            .on_hover_text("Keyboard layout of the target, used by Paste when typing");
-            changed |= self.device.keymap != before;
 
-            ui.separator();
-            ui.checkbox(&mut self.show_stats, "Show stats")
-                .on_hover_text("Right Cmd + S");
+            theme::show_dropdown_row(
+                ui,
+                egui::Id::unique("settings_keyboard_layout"),
+                "Keyboard layout",
+                &current,
+                260.0,
+                |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(280.0)
+                        .show(ui, |ui| {
+                            for k in &self.keymaps {
+                                let note = if on_target.contains(&k.as_str()) {
+                                    Some("on target")
+                                } else {
+                                    None
+                                };
+                                let on = self.device.keymap.as_deref() == Some(k.as_str());
+                                if menu_button_item(ui, k, note).clicked() && !on {
+                                    self.device.keymap = Some(k.clone());
+                                    changed = true;
+                                    ui.close();
+                                }
+                            }
+                        });
+                },
+            );
+        });
+
+        // --- THIS VIEWER section ---
+        theme::caption(ui, "THIS VIEWER");
+
+        theme::labelled_switch(ui, "Show stats", &mut self.show_stats)
+            .on_hover_text("Right Cmd + S");
+
+        // --- DEVICE section ---
+        theme::caption(ui, "DEVICE");
+
+        let device_card = theme::panel_card();
+        device_card.show(ui, |ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, 10.0);
+            ui.label(
+                egui::RichText::new("Direct management of the Comet device.")
+                    .font(egui::FontId::new(12.0, egui::FontFamily::Proportional))
+                    .color(theme::MUTED),
+            );
             if ui
-                .button("Device web interface…")
+                .add(egui::Button::new("Device web interface…"))
                 .on_hover_text("Opens the device's web interface in the browser")
                 .clicked()
             {
@@ -2805,9 +3485,9 @@ impl Console {
                 if let Err(e) = open::that(&url) {
                     self.notify(format!("Cannot open {url}: {e}"));
                 }
-                ui.close();
             }
-        }
+        });
+
         changed
     }
 
@@ -2842,7 +3522,18 @@ impl Console {
             egui::Area::new(egui::Id::unique("stats"))
                 .anchor(egui::Align2::RIGHT_BOTTOM, [-8.0, -8.0])
                 .show(ui.ctx(), |ui| {
-                    egui::Frame::popup(ui.style()).show(ui, |ui| ui.monospace(&self.stats.shown));
+                    egui::Frame::NONE
+                        .fill(theme::PANEL)
+                        .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                        .corner_radius(egui::CornerRadius::same(8))
+                        .inner_margin(egui::Margin::symmetric(10, 8))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(&self.stats.shown)
+                                    .font(egui::FontId::new(12.0, egui::FontFamily::Monospace))
+                                    .color(theme::TEXT),
+                            );
+                        });
                 });
         }
         if let Some(typing) = &self.typing {
@@ -2851,16 +3542,23 @@ impl Console {
             egui::Area::new(egui::Id::unique("typing"))
                 .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -16.0])
                 .show(ui.ctx(), |ui| {
-                    egui::Frame::popup(ui.style()).show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::ProgressBar::new(done as f32 / typing.total.max(1) as f32)
+                    egui::Frame::NONE
+                        .fill(theme::PANEL)
+                        .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                        .corner_radius(egui::CornerRadius::same(8))
+                        .inner_margin(egui::Margin::symmetric(12, 10))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::ProgressBar::new(
+                                        done as f32 / typing.total.max(1) as f32,
+                                    )
                                     .desired_width(220.0)
                                     .text(format!("Typing {done}/{}", typing.total)),
-                            );
-                            cancel = ui.button("Cancel").clicked();
+                                );
+                                cancel = ui.button("Cancel").clicked();
+                            });
                         });
-                    });
                 });
             if cancel {
                 self.cancel_typing();
@@ -2878,7 +3576,29 @@ impl Console {
             egui::Area::new(egui::Id::unique("notice"))
                 .anchor(egui::Align2::CENTER_TOP, [0.0, 48.0])
                 .show(ui.ctx(), |ui| {
-                    egui::Frame::popup(ui.style()).show(ui, |ui| ui.label(text));
+                    egui::Frame::NONE
+                        .fill(theme::PANEL)
+                        .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                        .corner_radius(egui::CornerRadius::same(8))
+                        .inner_margin(egui::Margin::symmetric(16, 10))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(10.0, 0.0);
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(8.0, 8.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().circle_filled(rect.center(), 4.0, theme::OK);
+                                ui.label(
+                                    egui::RichText::new(text)
+                                        .font(egui::FontId::new(
+                                            13.0,
+                                            egui::FontFamily::Proportional,
+                                        ))
+                                        .color(theme::TEXT),
+                                );
+                            });
+                        });
                 });
         }
     }
@@ -2888,47 +3608,108 @@ impl Console {
     fn drawer_ui(&mut self, ctx: &egui::Context) -> bool {
         let Some(tab) = self.drawer else { return false };
         let top = self.toolbar_rect.map_or(0.0, |r| r.bottom());
-        let height = (ctx.content_rect().height() - top - 24.0).max(240.0);
-        let (mut changed, mut close, mut next) = (false, false, tab);
+        let height = (ctx.content_rect().height() - top).max(240.0);
+        let mut changed = false;
+        let mut next = tab;
         #[allow(deprecated)] // a stable id keeps the panel's scroll position
         let panel_id = egui::Id::new("panel");
         egui::Area::new(panel_id)
-            .anchor(egui::Align2::RIGHT_TOP, [-8.0, top + 8.0])
+            .anchor(egui::Align2::RIGHT_TOP, [0.0, top])
             .show(ctx, |ui| {
                 egui::Frame::NONE
                     .fill(theme::PANEL)
-                    .stroke(egui::Stroke::new(1.0, theme::BORDER))
-                    .corner_radius(egui::CornerRadius::same(6))
-                    .inner_margin(egui::Margin::same(12))
+                    .inner_margin(egui::Margin::ZERO)
                     .show(ui, |ui| {
                         ui.set_width(320.0);
-                        ui.set_min_height(height - 24.0);
-                        theme::set_inline_sections(ui, true);
-                        ui.horizontal(|ui| {
-                            for t in Tab::ALL {
-                                if ui.selectable_label(tab == t, t.label()).clicked() {
-                                    next = t;
-                                }
-                            }
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    close = ui.add(theme::ghost("Close")).clicked();
-                                },
+                        ui.set_height(height);
+                        ui.set_max_width(320.0);
+                        ui.set_max_height(height);
+
+                        // 1px left rule
+                        let panel_rect = ui.max_rect();
+                        ui.painter().vline(
+                            panel_rect.left() + 0.5,
+                            panel_rect.y_range(),
+                            egui::Stroke::new(1.0, theme::BORDER),
+                        );
+
+                        // Tab header bar
+                        let tab_bar_height = 42.0;
+                        let (tab_bar_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(320.0, tab_bar_height),
+                            egui::Sense::hover(),
+                        );
+                        // Bottom rule for tab header
+                        ui.painter().hline(
+                            tab_bar_rect.x_range(),
+                            tab_bar_rect.bottom() - 0.5,
+                            egui::Stroke::new(1.0, theme::BORDER),
+                        );
+
+                        let mut cur_x = tab_bar_rect.min.x + 12.0;
+                        for t in Tab::ALL {
+                            let active = tab == t;
+                            let font_id = if active {
+                                egui::FontId::new(14.0, theme::bold_family())
+                            } else {
+                                egui::FontId::new(14.0, egui::FontFamily::Proportional)
+                            };
+                            let text_color = if active { theme::TEXT } else { theme::MUTED };
+                            let galley = ui.painter().layout_no_wrap(
+                                t.label().to_owned(),
+                                font_id,
+                                text_color,
                             );
-                        });
-                        ui.separator();
+                            let tab_w = galley.size().x + 24.0;
+                            let tab_rect = egui::Rect::from_min_size(
+                                egui::pos2(cur_x, tab_bar_rect.min.y),
+                                egui::vec2(tab_w, tab_bar_height),
+                            );
+                            let resp = ui.interact(
+                                tab_rect,
+                                ui.scope_id().with(t.label()),
+                                egui::Sense::click(),
+                            );
+                            if resp.clicked() {
+                                next = t;
+                            }
+                            let label_color = if active || resp.hovered() {
+                                theme::TEXT
+                            } else {
+                                theme::MUTED
+                            };
+                            let text_pos = egui::pos2(cur_x + 12.0, tab_rect.min.y + 14.0);
+                            ui.painter().galley(text_pos, galley, label_color);
+                            if active {
+                                ui.painter().hline(
+                                    tab_rect.x_range(),
+                                    tab_bar_rect.bottom() - 1.0,
+                                    egui::Stroke::new(2.0, theme::ACCENT),
+                                );
+                            }
+                            cur_x += tab_w;
+                        }
+
+                        theme::set_inline_sections(ui, true);
                         egui::ScrollArea::vertical()
-                            .max_height(height - 64.0)
+                            .max_height(height - tab_bar_height)
                             .auto_shrink([false, false])
-                            .show(ui, |ui| match tab {
-                                Tab::Target => changed = self.target_panel(ui),
-                                Tab::Video => self.video_menu(ui),
-                                Tab::Settings => changed = self.settings_panel(ui),
+                            .show(ui, |ui| {
+                                egui::Frame::NONE.inner_margin(egui::Margin::same(16)).show(
+                                    ui,
+                                    |ui| {
+                                        ui.spacing_mut().item_spacing = egui::vec2(0.0, 12.0);
+                                        match tab {
+                                            Tab::Target => changed = self.target_panel(ui),
+                                            Tab::Video => self.video_menu(ui),
+                                            Tab::Settings => changed = self.settings_panel(ui),
+                                        }
+                                    },
+                                );
                             });
                     });
             });
-        self.drawer = if close { None } else { Some(next) };
+        self.drawer = Some(next);
         changed
     }
 
@@ -3010,11 +3791,26 @@ impl Console {
             return ConsoleAction::None;
         };
         let needle = query.to_lowercase();
-        let mut matches: Vec<(String, Cmd)> = self
+        let matches: Vec<(String, Cmd)> = self
             .commands()
             .into_iter()
             .filter(|(l, _)| l.to_lowercase().contains(&needle))
             .collect();
+
+        let mut ordered_matches: Vec<(String, Cmd)> = Vec::new();
+        let mut group_slices: Vec<(CmdGroup, usize, usize)> = Vec::new();
+        for g in CmdGroup::ALL {
+            let start = ordered_matches.len();
+            for (label, cmd) in &matches {
+                if cmd.group() == g {
+                    ordered_matches.push((label.clone(), *cmd));
+                }
+            }
+            if ordered_matches.len() > start {
+                group_slices.push((g, start, ordered_matches.len()));
+            }
+        }
+
         #[allow(deprecated)]
         let sel_id = egui::Id::new("palette-selected");
         let mut sel = ctx.data(|d| d.get_temp::<usize>(sel_id)).unwrap_or(0);
@@ -3025,7 +3821,7 @@ impl Console {
                 i.key_pressed(egui::Key::Escape),
             )
         });
-        let last = matches.len().saturating_sub(1);
+        let last = ordered_matches.len().saturating_sub(1);
         if down {
             sel = (sel + 1).min(last);
         }
@@ -3034,72 +3830,233 @@ impl Console {
         }
         let before = query.clone();
         let mut chosen = None;
-        egui::Modal::new(egui::Id::unique("actions")).show(ctx, |ui| {
-            ui.set_width(440.0);
-            let edit = ui.add(
-                egui::TextEdit::singleline(&mut query)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("Search actions…"),
-            );
-            edit.request_focus();
-            ui.add_space(4.0);
-            if matches.is_empty() {
-                ui.label(egui::RichText::new("No action matches.").color(theme::MUTED));
-            }
-            egui::ScrollArea::vertical()
-                .max_height(340.0)
-                .show(ui, |ui| {
-                    for (i, (label, cmd)) in matches.iter().enumerate() {
-                        let (rect, resp) = ui.allocate_exact_size(
-                            egui::vec2(ui.available_width(), 28.0),
-                            egui::Sense::click(),
-                        );
-                        let on = i == sel;
-                        if on || resp.hovered() {
-                            let fill = if on { theme::CARD_HOVER } else { theme::CARD };
-                            ui.painter()
-                                .rect_filled(rect, egui::CornerRadius::same(4), fill);
-                        }
-                        if on {
-                            ui.painter().rect_stroke(
-                                rect,
-                                egui::CornerRadius::same(4),
-                                egui::Stroke::new(1.0, theme::ACCENT),
-                                egui::StrokeKind::Inside,
+        let mut enter_pressed = false;
+
+        egui::Modal::new(egui::Id::unique("actions"))
+            .frame(theme::modal_frame().inner_margin(egui::Margin::ZERO))
+            .show(ctx, |ui| {
+                ui.set_width(480.0);
+
+                // Header row: 52px high, search icon, borderless 15px text input, right kbd("esc")
+                egui::Frame::NONE
+                    .inner_margin(egui::Margin::symmetric(16, 12))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(10.0, 0.0);
+                            let (icon_rect, _) = ui
+                                .allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                            theme::draw_icon(
+                                ui.painter(),
+                                icon_rect,
+                                theme::Icon::Search,
+                                theme::MUTED,
                             );
-                            resp.scroll_to_me(None);
+
+                            let edit = ui.add(
+                                egui::TextEdit::singleline(&mut query)
+                                    .desired_width(ui.available_width() - 48.0)
+                                    .font(egui::FontId::new(15.0, egui::FontFamily::Proportional))
+                                    .hint_text("Search actions…")
+                                    .frame(egui::Frame::NONE),
+                            );
+                            edit.request_focus();
+
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    theme::kbd(ui, "esc");
+                                },
+                            );
+
+                            if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                enter_pressed = true;
+                            }
+                        });
+                    });
+
+                // 1px rule under header
+                let (rule_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 1.0),
+                    egui::Sense::hover(),
+                );
+                ui.painter()
+                    .rect_filled(rule_rect, egui::CornerRadius::ZERO, theme::BORDER);
+
+                // Results list
+                egui::Frame::NONE
+                    .inner_margin(egui::Margin::same(8))
+                    .show(ui, |ui| {
+                        if ordered_matches.is_empty() {
+                            ui.add_space(8.0);
+                            ui.label(egui::RichText::new("No action matches.").color(theme::MUTED));
+                            ui.add_space(8.0);
+                        } else {
+                            egui::ScrollArea::vertical()
+                                .max_height(340.0)
+                                .show(ui, |ui| {
+                                    for (group, start_idx, end_idx) in &group_slices {
+                                        ui.add_space(6.0);
+                                        ui.label(
+                                            egui::RichText::new(group.label().to_uppercase())
+                                                .font(egui::FontId::new(11.0, theme::bold_family()))
+                                                .color(theme::MUTED),
+                                        );
+                                        ui.add_space(2.0);
+
+                                        for (offset, (label, cmd)) in
+                                            ordered_matches[*start_idx..*end_idx].iter().enumerate()
+                                        {
+                                            let i = *start_idx + offset;
+                                            let (rect, resp) = ui.allocate_exact_size(
+                                                egui::vec2(ui.available_width(), 32.0),
+                                                egui::Sense::click(),
+                                            );
+                                            let on = i == sel;
+                                            if on || resp.hovered() {
+                                                let fill = if on {
+                                                    theme::CARD_HOVER
+                                                } else {
+                                                    theme::CARD
+                                                };
+                                                ui.painter().rect_filled(
+                                                    rect,
+                                                    egui::CornerRadius::same(6),
+                                                    fill,
+                                                );
+                                            }
+                                            if on {
+                                                resp.scroll_to_me(None);
+                                            }
+
+                                            // Left label (13.5px)
+                                            let label_font = egui::FontId::new(
+                                                13.5,
+                                                if on {
+                                                    theme::bold_family()
+                                                } else {
+                                                    egui::FontFamily::Proportional
+                                                },
+                                            );
+                                            let label_galley = ui.painter().layout_no_wrap(
+                                                label.clone(),
+                                                label_font,
+                                                theme::TEXT,
+                                            );
+                                            let label_pos = egui::pos2(
+                                                rect.min.x + 12.0,
+                                                rect.center().y - label_galley.size().y * 0.5,
+                                            );
+                                            ui.painter().galley(
+                                                label_pos,
+                                                label_galley,
+                                                theme::TEXT,
+                                            );
+
+                                            // Right hint
+                                            if on {
+                                                let hint_font =
+                                                    egui::FontId::new(12.0, theme::bold_family());
+                                                let hint_galley = ui.painter().layout_no_wrap(
+                                                    "Enter run".to_owned(),
+                                                    hint_font,
+                                                    theme::ACCENT,
+                                                );
+                                                let hint_pos = egui::pos2(
+                                                    rect.max.x - 12.0 - hint_galley.size().x,
+                                                    rect.center().y - hint_galley.size().y * 0.5,
+                                                );
+                                                ui.painter().galley(
+                                                    hint_pos,
+                                                    hint_galley,
+                                                    theme::ACCENT,
+                                                );
+                                            } else if cmd.is_confirm_gated() {
+                                                let hint_font = egui::FontId::new(
+                                                    12.0,
+                                                    egui::FontFamily::Proportional,
+                                                );
+                                                let hint_galley = ui.painter().layout_no_wrap(
+                                                    "asks first".to_owned(),
+                                                    hint_font,
+                                                    theme::MUTED,
+                                                );
+                                                let hint_pos = egui::pos2(
+                                                    rect.max.x - 12.0 - hint_galley.size().x,
+                                                    rect.center().y - hint_galley.size().y * 0.5,
+                                                );
+                                                ui.painter().galley(
+                                                    hint_pos,
+                                                    hint_galley,
+                                                    theme::MUTED,
+                                                );
+                                            } else if let Some(shortcut) = cmd.shortcut_text() {
+                                                let hint_font = egui::FontId::new(
+                                                    11.5,
+                                                    egui::FontFamily::Monospace,
+                                                );
+                                                let hint_galley = ui.painter().layout_no_wrap(
+                                                    shortcut.to_owned(),
+                                                    hint_font,
+                                                    theme::MUTED,
+                                                );
+                                                let hint_pos = egui::pos2(
+                                                    rect.max.x - 12.0 - hint_galley.size().x,
+                                                    rect.center().y - hint_galley.size().y * 0.5,
+                                                );
+                                                ui.painter().galley(
+                                                    hint_pos,
+                                                    hint_galley,
+                                                    theme::MUTED,
+                                                );
+                                            }
+
+                                            if resp.clicked() {
+                                                chosen = Some(i);
+                                            }
+                                        }
+                                    }
+                                });
                         }
-                        let font = egui::TextStyle::Body.resolve(ui.style());
-                        ui.painter().text(
-                            rect.left_center() + egui::vec2(10.0, 0.0),
-                            egui::Align2::LEFT_CENTER,
-                            label,
-                            font.clone(),
-                            theme::TEXT,
-                        );
-                        ui.painter().text(
-                            rect.right_center() - egui::vec2(10.0, 0.0),
-                            egui::Align2::RIGHT_CENTER,
-                            cmd.hint(),
-                            egui::TextStyle::Small.resolve(ui.style()),
-                            theme::MUTED,
-                        );
-                        if resp.clicked() {
-                            chosen = Some(i);
-                        }
-                    }
-                });
-            if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                chosen = (!matches.is_empty()).then_some(sel.min(last));
-            }
-        });
+                    });
+
+                // 1px rule above footer
+                let (footer_rule, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 1.0),
+                    egui::Sense::hover(),
+                );
+                ui.painter()
+                    .rect_filled(footer_rule, egui::CornerRadius::ZERO, theme::BORDER);
+
+                // Footer row: "Up/Down move · Enter run · Esc close"
+                egui::Frame::NONE
+                    .inner_margin(egui::Margin::symmetric(16, 10))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(16.0, 0.0);
+                            ui.label(
+                                egui::RichText::new("Up/Down move · Enter run · Esc close")
+                                    .font(egui::FontId::new(11.5, egui::FontFamily::Proportional))
+                                    .color(theme::MUTED),
+                            );
+                        });
+                    });
+
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    enter_pressed = true;
+                }
+            });
+
+        if enter_pressed && chosen.is_none() && !ordered_matches.is_empty() {
+            chosen = Some(sel.min(last));
+        }
+
         if query != before {
             sel = 0;
         }
         ctx.data_mut(|d| d.insert_temp(sel_id, sel));
         if let Some(i) = chosen {
             ctx.data_mut(|d| d.insert_temp(sel_id, 0usize));
-            let (_, cmd) = matches.swap_remove(i);
+            let (_, cmd) = ordered_matches.swap_remove(i);
             return self.run_command(cmd);
         }
         if !close {
@@ -3198,19 +4155,31 @@ impl Console {
             },
         };
         let mut decision = None;
-        egui::Modal::new(egui::Id::unique("confirm")).show(ctx, |ui| {
-            ui.set_width(380.0);
-            ui.label(egui::RichText::new(title).size(17.0).strong());
-            ui.label(egui::RichText::new(body).color(theme::MUTED));
-            ui.horizontal(|ui| {
-                if ui.button("Cancel").clicked() {
-                    decision = Some(false);
-                }
-                if ui.add(theme::primary("Continue")).clicked() {
-                    decision = Some(true);
-                }
+        egui::Modal::new(egui::Id::unique("confirm"))
+            .frame(theme::modal_frame())
+            .show(ctx, |ui| {
+                ui.set_width(380.0);
+                ui.label(
+                    egui::RichText::new(title)
+                        .font(egui::FontId::new(18.0, theme::bold_family()))
+                        .color(theme::TEXT),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(body)
+                        .font(egui::FontId::new(13.5, egui::FontFamily::Proportional))
+                        .color(theme::MUTED),
+                );
+                ui.add_space(12.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(theme::primary("Continue")).clicked() {
+                        decision = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                });
             });
-        });
         match decision {
             Some(true) => match self.confirm.take() {
                 Some(Confirm::Type { text, .. }) => self.deliver_text(text),
@@ -3245,7 +4214,21 @@ impl Tab {
     }
 }
 
+/// Debug builds: `COMETDESK_DEBUG_UI` opens a view at start so screenshots need no clicks.
+#[cfg(debug_assertions)]
+fn debug_view() -> Option<String> {
+    std::env::var("COMETDESK_DEBUG_UI")
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_view() -> Option<String> {
+    None
+}
+
 /// An entry of the action search.
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Cmd {
     Paste,
     Keys(&'static [&'static str]),
@@ -3265,26 +4248,66 @@ enum Cmd {
     Disconnect,
 }
 
-impl Cmd {
-    /// Right-hand note in the action search: the shortcut, or the group it belongs to.
-    fn hint(&self) -> &'static str {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CmdGroup {
+    Power,
+    Viewer,
+    Keys,
+    Capture,
+    Files,
+}
+
+impl CmdGroup {
+    const ALL: [CmdGroup; 5] = [
+        CmdGroup::Power,
+        CmdGroup::Viewer,
+        CmdGroup::Keys,
+        CmdGroup::Capture,
+        CmdGroup::Files,
+    ];
+
+    fn label(&self) -> &'static str {
         match self {
-            Cmd::Paste => "Right Cmd V",
-            Cmd::Fullscreen => "Right Cmd F",
-            Cmd::Stats => "Right Cmd S",
-            Cmd::Keys(_) => "Keys",
-            Cmd::Power(_) | Cmd::Click(_) => "Power",
-            Cmd::Snapshot | Cmd::ExactShot | Cmd::CopyRegion | Cmd::CopyScreen | Cmd::Ocr => {
-                "Capture"
+            CmdGroup::Power => "Power",
+            CmdGroup::Viewer => "Viewer",
+            CmdGroup::Keys => "Keys",
+            CmdGroup::Capture => "Capture",
+            CmdGroup::Files => "Files",
+        }
+    }
+}
+
+impl Cmd {
+    fn group(&self) -> CmdGroup {
+        match self {
+            Cmd::Power(_) | Cmd::Click(_) => CmdGroup::Power,
+            Cmd::Fullscreen | Cmd::Stats | Cmd::Panel(_) | Cmd::WebUi | Cmd::Disconnect => {
+                CmdGroup::Viewer
             }
-            Cmd::SendFile | Cmd::BrowseFiles => "Files",
-            Cmd::Panel(_) | Cmd::WebUi | Cmd::Disconnect => "Viewer",
+            Cmd::Paste | Cmd::Keys(_) => CmdGroup::Keys,
+            Cmd::Snapshot | Cmd::ExactShot | Cmd::CopyRegion | Cmd::CopyScreen | Cmd::Ocr => {
+                CmdGroup::Capture
+            }
+            Cmd::SendFile | Cmd::BrowseFiles => CmdGroup::Files,
+        }
+    }
+
+    fn is_confirm_gated(&self) -> bool {
+        matches!(self, Cmd::Power(_) | Cmd::Click(_))
+    }
+
+    fn shortcut_text(&self) -> Option<&'static str> {
+        match self {
+            Cmd::Paste => Some("Right Cmd+V"),
+            Cmd::Fullscreen => Some("Right Cmd+F"),
+            Cmd::Stats => Some("Right Cmd+S"),
+            _ => None,
         }
     }
 }
 
 /// Width reserved for the status pill in the toolbar: fits the longest status text.
-const STATUS_WIDTH: f32 = 196.0;
+const STATUS_WIDTH: f32 = 132.0;
 
 /// How long the pointer rests on the top edge before the fullscreen toolbar appears.
 const EDGE_DWELL: std::time::Duration = std::time::Duration::from_millis(350);

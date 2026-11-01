@@ -50,6 +50,8 @@ fn main() -> Result<()> {
     let event_loop = builder.build()?;
     app::control::start(event_loop.create_proxy());
     let mut app = app::App::new(rt, event_loop.create_proxy(), pins, iso_fix);
-    event_loop.run_app(&mut app)?;
+    let result = event_loop.run_app(&mut app);
+    app.shutdown();
+    result?;
     Ok(())
 }

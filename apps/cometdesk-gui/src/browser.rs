@@ -9,6 +9,7 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::app::UserEvent;
 use crate::clipsync::{ClipBridge, ListResult, Request};
+use crate::theme;
 
 #[derive(Default)]
 pub struct Browser {
@@ -77,25 +78,27 @@ impl Browser {
         let mut fetch: Option<(String, String)> = None;
         egui::Window::new("Files on the target")
             .open(&mut open)
-            .default_size([460.0, 420.0])
+            .default_size([480.0, 440.0])
             .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(0.0, 10.0);
+
+                // Top navigation bar
                 ui.horizontal(|ui| {
-                    if ui.button("Home").clicked() {
+                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+                    if theme::plain_button(ui, "Home").clicked() {
                         go = Some(DirTarget::Home);
                     }
                     let here = self.listing.as_ref().map(|l| l.path.clone());
-                    if ui
-                        .add_enabled(
-                            here.as_deref().is_some_and(|p| !p.is_empty()),
-                            egui::Button::new("Up"),
-                        )
-                        .clicked()
-                    {
-                        go = here.clone().map(DirTarget::Parent);
-                    }
-                    if ui.button("Drives").clicked() {
+                    let has_parent = here.as_deref().is_some_and(|p| !p.is_empty());
+                    ui.add_enabled_ui(has_parent, |ui| {
+                        if theme::plain_button(ui, "Up").clicked() {
+                            go = here.clone().map(DirTarget::Parent);
+                        }
+                    });
+                    if theme::plain_button(ui, "Drives").clicked() {
                         go = Some(DirTarget::Roots);
                     }
+                    ui.add_space(8.0);
                     ui.checkbox(&mut self.show_hidden, "Hidden");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.filter)
@@ -106,53 +109,98 @@ impl Browser {
                         ui.spinner();
                     }
                 });
+
+                // Path header
                 if let Some(l) = &self.listing {
-                    ui.label(if l.path.is_empty() {
+                    let path_text = if l.path.is_empty() {
                         "Drives"
                     } else {
                         l.path.as_str()
-                    });
+                    };
+                    ui.label(
+                        egui::RichText::new(path_text)
+                            .font(egui::FontId::new(12.0, theme::bold_family()))
+                            .color(theme::MUTED),
+                    );
                 }
                 if let Some(e) = &self.error {
-                    ui.colored_label(crate::theme::ERR, e);
+                    ui.colored_label(theme::ERR, e);
                 }
-                ui.separator();
+
                 let Some(l) = &self.listing else {
                     return;
                 };
-                let filter = self.filter.to_lowercase();
-                egui::ScrollArea::vertical()
-                    .auto_shrink(false)
-                    .show(ui, |ui| {
-                        for e in l.entries.iter().filter(|e| {
-                            (self.show_hidden || !e.name.starts_with('.'))
-                                && (filter.is_empty() || e.name.to_lowercase().contains(&filter))
-                        }) {
-                            ui.horizontal(|ui| {
-                                if e.dir {
-                                    if ui.link(format!("{}/", e.name)).clicked() {
-                                        go = Some(if l.path.is_empty() {
-                                            DirTarget::Open(e.name.clone())
-                                        } else {
-                                            DirTarget::Child {
-                                                dir: l.path.clone(),
-                                                name: e.name.clone(),
-                                            }
-                                        });
+
+                let card = theme::panel_card();
+                card.show(ui, |ui| {
+                    let filter = self.filter.to_lowercase();
+                    egui::ScrollArea::vertical()
+                        .auto_shrink(false)
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(0.0, 4.0);
+                            for e in l.entries.iter().filter(|e| {
+                                (self.show_hidden || !e.name.starts_with('.'))
+                                    && (filter.is_empty()
+                                        || e.name.to_lowercase().contains(&filter))
+                            }) {
+                                ui.horizontal(|ui| {
+                                    if e.dir {
+                                        let dir_name = format!("{}/", e.name);
+                                        if ui
+                                            .link(
+                                                egui::RichText::new(&dir_name)
+                                                    .font(egui::FontId::new(
+                                                        13.0,
+                                                        theme::bold_family(),
+                                                    ))
+                                                    .color(theme::ACCENT),
+                                            )
+                                            .clicked()
+                                        {
+                                            go = Some(if l.path.is_empty() {
+                                                DirTarget::Open(e.name.clone())
+                                            } else {
+                                                DirTarget::Child {
+                                                    dir: l.path.clone(),
+                                                    name: e.name.clone(),
+                                                }
+                                            });
+                                        }
+                                    } else {
+                                        if ui.add(theme::ghost("Download")).clicked() {
+                                            fetch = Some((l.path.clone(), e.name.clone()));
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(&e.name)
+                                                .font(egui::FontId::new(
+                                                    13.0,
+                                                    egui::FontFamily::Proportional,
+                                                ))
+                                                .color(theme::TEXT),
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    theme::mono(size(e.size), 11.0)
+                                                        .color(theme::MUTED),
+                                                );
+                                            },
+                                        );
                                     }
-                                } else {
-                                    if ui.button("Download").clicked() {
-                                        fetch = Some((l.path.clone(), e.name.clone()));
-                                    }
-                                    ui.label(&e.name);
-                                    ui.weak(size(e.size));
-                                }
-                            });
-                        }
-                        if l.truncated {
-                            ui.weak("More entries than fit: use the filter or open a subfolder");
-                        }
-                    });
+                                });
+                            }
+                            if l.truncated {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "More entries than fit: use the filter or open a subfolder",
+                                    )
+                                    .font(egui::FontId::new(12.0, egui::FontFamily::Proportional))
+                                    .color(theme::MUTED),
+                                );
+                            }
+                        });
+                });
             });
         if !open {
             self.close();

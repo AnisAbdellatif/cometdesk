@@ -1,0 +1,153 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-30T00:00:00Z",
+  "title": "Design System: CometDesk",
+  "extensions": {
+    "colorMeta": {
+      "signage-yellow": {
+        "role": "primary",
+        "displayName": "Signage Yellow",
+        "canonical": "#FFD21F",
+        "tonalRamp": [
+          "#3D3000",
+          "#665000",
+          "#8F7000",
+          "#C29C00",
+          "#FFD21F",
+          "#FFDF63",
+          "#FFEBA0",
+          "#FFF7D6"
+        ]
+      },
+      "ground": {
+        "role": "neutral",
+        "displayName": "Ground",
+        "canonical": "#0B0B09",
+        "tonalRamp": [
+          "#0B0B09",
+          "#12120F",
+          "#1A1A15",
+          "#24241C",
+          "#3A392E",
+          "#A8A48C",
+          "#D4D0BC",
+          "#F4F1E3"
+        ]
+      },
+      "ok": {
+        "role": "status",
+        "displayName": "OK",
+        "canonical": "#3FD38A",
+        "tonalRamp": [
+          "#0B3A22",
+          "#135C37",
+          "#1C8A53",
+          "#2DB36F",
+          "#3FD38A",
+          "#79E3AF",
+          "#B1F0D0",
+          "#E3FAEF"
+        ]
+      },
+      "warn": {
+        "role": "status",
+        "displayName": "Warn",
+        "canonical": "#FF8F2B",
+        "tonalRamp": [
+          "#4A2500",
+          "#7A3E00",
+          "#B05A08",
+          "#E07318",
+          "#FF8F2B",
+          "#FFAE62",
+          "#FFCF9E",
+          "#FFEBD6"
+        ]
+      },
+      "err": {
+        "role": "status",
+        "displayName": "Err",
+        "canonical": "#FF5A52",
+        "tonalRamp": [
+          "#4A1311",
+          "#781F1C",
+          "#A83029",
+          "#D44840",
+          "#FF5A52",
+          "#FF8C86",
+          "#FFBAB6",
+          "#FFE5E3"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "heading": {
+        "displayName": "Heading",
+        "purpose": "Screen titles."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Default text and buttons."
+      }
+    },
+    "shadows": [],
+    "motion": [],
+    "breakpoints": []
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "The next action.",
+      "html": "<button class=\"ds-btn\">Connect</button>",
+      "css": ".ds-btn{background:#FFD21F;color:#0B0B09;font-weight:700;border:0;border-radius:4px;padding:6px 12px;font-size:14px}.ds-btn:hover{background:#FFE262}"
+    },
+    {
+      "name": "Device Row",
+      "kind": "card",
+      "refersTo": "card",
+      "description": "Saved device with its line badge.",
+      "html": "<div class=\"ds-row\"><b class=\"ds-badge\">C</b><span>Comet<br><i>admin@192.168.200.1</i></span></div>",
+      "css": ".ds-row{display:flex;gap:12px;align-items:center;background:#1A1A15;border:1px solid #3A392E;border-radius:6px;padding:14px 16px;color:#F4F1E3;font-size:14px}.ds-badge{width:36px;height:36px;border-radius:4px;background:#3FA7FF;color:#0B0B09;display:grid;place-items:center;font-size:22px}.ds-row i{color:#A8A48C;font-size:12px;font-style:normal}"
+    },
+    {
+      "name": "Status Tag",
+      "kind": "custom",
+      "description": "Dot plus label, square-cornered.",
+      "html": "<span class=\"ds-tag\"><u></u>Connected</span>",
+      "css": ".ds-tag{display:inline-flex;gap:6px;align-items:center;background:rgba(63,211,138,.14);color:#3FD38A;border-radius:4px;padding:3px 8px;font-size:12px}.ds-tag u{width:8px;height:8px;border-radius:50%;background:#3FD38A}"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Wayfinding Board",
+    "overview": "Warm-black ground, signage yellow for the next action, square tags, and a colour line per device.",
+    "keyCharacteristics": [
+      "Stream first",
+      "Flat and square",
+      "Yellow means the next action"
+    ],
+    "rules": [
+      {
+        "name": "The One Yellow Rule",
+        "body": "Yellow is for the single next action on a screen.",
+        "section": "colors"
+      },
+      {
+        "name": "The Separate Channels Rule",
+        "body": "Identity, action and state never share a colour.",
+        "section": "colors"
+      }
+    ],
+    "dos": [
+      "Do take colours from theme.rs constants.",
+      "Do keep every feature reachable through the bar, panel or search.",
+      "Do pair every status colour with text."
+    ],
+    "donts": [
+      "Don't use a line colour for status or yellow for identity.",
+      "Don't add shadows, gradients or rounded pills.",
+      "Don't put new top-level controls on the bar."
+    ]
+  }
+}

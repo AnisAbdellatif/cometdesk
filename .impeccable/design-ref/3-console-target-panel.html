@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<title>Console with Target panel</title>
+<script src="49b8d74b-4629-4587-9f02-164881ac5982"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+body{margin:0;background:#0B0B09}
+button{font-family:inherit}
+</style>
+</helmet>
+<div style="width:1280px;height:832px;box-sizing:border-box;background:#0B0B09;color:#F4F1E3;font-family:Inter,system-ui,sans-serif;position:relative;overflow:hidden">
+
+  <!-- remote screen (mock of a Linux desktop) -->
+  <div style="position:absolute;left:0;right:0;top:49px;bottom:0;background:#2b3442">
+    <div style="position:absolute;left:0;top:0;right:0;height:28px;background:#1d222b;opacity:0.95"></div>
+    <div style="position:absolute;left:60px;top:80px;width:640px;height:380px;background:#14181f;border-radius:8px;border:1px solid #3d4757">
+      <div style="height:28px;background:#232a35;border-radius:8px 8px 0 0"></div>
+      <div style="padding:16px;font-family:'JetBrains Mono',monospace;font-size:13px;color:#9fd6a8;line-height:1.6">user@workstation:~$ journalctl -u nginx<br>Oct 31 11:58:02 nginx[912]: reloaded config<br>Oct 31 11:58:04 nginx[912]: worker 4 ready<br>user@workstation:~$ <span style="background:#9fd6a8;color:#14181f">&nbsp;</span></div>
+    </div>
+  </div>
+
+  <!-- top bar -->
+  <div style="position:absolute;left:0;right:0;top:0;height:48px;background:#12120F;display:flex;align-items:center;justify-content:space-between;padding:0 12px;gap:8px">
+    <div style="display:flex;align-items:center;gap:8px">
+      <button style="height:32px;display:flex;align-items:center;gap:6px;padding:0 12px 0 8px;background:transparent;border:0;border-radius:6px;color:#F4F1E3;font-size:13px;font-weight:600;cursor:pointer">
+        <svg width="14" height="14" sc-camel-view-box="0 0 14 14" aria-hidden="true"><path d="M9 2L4 7l5 5" fill="none" stroke="#F4F1E3" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg>Devices</button>
+      <div style="width:1px;height:20px;background:#3A392E"></div>
+      <div style="display:flex;align-items:center;gap:8px;padding:0 8px">
+        <div style="width:24px;height:24px;border-radius:6px;background:#6AA3FF;color:#0B0B09;font-size:13px;font-weight:700;display:flex;align-items:center;justify-content:center">O</div>
+        <div style="font-size:14px;font-weight:600">Office Comet</div>
+      </div>
+      <div style="width:132px;display:flex;align-items:center;gap:7px;font-size:13px;color:#F4F1E3"><span style="width:8px;height:8px;border-radius:50%;background:#3FD38A"></span>Connected</div>
+      <div style="width:1px;height:20px;background:#3A392E"></div>
+
+      <!-- dropdowns: label + chevron in a recessed well; plain actions have no chevron -->
+      <button style="height:32px;display:flex;align-items:center;gap:8px;padding:0 8px 0 12px;background:#1A1A15;border:1px solid #3A392E;border-radius:6px;color:#F4F1E3;font-size:13px;font-weight:500;cursor:pointer">Keys<svg width="10" height="6" sc-camel-view-box="0 0 10 6" aria-hidden="true"><path d="M1 1l4 4 4-4" fill="none" stroke="#A8A48C" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path></svg></button>
+      <button style="height:32px;padding:0 12px;background:transparent;border:1px solid transparent;border-radius:6px;color:#F4F1E3;font-size:13px;font-weight:500;cursor:pointer">Paste</button>
+      <button style="height:32px;display:flex;align-items:center;gap:8px;padding:0 8px 0 12px;background:#1A1A15;border:1px solid #3A392E;border-radius:6px;color:#F4F1E3;font-size:13px;font-weight:500;cursor:pointer">Capture<svg width="10" height="6" sc-camel-view-box="0 0 10 6" aria-hidden="true"><path d="M1 1l4 4 4-4" fill="none" stroke="#A8A48C" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path></svg></button>
+      <button style="height:32px;display:flex;align-items:center;gap:8px;padding:0 8px 0 12px;background:#1A1A15;border:1px solid #3A392E;border-radius:6px;color:#F4F1E3;font-size:13px;font-weight:500;cursor:pointer">Power<svg width="10" height="6" sc-camel-view-box="0 0 10 6" aria-hidden="true"><path d="M1 1l4 4 4-4" fill="none" stroke="#A8A48C" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path></svg></button>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px">
+      <button style="height:32px;display:flex;align-items:center;gap:10px;padding:0 6px 0 12px;background:#1A1A15;border:1px solid #3A392E;border-radius:6px;color:#A8A48C;font-size:13px;cursor:pointer">Actions<span style="font-family:'JetBrains Mono',monospace;font-size:11px;background:#24241C;border:1px solid #3A392E;border-radius:4px;padding:2px 6px;color:#F4F1E3">⌘K</span></button>
+      <button style="height:32px;padding:0 12px;background:#3A392E;border:1px solid #3A392E;border-radius:6px;color:#F4F1E3;font-size:13px;font-weight:600;cursor:pointer">Panel</button>
+      <button aria-label="Fullscreen" style="height:32px;width:32px;display:flex;align-items:center;justify-content:center;background:transparent;border:0;border-radius:6px;cursor:pointer"><svg width="14" height="14" sc-camel-view-box="0 0 14 14" aria-hidden="true"><path d="M1 5V1h4M9 1h4v4M13 9v4H9M5 13H1V9" fill="none" stroke="#F4F1E3" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path></svg></button>
+    </div>
+  </div>
+  <div style="position:absolute;left:0;right:0;top:48px;height:1px;background:#3FD38A"></div>
+
+  <!-- side panel -->
+  <div style="position:absolute;right:0;top:49px;bottom:0;width:320px;box-sizing:border-box;background:#12120F;border-left:1px solid #3A392E;display:flex;flex-direction:column">
+    <div style="display:flex;padding:0 12px;border-bottom:1px solid #3A392E">
+      <div style="padding:14px 12px 12px;font-size:14px;font-weight:600;border-bottom:2px solid #FFD21F;margin-bottom:-1px">Target</div>
+      <div style="padding:14px 12px 12px;font-size:14px;color:#A8A48C">Video</div>
+      <div style="padding:14px 12px 12px;font-size:14px;color:#A8A48C">Settings</div>
+    </div>
+
+    <div style="flex:1;overflow:hidden;padding:16px;display:flex;flex-direction:column;gap:12px">
+      <!-- banner -->
+      <div style="display:flex;gap:10px;align-items:flex-start;background:#2a1d0c;border:1px solid #FF8F2B;border-radius:8px;padding:10px 12px;font-size:13px;line-height:1.4"><span style="margin-top:4px;width:8px;height:8px;border-radius:50%;background:#FF8F2B;flex:none"></span>Clipboard needs attention. Open Clipboard below.</div>
+
+      <!-- clipboard card (expanded) -->
+      <div style="background:#1A1A15;border:1px solid #3A392E;border-radius:10px">
+        <div style="height:44px;padding:0 14px;display:flex;align-items:center;justify-content:space-between">
+          <div style="display:flex;align-items:center;gap:8px;font-size:14px;font-weight:600">Clipboard<span style="font-size:12px;font-weight:600;color:#FF8F2B;background:#2a1d0c;border-radius:10px;padding:2px 8px">Needs repair</span></div>
+          <svg width="10" height="6" sc-camel-view-box="0 0 10 6" aria-hidden="true"><path d="M1 1l4 4 4-4" fill="none" stroke="#A8A48C" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+        </div>
+        <div style="padding:0 14px 14px;display:flex;flex-direction:column;gap:12px;font-size:13px;color:#A8A48C">
+          <div style="display:grid;grid-template-columns:64px 1fr;row-gap:4px"><span>Comet</span><span style="color:#F4F1E3">Bridge ready · fw 1.8.2</span><span>Target</span><span style="color:#F4F1E3">workstation (Linux)</span></div>
+          <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));background:#0B0B09;border:1px solid #3A392E;border-radius:8px;padding:3px;gap:3px">
+            <div style="height:32px;border-radius:6px;background:#3A392E;color:#F4F1E3;font-size:12px;font-weight:600;display:flex;align-items:center;justify-content:center">Both ways</div>
+            <div style="height:32px;border-radius:6px;color:#A8A48C;font-size:12px;display:flex;align-items:center;justify-content:center">To target</div>
+            <div style="height:32px;border-radius:6px;color:#A8A48C;font-size:12px;display:flex;align-items:center;justify-content:center">From target</div>
+          </div>
+          <div style="display:flex;align-items:center;justify-content:space-between;color:#F4F1E3;font-size:13px">Pause sync
+            <span style="width:36px;height:20px;border-radius:10px;background:#3A392E;position:relative"><span style="position:absolute;left:3px;top:3px;width:14px;height:14px;border-radius:50%;background:#A8A48C"></span></span></div>
+          <button style="height:36px;background:#24241C;color:#F4F1E3;border:1px solid #3A392E;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer">Set up the target again…</button>
+        </div>
+      </div>
+
+      <!-- action buttons: same width, same height -->
+      <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px">
+        <button style="height:40px;background:#1A1A15;color:#F4F1E3;border:1px solid #3A392E;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer">Send file…</button>
+        <button style="height:40px;background:#1A1A15;color:#F4F1E3;border:1px solid #3A392E;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer">Browse files…</button>
+      </div>
+
+      <!-- session -->
+      <div style="background:#1A1A15;border:1px solid #3A392E;border-radius:10px;padding:12px 14px;display:flex;flex-direction:column;gap:10px">
+        <div style="font-size:14px;font-weight:600">Session</div>
+        <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px">
+          <button style="height:34px;background:#24241C;color:#F4F1E3;border:1px solid #3A392E;border-radius:8px;font-size:13px;cursor:pointer">Lock</button>
+          <button style="height:34px;background:#24241C;color:#F4F1E3;border:1px solid #3A392E;border-radius:8px;font-size:13px;cursor:pointer">Sleep</button>
+          <button style="height:34px;background:#24241C;color:#F4F1E3;border:1px solid #3A392E;border-radius:8px;font-size:13px;cursor:pointer">Log off…</button>
+          <button style="height:34px;background:#24241C;color:#F4F1E3;border:1px solid #3A392E;border-radius:8px;font-size:13px;cursor:pointer">Restart…</button>
+        </div>
+      </div>
+
+      <!-- collapsed accordions -->
+      <div style="background:#1A1A15;border:1px solid #3A392E;border-radius:10px">
+        <div style="height:44px;padding:0 14px;display:flex;align-items:center;justify-content:space-between;font-size:14px;font-weight:600">System info<svg width="6" height="10" sc-camel-view-box="0 0 6 10" aria-hidden="true"><path d="M1 1l4 4-4 4" fill="none" stroke="#A8A48C" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path></svg></div>
+        <div style="height:1px;background:#3A392E"></div>
+        <div style="height:44px;padding:0 14px;display:flex;align-items:center;justify-content:space-between;font-size:14px;font-weight:600"><span>Media<span style="color:#3FD38A;margin-left:8px;font-size:12px">● mounted</span></span><svg width="6" height="10" sc-camel-view-box="0 0 6 10" aria-hidden="true"><path d="M1 1l4 4-4 4" fill="none" stroke="#A8A48C" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path></svg></div>
+      </div>
+    </div>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script="" data-props="{&quot;$preview&quot;:{&quot;width&quot;:1280,&quot;height&quot;:832}}">
+class Component extends DCLogic {
+renderVals() { return {}; }
+}
+</script>
+
+
+</body></html>

@@ -296,6 +296,21 @@ async fn connect(req: &ConnectRequest, pins: Arc<PinStore>) -> Result<Connected,
     })
 }
 
+impl App {
+    /// Disconnect and log out. Call once the event loop has returned.
+    pub fn shutdown(&mut self) {
+        if let Some(c) = self.console.take() {
+            let logout = c.disconnect();
+            // Wait for the logout, but no longer than this; the runtime is dropped with the app.
+            // The `async` block matters: `timeout` needs the runtime context to build its timer,
+            // which only exists once `block_on` is running.
+            let _ = self
+                .rt
+                .block_on(async { tokio::time::timeout(Duration::from_millis(500), logout).await });
+        }
+    }
+}
+
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -413,14 +428,8 @@ impl ApplicationHandler<UserEvent> for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match &event {
             WindowEvent::CloseRequested => {
-                if let Some(c) = self.console.take() {
-                    let logout = c.disconnect();
-                    // Wait for the logout, but no longer than this; the runtime is dropped
-                    // with the app.
-                    let _ = self
-                        .rt
-                        .block_on(tokio::time::timeout(Duration::from_millis(500), logout));
-                }
+                // Teardown runs in `App::shutdown`, after the event loop returns: a panic
+                // inside this winit/AppKit delegate callback cannot unwind and aborts.
                 event_loop.exit();
                 return;
             }

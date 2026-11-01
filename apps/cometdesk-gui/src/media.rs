@@ -269,34 +269,43 @@ impl Media {
         }
     }
 
-    /// The "Media" toolbar menu.
-    pub fn menu(&mut self, ui: &mut egui::Ui) {
+    /// Whether any virtual media image is currently mounted on the target.
+    pub fn is_mounted(&self) -> bool {
+        let s = self.lock();
+        s.state.as_ref().and_then(MsdState::mounted).is_some()
+    }
+
+    /// Renders virtual media controls inside the side panel accordion.
+    pub fn panel_ui(&mut self, ui: &mut egui::Ui) {
         let (state, working, upload) = {
             let s = self.lock();
             (s.state.clone(), s.working, s.upload.clone())
         };
-        let title = match &upload {
-            Some(u) => format!("Media {}%", u.sent * 100 / u.total.max(1)),
-            None if state.as_ref().and_then(MsdState::mounted).is_some() => "Media ●".into(),
-            None => "Media".into(),
+        let stale = {
+            let s = self.lock();
+            s.fetched.is_none_or(|t| t.elapsed() > STALE)
         };
-        theme::section(ui, title, |ui| {
-            let stale = {
-                let s = self.lock();
-                s.fetched.is_none_or(|t| t.elapsed() > STALE)
-            };
-            if stale {
-                self.refresh();
-            }
-            let Some(state) = state else {
-                ui.label("Reading the device…");
-                return;
-            };
-            if !state.enabled {
-                ui.label("Virtual media is off on this device");
-                return;
-            }
-            let connected = state.drive.connected;
+        if stale {
+            self.refresh();
+        }
+        let Some(state) = state else {
+            ui.label(egui::RichText::new("Reading the device…").color(theme::MUTED));
+            return;
+        };
+        if !state.enabled {
+            ui.label(
+                egui::RichText::new("Virtual media is off on this device").color(theme::MUTED),
+            );
+            return;
+        }
+
+        ui.spacing_mut().item_spacing = egui::vec2(0.0, 12.0);
+
+        // Mounted section
+        theme::caption(ui, "MOUNTED IMAGE");
+        let mount_card = theme::panel_card();
+        mount_card.show(ui, |ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, 8.0);
             match state.mounted() {
                 Some(image) => {
                     let kind = if state.drive.cdrom {
@@ -304,88 +313,157 @@ impl Media {
                     } else {
                         "USB drive"
                     };
-                    ui.label(format!("Mounted: {image} ({kind})"));
-                    if ui
-                        .add_enabled(!working, egui::Button::new("Eject"))
-                        .clicked()
-                    {
+                    ui.horizontal(|ui| {
+                        theme::tag(ui, kind, theme::OK, theme::WELL);
+                        ui.label(
+                            egui::RichText::new(image)
+                                .font(egui::FontId::new(13.0, theme::bold_family()))
+                                .color(theme::TEXT),
+                        );
+                    });
+                    if ui.add_enabled(!working, theme::ghost("Eject")).clicked() {
                         self.eject();
-                        ui.close();
                     }
                 }
                 None => {
-                    ui.label("Nothing mounted");
+                    ui.label(egui::RichText::new("Nothing mounted").color(theme::MUTED));
                 }
             }
-            ui.separator();
-            if state.storage.images.is_empty() {
-                ui.label("No images on the device");
-            }
-            let can_mount = !working && !connected && state.online && !state.busy;
-            for (name, img) in &state.storage.images {
-                let label = if img.complete {
-                    format!("{name}  ({})", size(img.size))
-                } else {
-                    format!("{name}  (incomplete)")
-                };
-                ui.menu_button(label, |ui| {
-                    if img.complete {
-                        for (text, cdrom) in
-                            [("Mount as CD-ROM", true), ("Mount as USB drive", false)]
-                        {
-                            let tip = if connected {
-                                "Eject the mounted image first"
-                            } else {
-                                "Not ready"
-                            };
-                            if ui
-                                .add_enabled(can_mount, egui::Button::new(text))
-                                .on_disabled_hover_text(tip)
-                                .clicked()
-                            {
-                                self.mount(name.clone(), cdrom);
-                                ui.close();
-                            }
-                        }
-                    }
-                    let in_use =
-                        state.drive.connected && state.drive.image.as_deref() == Some(name);
-                    ui.add_enabled_ui(!working && !in_use, |ui| {
-                        ui.menu_button("Delete from device", |ui| {
-                            if ui.button(format!("Really delete {name}")).clicked() {
-                                self.remove(name.clone());
-                                ui.close();
-                            }
-                        });
+        });
+
+        // Images list section
+        theme::caption(ui, "IMAGES ON DEVICE");
+        if state.storage.images.is_empty() {
+            let empty_card = theme::panel_card();
+            empty_card.show(ui, |ui| {
+                ui.label(egui::RichText::new("No images on the device").color(theme::MUTED));
+            });
+        }
+        let can_mount = !working && !state.drive.connected && state.online && !state.busy;
+        for (name, img) in &state.storage.images {
+            let card = theme::panel_card();
+            card.show(ui, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(0.0, 8.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(name)
+                            .font(egui::FontId::new(13.0, theme::bold_family()))
+                            .color(theme::TEXT),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let size_text = if img.complete {
+                            size(img.size)
+                        } else {
+                            "incomplete".to_string()
+                        };
+                        ui.label(theme::mono(size_text, 11.0).color(theme::MUTED));
                     });
                 });
-            }
-            ui.separator();
+
+                if img.complete && can_mount {
+                    let pair_w = (ui.available_width() - 8.0) * 0.5;
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
+                        let (rect_cd, resp_cd) =
+                            ui.allocate_exact_size(egui::vec2(pair_w, 32.0), egui::Sense::click());
+                        if ui.is_rect_visible(rect_cd) {
+                            let fill = if resp_cd.hovered() {
+                                theme::CARD_HOVER
+                            } else {
+                                theme::BG
+                            };
+                            ui.painter().rect(
+                                rect_cd,
+                                egui::CornerRadius::same(6),
+                                fill,
+                                egui::Stroke::new(1.0, theme::BORDER),
+                                egui::StrokeKind::Inside,
+                            );
+                            let galley = ui.painter().layout_no_wrap(
+                                "Mount CD".to_owned(),
+                                egui::FontId::new(12.0, theme::bold_family()),
+                                theme::TEXT,
+                            );
+                            ui.painter().galley(
+                                rect_cd.center() - galley.size() * 0.5,
+                                galley,
+                                theme::TEXT,
+                            );
+                        }
+                        if resp_cd.clicked() {
+                            self.mount(name.clone(), true);
+                        }
+
+                        let (rect_usb, resp_usb) =
+                            ui.allocate_exact_size(egui::vec2(pair_w, 32.0), egui::Sense::click());
+                        if ui.is_rect_visible(rect_usb) {
+                            let fill = if resp_usb.hovered() {
+                                theme::CARD_HOVER
+                            } else {
+                                theme::BG
+                            };
+                            ui.painter().rect(
+                                rect_usb,
+                                egui::CornerRadius::same(6),
+                                fill,
+                                egui::Stroke::new(1.0, theme::BORDER),
+                                egui::StrokeKind::Inside,
+                            );
+                            let galley = ui.painter().layout_no_wrap(
+                                "Mount USB".to_owned(),
+                                egui::FontId::new(12.0, theme::bold_family()),
+                                theme::TEXT,
+                            );
+                            ui.painter().galley(
+                                rect_usb.center() - galley.size() * 0.5,
+                                galley,
+                                theme::TEXT,
+                            );
+                        }
+                        if resp_usb.clicked() {
+                            self.mount(name.clone(), false);
+                        }
+                    });
+                }
+
+                let in_use = state.drive.connected && state.drive.image.as_deref() == Some(name);
+                if !working && !in_use && ui.add(theme::ghost("Delete image")).clicked() {
+                    self.remove(name.clone());
+                }
+            });
+        }
+
+        // Storage section
+        theme::caption(ui, "STORAGE");
+        let storage_card = theme::panel_card();
+        storage_card.show(ui, |ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, 8.0);
             match &upload {
                 Some(u) => {
-                    ui.label(format!("Uploading {}", u.name));
+                    ui.label(
+                        egui::RichText::new(format!("Uploading {}", u.name))
+                            .font(egui::FontId::new(13.0, theme::bold_family()))
+                            .color(theme::TEXT),
+                    );
                     ui.add(
                         egui::ProgressBar::new(u.sent as f32 / u.total.max(1) as f32)
                             .show_percentage(),
                     );
-                    if ui.button("Cancel upload").clicked() {
+                    if ui.add(theme::ghost("Cancel upload")).clicked() {
                         self.cancel_upload();
-                        ui.close();
                     }
                 }
                 None => {
-                    if ui
-                        .button("Upload image…")
+                    if theme::secondary_button(ui, "Upload image…", 34.0, false)
                         .on_hover_text("Or drop a file on the window")
                         .clicked()
                     {
                         self.pick();
-                        ui.close();
                     }
                 }
             }
             if let Some(free) = state.free() {
-                ui.weak(format!("{} free", size(free)));
+                ui.label(theme::mono(format!("{} free", size(free)), 11.0).color(theme::MUTED));
             }
         });
     }
