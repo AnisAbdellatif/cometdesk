@@ -75,7 +75,12 @@ pub fn route(state: &State, req: &Request) -> Reply {
         return Reply::error(400, "BadRequestError");
     }
     let (m, p) = (
-        req.method.as_str(),
+        // HEAD is answered like GET (the writer drops the body).
+        if req.method == "HEAD" {
+            "GET"
+        } else {
+            req.method.as_str()
+        },
         req.path.strip_prefix("/api/").unwrap_or(""),
     );
     match (m, p) {
