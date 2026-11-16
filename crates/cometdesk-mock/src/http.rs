@@ -3,6 +3,27 @@
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+/// Decodes `%XX` escapes (invalid ones stay as they are).
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2]))
+        {
+            out.push((h * 16 + l) as u8);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 pub struct Request {
     pub method: String,
     pub path: String,
@@ -81,7 +102,7 @@ impl Request {
 
 /// `None` when the peer closes before a full request arrives.
 /// `buf` carries bytes read past the previous request (pipelining) and is drained of this one.
-pub async fn read_request<S: AsyncRead + Unpin>(
+pub async fn read_request<S: AsyncRead + AsyncWrite + Unpin>(
     io: &mut S,
     buf: &mut Vec<u8>,
 ) -> std::io::Result<Option<Request>> {
@@ -109,6 +130,14 @@ pub async fn read_request<S: AsyncRead + Unpin>(
         .filter_map(|l| l.split_once(':'))
         .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_owned()))
         .collect();
+    if headers
+        .iter()
+        .any(|(k, v)| k == "expect" && v.eq_ignore_ascii_case("100-continue"))
+        && buf.len() == header_end
+    {
+        io.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
+        io.flush().await?;
+    }
     let chunked = headers
         .iter()
         .any(|(k, v)| k == "transfer-encoding" && v.to_ascii_lowercase().contains("chunked"));
@@ -147,7 +176,7 @@ pub async fn read_request<S: AsyncRead + Unpin>(
     let well_formed = version.starts_with("HTTP/") && !method.is_empty() && !target.is_empty();
     Ok(Some(Request {
         method: if well_formed { method } else { "BAD" }.into(),
-        path: path.into(),
+        path: percent_decode(path),
         query: query.into(),
         headers,
         body: String::from_utf8_lossy(&body_bytes).to_string(),

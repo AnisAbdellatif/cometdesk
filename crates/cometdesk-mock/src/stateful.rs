@@ -49,13 +49,17 @@ pub(crate) fn route(state: &State, m: &str, p: &str, req: &Request) -> Option<Re
             .cloned()
             .unwrap_or_default()
     };
-    Some(match (m, p) {
+    // Pushed to open `/api/ws` sockets once the write succeeded.
+    let mut note: Option<(&str, String)> = None;
+    let reply = match (m, p) {
         ("POST", "streamer/set_params") => {
             for (k, v) in pairs(req) {
                 dev.streamer_params.insert(k, coerce(&v));
             }
             drop(dev);
-            Reply::ok(streamer(state))
+            let full = streamer(state);
+            note = Some(("streamer", full.clone()));
+            Reply::ok(full)
         }
         ("GET", "streamer/snapshot") => {
             if state.viewers.load(Ordering::SeqCst) == 0 && param(req, "allow_offline") != "1" {
@@ -84,6 +88,7 @@ pub(crate) fn route(state: &State, m: &str, p: &str, req: &Request) -> Option<Re
                 image.into()
             };
             dev.msd["drive"]["cdrom"] = (param(req, "cdrom") != "0").into();
+            note = Some(("msd", dev.msd.to_string()));
             Reply::ok("{}")
         }
         ("POST", "msd/set_connected") => {
@@ -92,6 +97,7 @@ pub(crate) fn route(state: &State, m: &str, p: &str, req: &Request) -> Option<Re
                 return Some(Reply::error(400, "MsdImageNotSelectedError"));
             }
             dev.msd["drive"]["connected"] = on.into();
+            note = Some(("msd", dev.msd.to_string()));
             Reply::ok("{}")
         }
         ("POST", "msd/remove") => {
@@ -100,6 +106,7 @@ pub(crate) fn route(state: &State, m: &str, p: &str, req: &Request) -> Option<Re
                 .as_object_mut()
                 .is_some_and(|m| m.remove(&image).is_some());
             if removed {
+                note = Some(("msd", dev.msd.to_string()));
                 Reply::ok("{}")
             } else {
                 Reply::error(400, "MsdUnknownImageError")
@@ -112,6 +119,7 @@ pub(crate) fn route(state: &State, m: &str, p: &str, req: &Request) -> Option<Re
             }
             dev.msd["storage"]["images"][&image] =
                 json!({"complete": true, "mod_ts": 0, "removable": true, "size": req.body_len});
+            note = Some(("msd", dev.msd.to_string()));
             Reply::ok("{}")
         }
         ("GET", "wol/list") => Reply::ok(json!({"devices": dev.wol}).to_string()),
@@ -141,7 +149,11 @@ pub(crate) fn route(state: &State, m: &str, p: &str, req: &Request) -> Option<Re
             Reply::ok("{}")
         }
         _ => return None,
-    })
+    };
+    if let Some((kind, json)) = note {
+        state.push_json(kind, &json);
+    }
+    Some(reply)
 }
 
 /// The text of form field `name` in a `multipart/form-data` body.

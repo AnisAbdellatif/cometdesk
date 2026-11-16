@@ -287,3 +287,40 @@ async fn keep_alive_reuses_one_connection() {
         "login and all requests share one pooled connection"
     );
 }
+
+#[tokio::test]
+async fn wrong_method_is_405_and_paths_are_percent_decoded() {
+    let (_dev, s) = connect(Config {
+        atx: true,
+        ..Default::default()
+    })
+    .await;
+    let err = s
+        .get::<serde_json::Value>("atx/power", &[])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Api { status: 405, .. }), "{err:?}");
+    let err = s.post::<serde_json::Value>("info", &[]).await.unwrap_err();
+    assert!(matches!(err, Error::Api { status: 405, .. }), "{err:?}");
+    s.get::<serde_json::Value>("%61tx", &[]).await.unwrap();
+}
+
+#[tokio::test]
+async fn atx_actions_change_the_power_led() {
+    let (_dev, s) = connect(Config {
+        atx: true,
+        ..Default::default()
+    })
+    .await;
+    let led = |s: &Session| {
+        let s = s.clone();
+        async move { s.atx_state().await.unwrap().leds.power }
+    };
+    assert!(led(&s).await);
+    s.atx_power(PowerAction::OffHard, false).await.unwrap();
+    assert!(!led(&s).await);
+    s.atx_power(PowerAction::On, false).await.unwrap();
+    assert!(led(&s).await);
+    s.atx_power(PowerAction::ResetHard, false).await.unwrap();
+    assert!(led(&s).await, "reset keeps the power LED");
+}

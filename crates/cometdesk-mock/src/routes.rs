@@ -16,11 +16,59 @@ fn field(body: &str, k: &str) -> String {
 
 pub(crate) fn atx(state: &State) -> String {
     if state.config.atx {
-        r#"{"enabled":true,"busy":false,"leds":{"power":true,"hdd":false},"power":"on"}"#.into()
+        let on = state.dev.lock().unwrap().atx_on;
+        let power = if on { "on" } else { "off" };
+        format!(
+            r#"{{"enabled":true,"busy":false,"leds":{{"power":{on},"hdd":false}},"power":"{power}"}}"#
+        )
     } else {
         result("atx")
     }
 }
+
+/// New power LED after an ATX action (`atx/power?action=` or `atx/click?button=`).
+fn atx_after(on: bool, what: &str) -> bool {
+    match what {
+        "on" => true,
+        "off" | "off_hard" | "power_long" => false,
+        "power" => !on,
+        _ => on, // reset_hard, reset
+    }
+}
+
+/// Paths of every route, for answering a known path with the wrong method with 405.
+const PATHS: &[&str] = &[
+    "2fa/is_enabled",
+    "auth/login",
+    "auth/two_step_complete",
+    "auth/logout",
+    "info",
+    "upgrade/version",
+    "system/capability",
+    "system/get_config",
+    "system/set_config",
+    "hid",
+    "hid/keymaps",
+    "hid/print",
+    "msd",
+    "msd/set_params",
+    "msd/set_connected",
+    "msd/remove",
+    "msd/write",
+    "wol/list",
+    "wol/wake",
+    "wol/add",
+    "wol/remove",
+    "atx",
+    "atx/power",
+    "atx/click",
+    "streamer",
+    "streamer/set_params",
+    "streamer/snapshot",
+    "upgrade/get_edid",
+    "upgrade/edid_list",
+    "upgrade/edid",
+];
 
 pub fn route(state: &State, req: &Request) -> Reply {
     if req.method == "BAD" {
@@ -63,11 +111,27 @@ pub fn route(state: &State, req: &Request) -> Reply {
         ("GET", "system/capability") => Reply::ok(result("system_capability")),
         ("GET", "hid") => Reply::ok(result("hid")),
         ("GET", "hid/keymaps") => Reply::ok(result("hid_keymaps")),
-        ("POST", "atx/power" | "atx/click") if atx_on => Reply::ok("{}"),
+        ("POST", "atx/power" | "atx/click") if atx_on => {
+            let what = url::form_urlencoded::parse(req.query.as_bytes())
+                .find(|(k, _)| k == "action" || k == "button")
+                .map(|(_, v)| v.into_owned())
+                .unwrap_or_default();
+            {
+                let mut dev = state.dev.lock().unwrap();
+                dev.atx_on = atx_after(dev.atx_on, &what);
+            }
+            state.push_json("atx", &atx(state));
+            Reply::ok("{}")
+        }
         ("POST", "atx/power" | "atx/click") => Reply::error(400, "AtxDisabledError"),
         ("POST", "hid/print" | "wol/wake") => Reply::ok("{}"),
-        _ => crate::stateful::route(state, m, p, req)
-            .unwrap_or_else(|| Reply::error(404, "NotFoundError")),
+        _ => crate::stateful::route(state, m, p, req).unwrap_or_else(|| {
+            if PATHS.contains(&p) {
+                Reply::error(405, "MethodNotAllowedError")
+            } else {
+                Reply::error(404, "NotFoundError")
+            }
+        }),
     }
 }
 

@@ -16,6 +16,8 @@ pub(crate) struct Device {
     /// Saved Wake-on-LAN targets, `{mac, ip, name}`.
     pub wol: Vec<Value>,
     pub edid: String,
+    /// ATX power LED (only reported when `Config::atx`).
+    pub atx_on: bool,
 }
 
 pub(crate) const PRESETS: [(&str, &str, bool); 2] = [
@@ -38,6 +40,7 @@ impl Device {
             msd: parse("msd"),
             wol: Vec::new(),
             edid: preset_edid("1080p60"),
+            atx_on: true,
         }
     }
 

@@ -67,7 +67,12 @@ pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(state: Arc<State>, mut io:
                     }
                 }
                 Some(Ok(Message::Binary(b))) => state.hid_frames.lock().unwrap().push(b.to_vec()),
-                Some(Ok(Message::Close(_)) | Err(_)) | None => return,
+                Some(Ok(Message::Close(_))) => {
+                    // tungstenite queued the Close reply while reading; send it.
+                    let _ = ws.flush().await;
+                    return;
+                }
+                Some(Err(_)) | None => return,
                 Some(Ok(_)) => {}
             },
             p = push.recv() => match p {

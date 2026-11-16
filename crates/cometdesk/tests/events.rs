@@ -231,3 +231,61 @@ async fn hid_flood_is_delivered_in_order() {
     let frames = dev.hid_frames();
     assert!(frames.iter().all(|f| f[0] == 1), "key frames only");
 }
+
+#[tokio::test]
+async fn writes_are_pushed_to_open_event_sockets() {
+    use cometdesk::api::atx::AtxButton;
+    use cometdesk::api::streamer::StreamerUpdate;
+    let dev = MockDevice::start(Config {
+        atx: true,
+        ..Default::default()
+    })
+    .await;
+    let es = start(&dev, true).await;
+    let mut st = es.device_state();
+    wait(&mut st, |s: &DeviceState| {
+        s.atx().is_some() && s.streamer().is_some()
+    })
+    .await;
+    let api = login(&dev, Credentials::new(USER, PASSWORD)).await;
+    api.atx_click(AtxButton::PowerLong, false).await.unwrap();
+    wait(&mut st, |s: &DeviceState| {
+        s.raw("atx").is_some_and(|v| v["power"] == "off")
+    })
+    .await;
+    api.set_streamer_params(StreamerUpdate {
+        desired_fps: Some(33),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    wait(&mut st, |s: &DeviceState| {
+        s.raw("streamer")
+            .is_some_and(|v| v["params"]["desired_fps"] == 33)
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn client_close_gets_a_close_reply() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let dev = MockDevice::start(Config::default()).await;
+    let s = login(&dev, Credentials::new(USER, PASSWORD)).await;
+    let mut ws = s.ws_connect("api/ws?stream=0").await.unwrap();
+    ws.send(Message::Close(None)).await.unwrap();
+    let reply = timeout(Duration::from_secs(5), async {
+        while let Some(m) = ws.next().await {
+            if matches!(m, Ok(Message::Close(_))) {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .expect("timed out");
+    assert!(
+        reply,
+        "server must answer the close handshake before dropping"
+    );
+}

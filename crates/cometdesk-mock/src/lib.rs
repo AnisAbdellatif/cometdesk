@@ -77,6 +77,13 @@ impl State {
         t
     }
 
+    /// Sends `{"event_type":kind,"event":<json>}` to every open `/api/ws` socket.
+    pub fn push_json(&self, kind: &str, json: &str) {
+        let event: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
+        let text = serde_json::json!({"event_type": kind, "event": event}).to_string();
+        let _ = self.push.send(Push::Text(text));
+    }
+
     pub fn authed(&self, req: &http::Request) -> bool {
         req.token()
             .is_some_and(|t| self.tokens.lock().unwrap().contains(t))
@@ -105,11 +112,11 @@ pub struct MockDevice {
 impl MockDevice {
     /// Binds `127.0.0.1:0` and serves until the runtime ends.
     pub async fn start(config: Config) -> MockDevice {
-        Self::start_on(config, "127.0.0.1:0").await
+        Self::start_on(config, "127.0.0.1:0").await.unwrap()
     }
 
     /// Like `start`, but binds `bind` (e.g. `127.0.0.1:8443`).
-    pub async fn start_on(config: Config, bind: &str) -> MockDevice {
+    pub async fn start_on(config: Config, bind: &str) -> std::io::Result<MockDevice> {
         let state = Arc::new(State {
             config,
             acceptor: Mutex::new(acceptor()),
@@ -126,8 +133,8 @@ impl MockDevice {
             viewers: AtomicU32::new(0),
             push: broadcast::channel(64).0,
         });
-        let listener = TcpListener::bind(bind).await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let listener = TcpListener::bind(bind).await?;
+        let addr = listener.local_addr()?;
         let st = state.clone();
         tokio::spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
@@ -141,7 +148,7 @@ impl MockDevice {
                 });
             }
         });
-        MockDevice { addr, state }
+        Ok(MockDevice { addr, state })
     }
 
     /// `127.0.0.1:PORT`.
@@ -196,8 +203,7 @@ impl MockDevice {
 
     /// Sends `{"event_type":kind,"event":data}` to every open socket.
     pub fn push_event(&self, kind: &str, data: serde_json::Value) {
-        let text = serde_json::json!({"event_type": kind, "event": data}).to_string();
-        let _ = self.state.push.send(Push::Text(text));
+        self.state.push_json(kind, &data.to_string());
     }
 
     /// Pushes `kickout`, then closes every socket.
