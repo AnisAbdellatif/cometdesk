@@ -9,11 +9,8 @@
 .fastembed_cache/
 .DS_Store
 
-# graphify — keep the report and graph, ignore caches, build state and dated snapshots
-graphify-out/cache/
-graphify-out/.graphify_*
-graphify-out/manifest.json
-graphify-out/20??-??-??/
+# graphify — generated locally by the graphify hook
+graphify-out/
 
 # tokenade — scaffold backups
 *.tokenade-original
