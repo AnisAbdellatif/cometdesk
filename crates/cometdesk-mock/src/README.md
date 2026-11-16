@@ -13,3 +13,4 @@ Dev-only fake GLKVM device (TLS + REST + `/api/ws`) for SDK and CLI tests, built
 - `tests.rs`: unit tests for wire helpers
 - `faults.rs`: fault injection (delay, forced status, dropped requests)
 - `tests/wire.rs`: raw-TLS protocol tests (keep-alive, pipelining, HEAD, Expect, limits, timeouts, WS faults)
+- `media.rs`: `/api/media/ws` direct H.264 from `clip.h264` (640x360, 30 fps, GOP 30, looped)

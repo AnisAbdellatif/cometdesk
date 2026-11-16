@@ -29,12 +29,20 @@ fn event(kind: &str, json: &str) -> Message {
     Message::text(serde_json::json!({"event_type": kind, "event": data}).to_string())
 }
 
-pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(state: Arc<State>, mut io: S, req: &Request) {
+/// The `101 Switching Protocols` reply for a WebSocket upgrade request.
+pub(crate) async fn handshake<S: AsyncWrite + Unpin>(
+    io: &mut S,
+    req: &Request,
+) -> std::io::Result<()> {
     let key = req.header("sec-websocket-key").unwrap_or_default();
     let head = format!(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
         derive_accept_key(key.as_bytes())
     );
+    io.write_all(head.as_bytes()).await
+}
+
+pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(state: Arc<State>, mut io: S, req: &Request) {
     state.ws_sessions.fetch_add(1, Ordering::SeqCst);
     let streams =
         !url::form_urlencoded::parse(req.query.as_bytes()).any(|(k, v)| k == "stream" && v == "0");
@@ -45,7 +53,7 @@ pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(state: Arc<State>, mut io:
     // Subscribe before the 101 so a push right after the client connects is not lost.
     let token = req.token().map(str::to_owned);
     let mut push = state.push.subscribe();
-    if io.write_all(head.as_bytes()).await.is_err() {
+    if handshake(&mut io, req).await.is_err() {
         return;
     }
     let mut ws = WebSocketStream::from_raw_socket(io, Role::Server, None).await;

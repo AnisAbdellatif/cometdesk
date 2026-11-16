@@ -6,6 +6,7 @@ mod device;
 mod faults;
 mod fixtures;
 mod http;
+mod media;
 mod routes;
 mod stateful;
 mod ws;
@@ -76,6 +77,8 @@ pub(crate) struct State {
     pub dev: Mutex<device::Device>,
     pub faults: Mutex<faults::Faults>,
     pub connections: AtomicU32,
+    pub media_sessions: AtomicU32,
+    pub media_frames: AtomicU32,
     pub logins: AtomicU32,
     pub polls: AtomicU32,
     pub issued: AtomicU32,
@@ -139,6 +142,8 @@ impl MockDevice {
             dev: Mutex::new(device::Device::new()),
             faults: Mutex::new(faults::Faults::default()),
             connections: AtomicU32::new(0),
+            media_sessions: AtomicU32::new(0),
+            media_frames: AtomicU32::new(0),
             logins: AtomicU32::new(0),
             polls: AtomicU32::new(0),
             issued: AtomicU32::new(0),
@@ -237,6 +242,16 @@ impl MockDevice {
         self.state.connections.load(Ordering::SeqCst)
     }
 
+    /// `/api/media/ws` sockets opened so far.
+    pub fn media_sessions(&self) -> u32 {
+        self.state.media_sessions.load(Ordering::SeqCst)
+    }
+
+    /// Video frames sent over `/api/media/ws` so far.
+    pub fn media_frames(&self) -> u32 {
+        self.state.media_frames.load(Ordering::SeqCst)
+    }
+
     /// Delays every REST answer by `d`.
     pub fn set_delay(&self, d: std::time::Duration) {
         self.state.faults.lk().delay = d;
@@ -281,7 +296,7 @@ where
             .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
         let keep = state.config.keep_alive && req.keep_alive;
         let fault = faults::apply(&state, &req).await;
-        if req.path == "/api/ws" && upgrade {
+        if (req.path == "/api/ws" || req.path == "/api/media/ws") && upgrade {
             match fault {
                 faults::Fault::Drop => return Ok(()),
                 faults::Fault::Reply(r) => return http::write_reply(io, &r, false, false).await,
@@ -291,7 +306,11 @@ where
                 let r = http::Reply::error(401, "UnauthorizedError");
                 return http::write_reply(io, &r, false, false).await;
             }
-            ws::serve(state, io, &req).await;
+            if req.path == "/api/media/ws" {
+                media::serve(state, io, &req).await;
+            } else {
+                ws::serve(state, io, &req).await;
+            }
             return Ok(());
         }
         let reply = match fault {

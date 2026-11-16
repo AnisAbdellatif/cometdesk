@@ -1032,6 +1032,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "cometdesk",
+ "cometdesk-mock",
  "cpal",
  "futures-util",
  "objc2-core-foundation",
