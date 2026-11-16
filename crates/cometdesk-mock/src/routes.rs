@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 
 use crate::fixtures::result;
 use crate::http::{Reply, Request};
+use crate::stateful::streamer;
 use crate::{Call, PASSWORD, State, TOTP, USER};
 
 fn field(body: &str, k: &str) -> String {
@@ -11,14 +12,6 @@ fn field(body: &str, k: &str) -> String {
         .find(|(key, _)| key == k)
         .map(|(_, v)| v.into_owned())
         .unwrap_or_default()
-}
-
-pub(crate) fn streamer(state: &State) -> String {
-    result(if state.viewers.load(Ordering::SeqCst) > 0 {
-        "streamer_running"
-    } else {
-        "streamer_idle"
-    })
 }
 
 pub(crate) fn atx(state: &State) -> String {
@@ -30,6 +23,9 @@ pub(crate) fn atx(state: &State) -> String {
 }
 
 pub fn route(state: &State, req: &Request) -> Reply {
+    if req.method == "BAD" {
+        return Reply::error(400, "BadRequestError");
+    }
     let (m, p) = (
         req.method.as_str(),
         req.path.strip_prefix("/api/").unwrap_or(""),
@@ -54,28 +50,23 @@ pub fn route(state: &State, req: &Request) -> Reply {
     let atx_on = state.config.atx;
     match (m, p) {
         ("POST", "auth/logout") => {
-            *state.valid_token.lock().unwrap() = None;
+            if let Some(t) = req.token() {
+                state.tokens.lock().unwrap().remove(t);
+            }
             Reply::ok("{}")
         }
         ("GET", "streamer") => Reply::ok(streamer(state)),
-        ("POST", "streamer/set_params") => Reply::ok(streamer(state)),
         ("GET", "atx") => Reply::ok(atx(state)),
         ("GET", "info") => Reply::ok(result("info")),
         ("GET", "upgrade/version") => Reply::ok(result("upgrade_version")),
         ("GET", "system/capability") => Reply::ok(result("system_capability")),
-        ("GET", "system/get_config") => Reply::ok(result("system_get_config")),
         ("GET", "hid") => Reply::ok(result("hid")),
         ("GET", "hid/keymaps") => Reply::ok(result("hid_keymaps")),
-        ("GET", "msd") => Reply::ok(result("msd")),
-        ("GET", "wol/list") => Reply::ok(result("wol_list")),
         ("POST", "atx/power" | "atx/click") if atx_on => Reply::ok("{}"),
         ("POST", "atx/power" | "atx/click") => Reply::error(400, "AtxDisabledError"),
-        (
-            "POST",
-            "msd/set_params" | "msd/set_connected" | "msd/remove" | "hid/print" | "wol/wake"
-            | "system/set_config",
-        ) => Reply::ok("{}"),
-        _ => Reply::error(404, "NotFoundError"),
+        ("POST", "hid/print" | "wol/wake") => Reply::ok("{}"),
+        _ => crate::stateful::route(state, m, p, req)
+            .unwrap_or_else(|| Reply::error(404, "NotFoundError")),
     }
 }
 

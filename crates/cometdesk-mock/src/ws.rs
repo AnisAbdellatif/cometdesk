@@ -50,7 +50,7 @@ pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(state: Arc<State>, mut io:
     let initial = [
         ("hid", crate::fixtures::result("hid")),
         ("atx", crate::routes::atx(&state)),
-        ("streamer", crate::routes::streamer(&state)),
+        ("streamer", crate::stateful::streamer(&state)),
     ];
     for (kind, json) in &initial {
         if ws.send(event(kind, json)).await.is_err() {

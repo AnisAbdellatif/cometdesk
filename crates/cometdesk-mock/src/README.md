@@ -8,3 +8,6 @@ Dev-only fake GLKVM device (TLS + REST + `/api/ws`) for SDK and CLI tests, built
 - `ws.rs`: `/api/ws` upgrade, initial state events, ping/pong, HID frame capture, pushed events.
 - `fixtures.rs`: embedded rm1-v1.10.1 recordings, `result(name)`.
 - `main.rs`: standalone binary (`cargo run -p cometdesk-mock -- --atx`), runs the mock until Ctrl-C
+- `device.rs`: mutable device state (streamer params, config, MSD, WoL, EDID)
+- `stateful.rs`: routes that depend on earlier writes, plus snapshot and EDID; `snapshot.jpg` is its canned picture
+- `tests.rs`: unit tests for wire helpers

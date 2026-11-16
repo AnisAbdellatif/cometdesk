@@ -2,11 +2,14 @@
 //! Entry point: `MockDevice::start`. Files: `http` (wire), `routes` (REST), `ws` (events/HID),
 //! `fixtures` (embedded recordings). Read `routes.rs` to add an endpoint.
 
+mod device;
 mod fixtures;
 mod http;
 mod routes;
+mod stateful;
 mod ws;
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -48,7 +51,8 @@ pub(crate) enum Push {
 pub(crate) struct State {
     pub config: Config,
     pub acceptor: Mutex<TlsAcceptor>,
-    pub valid_token: Mutex<Option<String>>,
+    pub tokens: Mutex<HashSet<String>>,
+    pub dev: Mutex<device::Device>,
     pub logins: AtomicU32,
     pub polls: AtomicU32,
     pub issued: AtomicU32,
@@ -62,12 +66,13 @@ pub(crate) struct State {
 impl State {
     pub fn issue_token(&self) -> String {
         let t = format!("token-{}", self.issued.fetch_add(1, Ordering::SeqCst));
-        *self.valid_token.lock().unwrap() = Some(t.clone());
+        self.tokens.lock().unwrap().insert(t.clone());
         t
     }
 
     pub fn authed(&self, req: &http::Request) -> bool {
-        req.token().is_some() && req.token().map(str::to_owned) == *self.valid_token.lock().unwrap()
+        req.token()
+            .is_some_and(|t| self.tokens.lock().unwrap().contains(t))
     }
 }
 
@@ -101,7 +106,8 @@ impl MockDevice {
         let state = Arc::new(State {
             config,
             acceptor: Mutex::new(acceptor()),
-            valid_token: Mutex::new(None),
+            tokens: Mutex::new(HashSet::new()),
+            dev: Mutex::new(device::Device::new()),
             logins: AtomicU32::new(0),
             polls: AtomicU32::new(0),
             issued: AtomicU32::new(0),
@@ -139,7 +145,7 @@ impl MockDevice {
     }
 
     pub fn expire_token(&self) {
-        *self.state.valid_token.lock().unwrap() = None;
+        self.state.tokens.lock().unwrap().clear();
     }
 
     pub fn logins(&self) -> u32 {
@@ -208,10 +214,14 @@ where
         .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
     if req.path == "/api/ws" && upgrade {
         if !state.authed(&req) {
-            return http::write_reply(io, &http::Reply::error(401, "UnauthorizedError")).await;
+            return http::write_reply(io, &http::Reply::error(401, "UnauthorizedError"), false)
+                .await;
         }
         ws::serve(state, io, &req).await;
         return Ok(());
     }
-    http::write_reply(io, &routes::route(&state, &req)).await
+    http::write_reply(io, &routes::route(&state, &req), req.method == "HEAD").await
 }
+
+#[cfg(test)]
+mod tests;

@@ -132,3 +132,114 @@ async fn print_sends_text_body_without_length_limit() {
         assert!(call.query.contains(part), "{}", call.query);
     }
 }
+
+#[tokio::test]
+async fn two_sessions_stay_valid_together() {
+    let (dev, a) = connect(Config::default()).await;
+    let b = Session::login(
+        &dev.host(),
+        &Credentials::new(USER, PASSWORD),
+        Arc::new(PinStore::in_memory()),
+    )
+    .await
+    .unwrap();
+    a.system_info().await.unwrap();
+    b.system_info().await.unwrap();
+    assert_eq!(dev.logins(), 2, "a must not have re-logged in");
+}
+
+#[tokio::test]
+async fn video_format_write_is_read_back() {
+    use cometdesk::api::system::VideoFormat;
+    let (_dev, s) = connect(Config::default()).await;
+    s.set_video_format(VideoFormat::H265).await.unwrap();
+    assert_eq!(s.system_config().await.unwrap().video_format, Some(1));
+}
+
+#[tokio::test]
+async fn streamer_params_write_is_read_back() {
+    use cometdesk::api::streamer::StreamerUpdate;
+    let (_dev, s) = connect(Config::default()).await;
+    let update = StreamerUpdate {
+        desired_fps: Some(30),
+        ..Default::default()
+    };
+    let state = s.set_streamer_params(update).await.unwrap();
+    assert_eq!(state.params.desired_fps, Some(30));
+}
+
+#[tokio::test]
+async fn msd_mount_remove_and_upload_round_trip() {
+    let (_dev, s) = connect(Config::default()).await;
+    s.msd_mount("image-0.iso", true).await.unwrap();
+    let msd = s.msd_state().await.unwrap();
+    assert!(msd.drive.connected);
+    assert_eq!(msd.drive.image.as_deref(), Some("image-0.iso"));
+    assert!(s.msd_mount("nope.iso", true).await.is_err());
+
+    // Streamed upload goes out chunked; the mock must see every byte.
+    let path = std::env::temp_dir().join(format!("cometdesk-mock-upload-{}", std::process::id()));
+    std::fs::write(&path, vec![7u8; 300_000]).unwrap();
+    s.msd_upload(&path, "new.iso", |_, _| {}).await.unwrap();
+    assert!(s.msd_upload(&path, "new.iso", |_, _| {}).await.is_err());
+    std::fs::remove_file(&path).ok();
+    let msd = s.msd_state().await.unwrap();
+    assert_eq!(msd.storage.images["new.iso"].size, 300_000);
+    s.msd_remove("new.iso").await.unwrap();
+    assert!(
+        !s.msd_state()
+            .await
+            .unwrap()
+            .storage
+            .images
+            .contains_key("new.iso")
+    );
+}
+
+#[tokio::test]
+async fn wol_add_and_remove_round_trip() {
+    use cometdesk::api::wol::Mac;
+    let (_dev, s) = connect(Config::default()).await;
+    let mac: Mac = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+    s.wol_add(mac, "192.168.1.9", "nas").await.unwrap();
+    let list = s.wol_list().await.unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].name, "nas");
+    s.wol_remove(mac).await.unwrap();
+    assert!(s.wol_list().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn edid_presets_and_switch() {
+    let (_dev, s) = connect(Config::default()).await;
+    let presets = s.edid_presets().await.unwrap();
+    assert!(presets.len() >= 2);
+    let other = presets.iter().find(|p| !p.is_default).unwrap();
+    s.set_edid(&other.content).await.unwrap();
+    assert_eq!(s.edid().await.unwrap(), other.content);
+    assert!(s.set_edid("zz").await.is_err());
+}
+
+#[tokio::test]
+async fn snapshot_needs_a_viewer_unless_offline_allowed() {
+    use cometdesk::api::streamer::SnapshotOptions;
+    let (_dev, s) = connect(Config::default()).await;
+    let idle = SnapshotOptions {
+        allow_offline: false,
+        preview: None,
+    };
+    assert!(matches!(
+        s.snapshot(idle).await,
+        Err(Error::Api { status: 503, .. })
+    ));
+    let offline = SnapshotOptions {
+        allow_offline: true,
+        preview: None,
+    };
+    assert!(
+        s.snapshot(offline)
+            .await
+            .unwrap()
+            .starts_with(&[0xff, 0xd8, 0xff])
+    );
+}
