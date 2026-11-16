@@ -30,6 +30,7 @@ async fn main() {
         atx,
         twofa,
         keep_alive,
+        idle_timeout: Some(std::time::Duration::from_secs(120)),
         ..Config::default()
     };
     let dev = match MockDevice::start_on(config, &format!("127.0.0.1:{port}")).await {

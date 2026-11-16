@@ -1,6 +1,7 @@
 //! Fault injection for REST requests: delay, forced error statuses, dropped connections.
 //! Entry points: `Faults`, `apply`. Read this to add another way for the device to misbehave.
 
+use crate::Lock;
 use std::time::Duration;
 
 use crate::State;
@@ -23,7 +24,7 @@ pub(crate) enum Fault {
 
 pub(crate) async fn apply(state: &State, req: &Request) -> Fault {
     let (delay, fault) = {
-        let mut f = state.faults.lock().unwrap();
+        let mut f = state.faults.lk();
         let fault = if f.drop_next > 0 {
             f.drop_next -= 1;
             Fault::Drop

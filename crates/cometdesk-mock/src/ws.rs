@@ -1,6 +1,7 @@
 //! `/api/ws` of the mock device: 101 upgrade, initial state events, ping/pong, HID frame
 //! capture and pushed events. Entry point: `serve`. Read this to change the event stream.
 
+use crate::Lock;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -66,7 +67,7 @@ pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(state: Arc<State>, mut io:
                         return;
                     }
                 }
-                Some(Ok(Message::Binary(b))) => state.hid_frames.lock().unwrap().push(b.to_vec()),
+                Some(Ok(Message::Binary(b))) => state.hid_frames.lk().push(b.to_vec()),
                 Some(Ok(Message::Close(_))) => {
                     // tungstenite queued the Close reply while reading; send it.
                     let _ = ws.flush().await;

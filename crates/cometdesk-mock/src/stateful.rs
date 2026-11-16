@@ -1,6 +1,7 @@
 //! Routes whose answer depends on earlier writes: streamer params, system config, MSD, WoL,
 //! EDID, snapshot. Entry point: `route`. Read this to add a write-then-read endpoint.
 
+use crate::Lock;
 use std::sync::atomic::Ordering;
 
 use serde_json::{Value, json};
@@ -33,7 +34,7 @@ pub(crate) fn streamer(state: &State) -> String {
         "streamer_idle"
     };
     let mut v: Value = serde_json::from_str(&result(base)).unwrap();
-    let dev = state.dev.lock().unwrap();
+    let dev = state.dev.lk();
     for (k, val) in &dev.streamer_params {
         v["params"][k] = val.clone();
     }
@@ -42,7 +43,7 @@ pub(crate) fn streamer(state: &State) -> String {
 
 /// `None` when the route is not handled here.
 pub(crate) fn route(state: &State, m: &str, p: &str, req: &Request) -> Option<Reply> {
-    let mut dev = state.dev.lock().unwrap();
+    let mut dev = state.dev.lk();
     let images = |d: &Device| {
         d.msd["storage"]["images"]
             .as_object()

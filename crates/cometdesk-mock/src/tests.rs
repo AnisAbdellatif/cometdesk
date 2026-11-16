@@ -53,3 +53,18 @@ async fn oversized_headers_are_refused() {
     let (req, _) = parse(wire).await;
     assert!(req.is_none());
 }
+
+#[test]
+fn poisoned_locks_keep_working() {
+    use crate::Lock;
+    use std::sync::{Arc, Mutex};
+    let m = Arc::new(Mutex::new(1));
+    let m2 = m.clone();
+    let _ = std::thread::spawn(move || {
+        let _g = m2.lock().unwrap();
+        panic!("poison it");
+    })
+    .join();
+    assert!(m.is_poisoned());
+    assert_eq!(*m.lk(), 1);
+}

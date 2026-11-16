@@ -13,12 +13,25 @@ mod ws;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::{self, pki_types::PrivateKeyDer};
+
+/// Locks ignoring poison: one panicking handler must not take the whole device down.
+pub(crate) trait Lock<T> {
+    fn lk(&self) -> MutexGuard<'_, T>;
+}
+
+impl<T> Lock<T> for Mutex<T> {
+    fn lk(&self) -> MutexGuard<'_, T> {
+        self.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
 
 pub const USER: &str = "admin";
 pub const PASSWORD: &str = "pa$$word";
@@ -34,6 +47,9 @@ pub struct Config {
     pub atx: bool,
     /// Serve several requests per connection (HTTP keep-alive) instead of closing after one.
     pub keep_alive: bool,
+    /// Drop a connection that sends nothing for this long (stalled handshakes, idle
+    /// keep-alive). `None` waits forever.
+    pub idle_timeout: Option<Duration>,
 }
 
 /// One authenticated REST request.
@@ -73,7 +89,7 @@ pub(crate) struct State {
 impl State {
     pub fn issue_token(&self) -> String {
         let t = format!("token-{}", self.issued.fetch_add(1, Ordering::SeqCst));
-        self.tokens.lock().unwrap().insert(t.clone());
+        self.tokens.lk().insert(t.clone());
         t
     }
 
@@ -85,8 +101,7 @@ impl State {
     }
 
     pub fn authed(&self, req: &http::Request) -> bool {
-        req.token()
-            .is_some_and(|t| self.tokens.lock().unwrap().contains(t))
+        req.token().is_some_and(|t| self.tokens.lk().contains(t))
     }
 }
 
@@ -138,11 +153,16 @@ impl MockDevice {
         let st = state.clone();
         tokio::spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
-                let acceptor = st.acceptor.lock().unwrap().clone();
+                let acceptor = st.acceptor.lk().clone();
                 let st = st.clone();
                 st.connections.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(async move {
-                    if let Ok(mut tls) = acceptor.accept(tcp).await {
+                    let hs = acceptor.accept(tcp);
+                    let tls = match st.config.idle_timeout {
+                        Some(t) => tokio::time::timeout(t, hs).await.ok().and_then(Result::ok),
+                        None => hs.await.ok(),
+                    };
+                    if let Some(mut tls) = tls {
                         let _ = handle(st, &mut tls).await;
                     }
                 });
@@ -158,11 +178,11 @@ impl MockDevice {
 
     /// Simulates a factory reset / new certificate.
     pub fn rotate_cert(&self) {
-        *self.state.acceptor.lock().unwrap() = acceptor();
+        *self.state.acceptor.lk() = acceptor();
     }
 
     pub fn expire_token(&self) {
-        self.state.tokens.lock().unwrap().clear();
+        self.state.tokens.lk().clear();
     }
 
     pub fn logins(&self) -> u32 {
@@ -176,7 +196,7 @@ impl MockDevice {
 
     /// Authenticated REST requests in arrival order.
     pub fn calls(&self) -> Vec<Call> {
-        self.state.calls.lock().unwrap().clone()
+        self.state.calls.lk().clone()
     }
 
     pub fn calls_to(&self, path: &str) -> Vec<Call> {
@@ -188,7 +208,7 @@ impl MockDevice {
 
     /// Binary `/api/ws` frames received.
     pub fn hid_frames(&self) -> Vec<Vec<u8>> {
-        self.state.hid_frames.lock().unwrap().clone()
+        self.state.hid_frames.lk().clone()
     }
 
     /// Successful `/api/ws` upgrades.
@@ -219,22 +239,21 @@ impl MockDevice {
 
     /// Delays every REST answer by `d`.
     pub fn set_delay(&self, d: std::time::Duration) {
-        self.state.faults.lock().unwrap().delay = d;
+        self.state.faults.lk().delay = d;
     }
 
     /// Answers the next `times` requests to `path` (e.g. `/api/atx/power`) with `status`.
     pub fn fail_next(&self, path: &str, status: u16, times: u32) {
         self.state
             .faults
-            .lock()
-            .unwrap()
+            .lk()
             .fail
             .push((path.into(), status, times));
     }
 
     /// Closes the next `n` REST connections without answering.
     pub fn drop_next_requests(&self, n: u32) {
-        self.state.faults.lock().unwrap().drop_next = n;
+        self.state.faults.lk().drop_next = n;
     }
 
     /// Closes every `/api/ws` socket.
@@ -249,14 +268,25 @@ where
 {
     let mut buf = Vec::new();
     loop {
-        let Some(req) = http::read_request(io, &mut buf).await? else {
+        let next = http::read_request(io, &mut buf);
+        let req = match state.config.idle_timeout {
+            Some(t) => tokio::time::timeout(t, next).await.unwrap_or(Ok(None))?,
+            None => next.await?,
+        };
+        let Some(req) = req else {
             return Ok(());
         };
         let upgrade = req
             .header("upgrade")
             .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
         let keep = state.config.keep_alive && req.keep_alive;
+        let fault = faults::apply(&state, &req).await;
         if req.path == "/api/ws" && upgrade {
+            match fault {
+                faults::Fault::Drop => return Ok(()),
+                faults::Fault::Reply(r) => return http::write_reply(io, &r, false, false).await,
+                faults::Fault::None => {}
+            }
             if !state.authed(&req) {
                 let r = http::Reply::error(401, "UnauthorizedError");
                 return http::write_reply(io, &r, false, false).await;
@@ -264,7 +294,7 @@ where
             ws::serve(state, io, &req).await;
             return Ok(());
         }
-        let reply = match faults::apply(&state, &req).await {
+        let reply = match fault {
             faults::Fault::Drop => return Ok(()),
             faults::Fault::Reply(r) => r,
             faults::Fault::None => routes::route(&state, &req),

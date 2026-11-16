@@ -1,5 +1,6 @@
 //! REST routes of the mock device. Entry point: `route`. Read this to add or change an endpoint.
 
+use crate::Lock;
 use std::sync::atomic::Ordering;
 
 use crate::fixtures::result;
@@ -16,7 +17,7 @@ fn field(body: &str, k: &str) -> String {
 
 pub(crate) fn atx(state: &State) -> String {
     if state.config.atx {
-        let on = state.dev.lock().unwrap().atx_on;
+        let on = state.dev.lk().atx_on;
         let power = if on { "on" } else { "off" };
         format!(
             r#"{{"enabled":true,"busy":false,"leds":{{"power":{on},"hdd":false}},"power":"{power}"}}"#
@@ -94,7 +95,7 @@ pub fn route(state: &State, req: &Request) -> Reply {
     if !state.authed(req) {
         return Reply::error(401, "UnauthorizedError");
     }
-    state.calls.lock().unwrap().push(Call {
+    state.calls.lk().push(Call {
         method: req.method.clone(),
         path: req.path.clone(),
         query: req.query.clone(),
@@ -104,7 +105,7 @@ pub fn route(state: &State, req: &Request) -> Reply {
     match (m, p) {
         ("POST", "auth/logout") => {
             if let Some(t) = req.token() {
-                state.tokens.lock().unwrap().remove(t);
+                state.tokens.lk().remove(t);
                 let _ = state.push.send(crate::Push::CloseToken(t.into()));
             }
             Reply::ok("{}")
@@ -122,7 +123,7 @@ pub fn route(state: &State, req: &Request) -> Reply {
                 .map(|(_, v)| v.into_owned())
                 .unwrap_or_default();
             {
-                let mut dev = state.dev.lock().unwrap();
+                let mut dev = state.dev.lk();
                 dev.atx_on = atx_after(dev.atx_on, &what);
             }
             state.push_json("atx", &atx(state));
