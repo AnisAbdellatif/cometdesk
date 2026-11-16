@@ -100,24 +100,121 @@ impl Request {
     }
 }
 
+const HEAD_MAX: usize = 64 * 1024;
+/// Bytes of a request body kept as text (`Request::body`); the rest is counted, not stored.
+const BODY_KEEP: usize = 1 << 20;
+
+struct Body {
+    kept: Vec<u8>,
+    len: usize,
+}
+
+impl Body {
+    fn push(&mut self, data: &[u8]) {
+        let room = BODY_KEEP.saturating_sub(self.kept.len());
+        self.kept.extend_from_slice(&data[..room.min(data.len())]);
+        self.len += data.len();
+    }
+}
+
+/// Reads more into `buf`; `false` when the peer closed.
+async fn fill<S: AsyncRead + Unpin>(io: &mut S, buf: &mut Vec<u8>) -> std::io::Result<bool> {
+    let mut chunk = [0u8; 16 * 1024];
+    let n = io.read(&mut chunk).await?;
+    buf.extend_from_slice(&chunk[..n]);
+    Ok(n > 0)
+}
+
+fn bad(msg: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, msg.to_owned())
+}
+
+fn line_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(2).position(|w| w == b"\r\n")
+}
+
+/// Streams a chunked body into `body`, leaving bytes after it in `buf`. `false` on EOF.
+async fn read_chunked<S: AsyncRead + Unpin>(
+    io: &mut S,
+    buf: &mut Vec<u8>,
+    body: &mut Body,
+) -> std::io::Result<bool> {
+    loop {
+        let eol = loop {
+            if let Some(i) = line_end(buf) {
+                break i;
+            }
+            if buf.len() > 1024 {
+                return Err(bad("chunk size line too long"));
+            }
+            if !fill(io, buf).await? {
+                return Ok(false);
+            }
+        };
+        let text = std::str::from_utf8(&buf[..eol]).map_err(|_| bad("chunk size"))?;
+        let size = usize::from_str_radix(text.split(';').next().unwrap_or("").trim(), 16)
+            .map_err(|_| bad("chunk size"))?;
+        buf.drain(..eol + 2);
+        if size == 0 {
+            // Optional trailers end with an empty line.
+            loop {
+                let eol = loop {
+                    if let Some(i) = line_end(buf) {
+                        break i;
+                    }
+                    if !fill(io, buf).await? {
+                        return Ok(false);
+                    }
+                };
+                buf.drain(..eol + 2);
+                if eol == 0 {
+                    return Ok(true);
+                }
+            }
+        }
+        let mut left = size;
+        while left > 0 {
+            if buf.is_empty() && !fill(io, buf).await? {
+                return Ok(false);
+            }
+            let t = left.min(buf.len());
+            body.push(&buf[..t]);
+            buf.drain(..t);
+            left -= t;
+        }
+        while buf.len() < 2 {
+            if !fill(io, buf).await? {
+                return Ok(false);
+            }
+        }
+        buf.drain(..2);
+    }
+}
+
 /// `None` when the peer closes before a full request arrives.
 /// `buf` carries bytes read past the previous request (pipelining) and is drained of this one.
+/// Bodies stream through: only the first `BODY_KEEP` bytes are kept, so uploads stay O(1).
 pub async fn read_request<S: AsyncRead + AsyncWrite + Unpin>(
     io: &mut S,
     buf: &mut Vec<u8>,
 ) -> std::io::Result<Option<Request>> {
-    let mut chunk = [0u8; 4096];
+    let mut scanned = 0;
     let header_end = loop {
-        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break i + 4;
+        if let Some(i) = buf[scanned..].windows(4).position(|w| w == b"\r\n\r\n") {
+            break scanned + i + 4;
         }
-        let n = io.read(&mut chunk).await?;
-        if n == 0 {
+        scanned = buf.len().saturating_sub(3);
+        if buf.len() > HEAD_MAX {
+            let msg = b"HTTP/1.1 431 X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = io.write_all(msg).await;
             return Ok(None);
         }
-        buf.extend_from_slice(&chunk[..n]);
+        if !fill(io, buf).await? {
+            return Ok(None);
+        }
     };
     let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+    buf.drain(..header_end);
     let mut lines = head.lines();
     let mut first = lines.next().unwrap_or_default().split(' ');
     let (method, target, version) = (
@@ -133,7 +230,7 @@ pub async fn read_request<S: AsyncRead + AsyncWrite + Unpin>(
     if headers
         .iter()
         .any(|(k, v)| k == "expect" && v.eq_ignore_ascii_case("100-continue"))
-        && buf.len() == header_end
+        && buf.is_empty()
     {
         io.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
         io.flush().await?;
@@ -146,28 +243,26 @@ pub async fn read_request<S: AsyncRead + AsyncWrite + Unpin>(
         .find(|(k, _)| k == "content-length")
         .and_then(|(_, v)| v.parse().ok())
         .unwrap_or(0);
-    let (body_bytes, body_wire) = if chunked {
-        loop {
-            if let Some(b) = decode_chunked(&buf[header_end..]) {
-                break b;
-            }
-            let n = io.read(&mut chunk).await?;
-            if n == 0 {
-                return Ok(None);
-            }
-            buf.extend_from_slice(&chunk[..n]);
+    let mut body = Body {
+        kept: Vec::new(),
+        len: 0,
+    };
+    if chunked {
+        if !read_chunked(io, buf, &mut body).await? {
+            return Ok(None);
         }
     } else {
-        while buf.len() < header_end + len {
-            let n = io.read(&mut chunk).await?;
-            if n == 0 {
+        let mut left = len;
+        while left > 0 {
+            if buf.is_empty() && !fill(io, buf).await? {
                 return Ok(None);
             }
-            buf.extend_from_slice(&chunk[..n]);
+            let t = left.min(buf.len());
+            body.push(&buf[..t]);
+            buf.drain(..t);
+            left -= t;
         }
-        (buf[header_end..header_end + len].to_vec(), len)
-    };
-    buf.drain(..header_end + body_wire);
+    }
     let keep_alive = !version.eq_ignore_ascii_case("HTTP/1.0")
         && !headers
             .iter()
@@ -179,38 +274,10 @@ pub async fn read_request<S: AsyncRead + AsyncWrite + Unpin>(
         path: percent_decode(path),
         query: query.into(),
         headers,
-        body: String::from_utf8_lossy(&body_bytes).to_string(),
-        body_len: body_bytes.len(),
+        body: String::from_utf8_lossy(&body.kept).into_owned(),
+        body_len: body.len,
         keep_alive,
     }))
-}
-
-/// The body of a complete chunked message, or `None` while the terminating chunk is missing.
-/// Also returns how many wire bytes it spans.
-pub(crate) fn decode_chunked(data: &[u8]) -> Option<(Vec<u8>, usize)> {
-    let total = data.len();
-    let mut data = data;
-    let mut out = Vec::new();
-    loop {
-        let eol = data.windows(2).position(|w| w == b"\r\n")?;
-        let size_text = std::str::from_utf8(&data[..eol]).ok()?;
-        let size = usize::from_str_radix(size_text.split(';').next()?.trim(), 16).ok()?;
-        data = &data[eol + 2..];
-        if size == 0 {
-            // Optional trailers end with an empty line.
-            let end = if data.starts_with(b"\r\n") {
-                2
-            } else {
-                data.windows(4).position(|w| w == b"\r\n\r\n")? + 4
-            };
-            return Some((out, total - data.len() + end));
-        }
-        if data.len() < size + 2 {
-            return None;
-        }
-        out.extend_from_slice(&data[..size]);
-        data = &data[size + 2..];
-    }
 }
 
 pub async fn write_reply<S: AsyncWrite + Unpin>(

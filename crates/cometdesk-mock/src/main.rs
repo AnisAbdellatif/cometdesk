@@ -1,19 +1,20 @@
 //! `cometdesk-mock` binary: runs the mock device until Ctrl-C, for demos and manual GUI/CLI
-//! testing. Flags: `--port N` (default random), `--atx`, `--twofa`. Read `lib.rs` for behaviour.
+//! testing. Flags: `--port N` (default random), `--atx`, `--twofa`, `--keep-alive`. Read `lib.rs` for behaviour.
 
 use cometdesk_mock::{Config, MockDevice, PASSWORD, TOTP, USER};
 
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: cometdesk-mock [--port N] [--atx] [--twofa]";
+    let usage = "usage: cometdesk-mock [--port N] [--atx] [--twofa] [--keep-alive]";
     let mut port = 0u16;
-    let (mut atx, mut twofa) = (false, false);
+    let (mut atx, mut twofa, mut keep_alive) = (false, false, false);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--atx" => atx = true,
             "--twofa" => twofa = true,
+            "--keep-alive" => keep_alive = true,
             "--port" => match it.next().and_then(|v| v.parse().ok()) {
                 Some(p) => port = p,
                 None => fail(&format!("--port needs a number (0-65535)\n{usage}")),
@@ -28,6 +29,7 @@ async fn main() {
     let config = Config {
         atx,
         twofa,
+        keep_alive,
         ..Config::default()
     };
     let dev = match MockDevice::start_on(config, &format!("127.0.0.1:{port}")).await {

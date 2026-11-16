@@ -31,7 +31,7 @@ cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 Try it without a device: `cargo run -p cometdesk-mock -- --atx` starts a mock GLKVM device
-(self-signed TLS, user `admin`) and prints the host to connect to. Flags: `--port N`, `--atx`, `--twofa`.
+(self-signed TLS, user `admin`) and prints the host to connect to. Flags: `--port N`, `--atx`, `--twofa`, `--keep-alive`.
 
 ## Docs
 
