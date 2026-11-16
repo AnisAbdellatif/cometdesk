@@ -52,6 +52,7 @@ pub fn route(state: &State, req: &Request) -> Reply {
         ("POST", "auth/logout") => {
             if let Some(t) = req.token() {
                 state.tokens.lock().unwrap().remove(t);
+                let _ = state.push.send(crate::Push::CloseToken(t.into()));
             }
             Reply::ok("{}")
         }

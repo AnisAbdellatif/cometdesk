@@ -12,6 +12,8 @@ pub struct Request {
     pub body: String,
     /// Bytes in the body (`body` is lossy UTF-8, so its length can differ).
     pub body_len: usize,
+    /// The client did not ask to close the connection after this request.
+    pub keep_alive: bool,
 }
 
 /// Status plus the JSON that goes inside the `{"ok":..,"result":..}` envelope.
@@ -78,18 +80,21 @@ impl Request {
 }
 
 /// `None` when the peer closes before a full request arrives.
-pub async fn read_request<S: AsyncRead + Unpin>(io: &mut S) -> std::io::Result<Option<Request>> {
-    let mut buf = Vec::new();
+/// `buf` carries bytes read past the previous request (pipelining) and is drained of this one.
+pub async fn read_request<S: AsyncRead + Unpin>(
+    io: &mut S,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<Option<Request>> {
     let mut chunk = [0u8; 4096];
     let header_end = loop {
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i + 4;
+        }
         let n = io.read(&mut chunk).await?;
         if n == 0 {
             return Ok(None);
         }
         buf.extend_from_slice(&chunk[..n]);
-        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break i + 4;
-        }
     };
     let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
     let mut lines = head.lines();
@@ -112,7 +117,7 @@ pub async fn read_request<S: AsyncRead + Unpin>(io: &mut S) -> std::io::Result<O
         .find(|(k, _)| k == "content-length")
         .and_then(|(_, v)| v.parse().ok())
         .unwrap_or(0);
-    let body_bytes = if chunked {
+    let (body_bytes, body_wire) = if chunked {
         loop {
             if let Some(b) = decode_chunked(&buf[header_end..]) {
                 break b;
@@ -131,8 +136,13 @@ pub async fn read_request<S: AsyncRead + Unpin>(io: &mut S) -> std::io::Result<O
             }
             buf.extend_from_slice(&chunk[..n]);
         }
-        buf[header_end..header_end + len].to_vec()
+        (buf[header_end..header_end + len].to_vec(), len)
     };
+    buf.drain(..header_end + body_wire);
+    let keep_alive = !version.eq_ignore_ascii_case("HTTP/1.0")
+        && !headers
+            .iter()
+            .any(|(k, v)| k == "connection" && v.to_ascii_lowercase().contains("close"));
     // A request line without `HTTP/x` is malformed; `routes::route` answers it with 400.
     let well_formed = version.starts_with("HTTP/") && !method.is_empty() && !target.is_empty();
     Ok(Some(Request {
@@ -142,11 +152,15 @@ pub async fn read_request<S: AsyncRead + Unpin>(io: &mut S) -> std::io::Result<O
         headers,
         body: String::from_utf8_lossy(&body_bytes).to_string(),
         body_len: body_bytes.len(),
+        keep_alive,
     }))
 }
 
 /// The body of a complete chunked message, or `None` while the terminating chunk is missing.
-pub(crate) fn decode_chunked(mut data: &[u8]) -> Option<Vec<u8>> {
+/// Also returns how many wire bytes it spans.
+pub(crate) fn decode_chunked(data: &[u8]) -> Option<(Vec<u8>, usize)> {
+    let total = data.len();
+    let mut data = data;
     let mut out = Vec::new();
     loop {
         let eol = data.windows(2).position(|w| w == b"\r\n")?;
@@ -155,8 +169,12 @@ pub(crate) fn decode_chunked(mut data: &[u8]) -> Option<Vec<u8>> {
         data = &data[eol + 2..];
         if size == 0 {
             // Optional trailers end with an empty line.
-            return (data.starts_with(b"\r\n") || data.windows(4).any(|w| w == b"\r\n\r\n"))
-                .then_some(out);
+            let end = if data.starts_with(b"\r\n") {
+                2
+            } else {
+                data.windows(4).position(|w| w == b"\r\n\r\n")? + 4
+            };
+            return Some((out, total - data.len() + end));
         }
         if data.len() < size + 2 {
             return None;
@@ -170,6 +188,7 @@ pub async fn write_reply<S: AsyncWrite + Unpin>(
     io: &mut S,
     r: &Reply,
     head_only: bool,
+    keep_alive: bool,
 ) -> std::io::Result<()> {
     let (ctype, payload) = match &r.raw {
         Some((t, b)) => (*t, b.clone()),
@@ -180,13 +199,18 @@ pub async fn write_reply<S: AsyncWrite + Unpin>(
         ),
     };
     let head = format!(
-        "HTTP/1.1 {} X\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} X\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
         r.status,
-        payload.len()
+        payload.len(),
+        if keep_alive { "keep-alive" } else { "close" }
     );
     io.write_all(head.as_bytes()).await?;
     if !head_only {
         io.write_all(&payload).await?;
     }
-    io.shutdown().await
+    if keep_alive {
+        io.flush().await
+    } else {
+        io.shutdown().await
+    }
 }

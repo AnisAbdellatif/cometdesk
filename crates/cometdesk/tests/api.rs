@@ -243,3 +243,47 @@ async fn snapshot_needs_a_viewer_unless_offline_allowed() {
             .starts_with(&[0xff, 0xd8, 0xff])
     );
 }
+
+#[tokio::test]
+async fn injected_failures_delays_and_drops() {
+    let (dev, s) = connect(Config {
+        atx: true,
+        ..Default::default()
+    })
+    .await;
+    dev.fail_next("/api/atx/power", 503, 1);
+    assert!(matches!(
+        s.atx_power(PowerAction::On, false).await,
+        Err(Error::Api { status: 503, .. })
+    ));
+    s.atx_power(PowerAction::On, false).await.unwrap();
+
+    dev.set_delay(std::time::Duration::from_millis(300));
+    let t = std::time::Instant::now();
+    s.system_info().await.unwrap();
+    assert!(t.elapsed() >= std::time::Duration::from_millis(300));
+    dev.set_delay(std::time::Duration::ZERO);
+
+    dev.drop_next_requests(1);
+    assert!(
+        s.system_info().await.is_err(),
+        "connection closed without an answer"
+    );
+}
+
+#[tokio::test]
+async fn keep_alive_reuses_one_connection() {
+    let (dev, s) = connect(Config {
+        keep_alive: true,
+        ..Default::default()
+    })
+    .await;
+    for _ in 0..5 {
+        s.system_info().await.unwrap();
+    }
+    assert_eq!(
+        dev.connections(),
+        1,
+        "login and all requests share one pooled connection"
+    );
+}

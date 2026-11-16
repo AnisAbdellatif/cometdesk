@@ -42,6 +42,7 @@ pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(state: Arc<State>, mut io:
         Viewer(state.clone())
     });
     // Subscribe before the 101 so a push right after the client connects is not lost.
+    let token = req.token().map(str::to_owned);
     let mut push = state.push.subscribe();
     if io.write_all(head.as_bytes()).await.is_err() {
         return;
@@ -75,7 +76,8 @@ pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(state: Arc<State>, mut io:
                         return;
                     }
                 }
-                Ok(Push::Close) => {
+                Ok(Push::CloseToken(t)) if Some(&t) != token.as_ref() => {}
+                Ok(Push::Close | Push::CloseToken(_)) => {
                     let _ = ws.close(None).await;
                     return;
                 }

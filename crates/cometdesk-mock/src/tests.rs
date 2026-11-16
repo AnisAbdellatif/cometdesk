@@ -6,11 +6,11 @@ use crate::http::decode_chunked;
 fn chunked_decodes_complete_messages_only() {
     assert_eq!(
         decode_chunked(b"5\r\nhello\r\n0\r\n\r\n"),
-        Some(b"hello".to_vec())
+        Some((b"hello".to_vec(), 15))
     );
     assert_eq!(
         decode_chunked(b"3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n"),
-        Some(b"abcde".to_vec())
+        Some((b"abcde".to_vec(), 20))
     );
     assert_eq!(decode_chunked(b"5\r\nhel"), None);
     assert_eq!(decode_chunked(b"5\r\nhello\r\n"), None);

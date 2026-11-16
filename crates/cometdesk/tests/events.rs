@@ -163,3 +163,71 @@ async fn ws_without_relogin_is_unauthorized() {
         Err(Error::Unauthorized)
     ));
 }
+
+#[tokio::test]
+async fn logout_closes_the_event_socket() {
+    let dev = MockDevice::start(Config::default()).await;
+    let s = login(&dev, Credentials::new(USER, PASSWORD)).await;
+    let es = EventSession::spawn(s.clone(), EventOptions::default());
+    wait(&mut es.conn_state(), connected).await;
+    s.logout().await.unwrap();
+    wait(&mut es.conn_state(), |c| !connected(c)).await;
+}
+
+#[tokio::test]
+async fn abrupt_client_drops_release_viewers() {
+    let dev = MockDevice::start(Config::default()).await;
+    let s = login(&dev, Credentials::new(USER, PASSWORD)).await;
+    let mut sockets = Vec::new();
+    for _ in 0..40 {
+        sockets.push(s.ws_connect("api/ws").await.unwrap());
+    }
+    until(|| dev.viewers() == 40).await;
+    drop(sockets); // no close handshake: the TCP/TLS streams just vanish
+    until(|| dev.viewers() == 0).await;
+}
+
+#[tokio::test]
+async fn event_flood_ends_with_the_latest_state() {
+    let dev = MockDevice::start(Config::default()).await;
+    let es = start(&dev, true).await;
+    wait(&mut es.conn_state(), connected).await;
+    // The initial full state must land first, or it would overwrite the pushed diff.
+    wait(&mut es.device_state(), |s: &DeviceState| {
+        s.streamer().is_some()
+    })
+    .await;
+    let blob = "x".repeat(2000);
+    for i in 0..2000 {
+        dev.push_event("flood", serde_json::json!({"n": i, "pad": blob}));
+    }
+    dev.push_event(
+        "streamer",
+        serde_json::json!({"streamer": {"hdmi": {"signal": false}}}),
+    );
+    // The 64-slot broadcast channel drops old events for a slow reader, never the newest.
+    wait(&mut es.device_state(), |s: &DeviceState| {
+        s.video_signal() == Some(false)
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn hid_flood_is_delivered_in_order() {
+    let dev = MockDevice::start(Config::default()).await;
+    let es = start(&dev, false).await;
+    wait(&mut es.conn_state(), connected).await;
+    for _ in 0..500 {
+        es.hid().key("KeyA", true);
+        es.hid().key("KeyA", false);
+    }
+    es.hid().key("KeyZ", true);
+    until(|| {
+        dev.hid_frames()
+            .last()
+            .is_some_and(|f| f.ends_with(b"KeyZ"))
+    })
+    .await;
+    let frames = dev.hid_frames();
+    assert!(frames.iter().all(|f| f[0] == 1), "key frames only");
+}
