@@ -41,6 +41,10 @@ ignore = [
     { id = "RUSTSEC-2026-0370", reason = "Linux-only keyring backend (zbus)" },
     { id = "RUSTSEC-2026-0371", reason = "Linux-only keyring backend (zbus)" },
     { id = "RUSTSEC-2026-0372", reason = "Linux-only keyring backend (zbus)" },
+    # crypto-bigint timing leaks, fixed only in 0.7.6. 0.5.5 comes from str0m's DTLS stack
+    # (dimpl -> p256/p384 -> elliptic-curve 0.13) with ephemeral per-session keys. Remove
+    # when str0m/dimpl move to elliptic-curve 0.14.
+    { id = "RUSTSEC-2026-0387", reason = "no fixed crypto-bigint 0.5.x; via str0m DTLS" },
 ]
 
 [sources]
