@@ -29,6 +29,7 @@ import os
 import pwd
 import re
 import socket
+import stat
 import tempfile
 import time
 
@@ -413,7 +414,9 @@ def _restrict_socket(path: str) -> None:
     """
     os.chmod(path, 0o660)
     try:
-        st = os.stat("/run/kvmd/nginx.pid")
+        st = os.stat("/run/kvmd/nginx.pid", follow_symlinks=False)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError("nginx.pid is not a regular file")
         uid, gid, how = st.st_uid, st.st_gid, "nginx.pid owner"
     except OSError:
         uid = gid = -1
@@ -482,7 +485,7 @@ def drop_privileges(target_user: str | None = None) -> None:
 
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--unix", default="/run/kvmd/cometdesk-bridge.sock")
+    parser.add_argument("--unix", default="/run/cometdesk-bridge/bridge.sock")
     parser.add_argument("--agent-host", default="192.168.5.1")
     parser.add_argument("--agent-port", type=int, default=47474)
     parser.add_argument("--download-port", type=int, default=47475)
@@ -499,7 +502,9 @@ async def main() -> None:
     app.router.add_put("/agents/{name}", handle_agent_upload)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
-    if os.path.exists(args.unix):
+    # The socket's folder must be root's alone: chmod/chown below go by path.
+    os.makedirs(os.path.dirname(args.unix), mode=0o755, exist_ok=True)
+    if os.path.lexists(args.unix):
         os.unlink(args.unix)
     await web.UnixSite(runner, args.unix).start()
     _restrict_socket(args.unix)  # nginx-only: a world-writable socket bypasses kvmd login

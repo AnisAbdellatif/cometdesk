@@ -3,6 +3,9 @@
 //! Values are taken literally: no `$VAR` expansion and no escape processing, because
 //! passwords routinely contain `$` and `\`. Surrounding single or double quotes are removed.
 //! Variables already set in the environment win.
+//! On Unix a `.env` is used only if it is owned by the current user (or root) and not
+//! writable by group or others: it can set the agents folder and the control socket, so one
+//! planted in a shared parent directory must not be trusted.
 
 use std::path::{Path, PathBuf};
 
@@ -40,7 +43,10 @@ pub fn load_dotenv() -> Option<PathBuf> {
     loop {
         let candidate = dir.join(".env");
         if candidate.is_file() {
-            load_file(&candidate).ok()?;
+            let text = read_trusted(&candidate)
+                .map_err(|e| eprintln!("ignoring {}: {e}", candidate.display()))
+                .ok()?;
+            set_vars(&text);
             return Some(candidate);
         }
         if !dir.pop() {
@@ -50,13 +56,45 @@ pub fn load_dotenv() -> Option<PathBuf> {
 }
 
 pub fn load_file(path: &Path) -> std::io::Result<()> {
-    for (key, value) in parse(&std::fs::read_to_string(path)?) {
+    set_vars(&read_trusted(path)?);
+    Ok(())
+}
+
+fn set_vars(text: &str) {
+    for (key, value) in parse(text) {
         if std::env::var_os(&key).is_none() {
             // SAFETY: called at startup before other threads read the environment.
             unsafe { std::env::set_var(key, value) };
         }
     }
-    Ok(())
+}
+
+/// Reads `path`, checking owner and mode on the opened file so it cannot be swapped between
+/// the check and the read.
+fn read_trusted(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let me = unsafe { libc::getuid() };
+        let meta = file.metadata()?;
+        if !trusted(meta.uid(), meta.mode(), me) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "owned by another user or writable by group/others",
+            ));
+        }
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    Ok(text)
+}
+
+#[cfg(unix)]
+fn trusted(owner: u32, mode: u32, me: u32) -> bool {
+    (owner == me || owner == 0) && mode & 0o022 == 0
 }
 
 #[cfg(test)]
@@ -86,6 +124,16 @@ mod tests {
         let v = parse("A=b=c\nB='open\n");
         assert_eq!(get(&v, "A"), Some("b=c"));
         assert_eq!(get(&v, "B"), Some("'open"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_own_unshared_files_are_trusted() {
+        assert!(trusted(501, 0o100600, 501));
+        assert!(trusted(0, 0o100644, 501));
+        assert!(!trusted(502, 0o100600, 501));
+        assert!(!trusted(501, 0o100664, 501));
+        assert!(!trusted(501, 0o100646, 501));
     }
 
     #[test]

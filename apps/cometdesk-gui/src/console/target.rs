@@ -107,11 +107,14 @@ pub(super) fn agent_name(os: TargetOs) -> Option<&'static str> {
 /// It is typed over HID in the target's layout, so it avoids characters that need AltGr on
 /// common layouts (`|`, `[`, `]`, `{`, `}`, `\`, `@`, `~` on German, for one): those may not
 /// arrive. Hence a download to a file instead of a pipe, and `/` in Windows paths.
+///
+/// On Linux the file goes in `$HOME` (no other user can plant it there, unlike `/tmp`) and the
+/// code travels in the environment, which other users cannot read (`ps` shows arguments).
 pub(super) fn install_command(os: TargetOs, code: &str) -> Option<String> {
     const URL: &str = "http://192.168.5.1:47475";
     match os {
         TargetOs::Linux => Some(format!(
-            "curl -fsSo /tmp/cometdesk-install.sh {URL}/install.sh && sh /tmp/cometdesk-install.sh {code}"
+            "curl -fsSo \"$HOME/.cometdesk-install.sh\" {URL}/install.sh && COMETDESK_CODE={code} sh \"$HOME/.cometdesk-install.sh\""
         )),
         TargetOs::Windows => Some(format!(
             "powershell -NoProfile -ExecutionPolicy Bypass -Command \"iwr -UseBasicParsing {URL}/install.ps1 -OutFile $env:TEMP/cometdesk-install.ps1; & $env:TEMP/cometdesk-install.ps1 {code}\""

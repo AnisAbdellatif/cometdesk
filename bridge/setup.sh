@@ -3,7 +3,7 @@
 # replaces what differs, so it is also the repair after a firmware upgrade.
 #
 # Run on the device from a directory holding the bridge files (cometdesk-gui and `cometdesk bridge
-# setup` stage them in /tmp/cometdesk-setup through the web terminal). Prints one line per
+# setup` stage them in a fresh `mktemp -d` folder through the web terminal). Prints one line per
 # change, and COMETDESK_SETUP_OK <version> on success.
 #
 # Restarting kvmd-otg (only when the RNDIS function is missing or its config changed)
@@ -12,7 +12,7 @@ set -eu
 SRC=$(cd "$(dirname "$0")" && pwd)
 BASE=/usr/local/lib/cometdesk-bridge
 EXTRA=/usr/share/kvmd/extras/cometdesk-bridge
-OVERRIDE=/etc/kvmd/override.d/90-cometdesk-rs-rndis.yaml
+OVERRIDE=/etc/kvmd/override.d/90-cometdesk-rndis.yaml
 
 # Remove what the app's former name (glkvm) installed: two bridges would fight for the port.
 if [ -e /etc/init.d/S99glkvm-bridge ]; then
@@ -21,8 +21,10 @@ if [ -e /etc/init.d/S99glkvm-bridge ]; then
 fi
 rm -rf /etc/init.d/S99glkvm-bridge /usr/local/lib/glkvm-bridge /usr/share/kvmd/extras/glkvm-bridge \
 	/etc/glkvm-bridge /run/kvmd/glkvm-bridge.sock
-if [ -f /etc/kvmd/override.d/90-glkvm-rs-rndis.yaml ]; then
-	rm /etc/kvmd/override.d/90-glkvm-rs-rndis.yaml
+OLD=/etc/kvmd/override.d/90-glkvm-rs-rndis.yaml
+OLD2=/etc/kvmd/override.d/90-cometdesk-rs-rndis.yaml
+if [ -f $OLD ] || [ -f $OLD2 ]; then
+	rm -f $OLD $OLD2
 	echo "removed old USB network override"
 fi
 
@@ -34,12 +36,18 @@ while [ "$d" != / ]; do
 	chmod o+x "$d" 2>/dev/null || true
 	d=$(dirname "$d")
 done
-for u in kvmd nobody; do
-	if id -u "$u" >/dev/null 2>&1; then
-		chown -R "$u" "$BASE/agents" 2>/dev/null || true
-		break
-	fi
-done
+# The daemon hands $BASE/agents (only that folder, not what is in it) to its user itself.
+
+# reload_nginx: HUP the nginx master named by kvmd's pidfile. /run/kvmd is writable by the
+# kvmd account, so only trust a regular file holding a number that names an nginx process.
+reload_nginx() {
+	f=/run/kvmd/nginx.pid
+	[ -f "$f" ] && [ ! -L "$f" ] || return 0
+	pid=$(head -c 16 "$f")
+	case "$pid" in '' | *[!0-9]*) return 0 ;; esac
+	[ "$(cat "/proc/$pid/comm" 2>/dev/null)" = nginx ] && kill -HUP "$pid"
+	return 0
+}
 
 # put <src> <dest> <mode>: replace dest only if it differs
 put() {
@@ -71,8 +79,8 @@ put "$SRC/S99cometdesk-bridge" /etc/init.d/S99cometdesk-bridge 755
 [ -f "$SRC/bundle" ] && put "$SRC/bundle" "$BASE/bundle" 644
 
 restart_otg=0
-if ! cmp -s "$SRC/90-cometdesk-rs-rndis.yaml" "$OVERRIDE"; then
-	put "$SRC/90-cometdesk-rs-rndis.yaml" "$OVERRIDE" 644
+if ! cmp -s "$SRC/90-cometdesk-rndis.yaml" "$OVERRIDE"; then
+	put "$SRC/90-cometdesk-rndis.yaml" "$OVERRIDE" 644
 	restart_otg=1
 fi
 if ! ls /sys/kernel/config/usb_gadget/*/configs/*/rndis.usb0 >/dev/null 2>&1; then
@@ -90,12 +98,10 @@ fi
 
 /etc/init.d/S99cometdesk-bridge restart >/dev/null
 nginx -t -q -p /etc/kvmd/nginx -c /etc/kvmd/nginx-kvmd.conf
-if [ -s /run/kvmd/nginx.pid ]; then
-	kill -HUP "$(cat /run/kvmd/nginx.pid)"
-fi
+reload_nginx
 
 for _ in 1 2 3 4 5 6 7 8 9 10; do
-	[ -S /run/kvmd/cometdesk-bridge.sock ] && break
+	[ -S /run/cometdesk-bridge/bridge.sock ] && break
 	sleep 1
 done
 version=$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' "$BASE/cometdesk_bridge.py")

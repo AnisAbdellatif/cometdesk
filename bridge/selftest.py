@@ -10,7 +10,7 @@ import asyncio
 
 import aiohttp
 
-SOCK = "/run/kvmd/cometdesk-bridge.sock"
+SOCK = "/run/cometdesk-bridge/bridge.sock"
 AGENT = ("192.168.5.1", 47474)
 
 

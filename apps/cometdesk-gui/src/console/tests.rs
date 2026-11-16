@@ -7,7 +7,8 @@ use crate::store::TargetOs;
 fn install_commands_carry_the_code_and_fit_the_run_dialog() {
     let code = cometdesk_clip::Secret::generate().to_code();
     let linux = install_command(TargetOs::Linux, &code).unwrap();
-    assert!(linux.ends_with(&format!("sh /tmp/cometdesk-install.sh {code}")));
+    assert!(linux.contains(&format!("COMETDESK_CODE={code} sh \"$HOME/")));
+    assert!(!linux.contains("/tmp/"));
     let win = install_command(TargetOs::Windows, &code).unwrap();
     assert!(win.contains(&code));
     // Typed over HID: no characters that need AltGr on common layouts.

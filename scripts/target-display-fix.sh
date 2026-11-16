@@ -5,13 +5,20 @@ set -euo pipefail
 user=${1:-${SUDO_USER:?run with sudo}}
 home=$(getent passwd "$user" | cut -d: -f6)
 
+# Read the layout as its owner, bounded: as root, a link the user planted there would publish
+# any file (e.g. /etc/shadow) world-readable below.
+layout=$(mktemp)
+trap 'rm -f "$layout"' EXIT
+timeout 10 runuser -u "$user" -- cat "$home/.config/monitors.xml" | head -c 1048576 >"$layout"
+[ -s "$layout" ] || { echo "no $home/.config/monitors.xml" >&2; exit 1; }
+
 # GDM 50 runs the greeter as gdm-greeter with HOME=/run/gdm3/home/gdm-greeter (tmpfs), so
 # /var/lib/gdm3/.config is ignored; mutter also reads the system-wide /etc/xdg/monitors.xml.
-install -o root -g root -m 0644 "$home/.config/monitors.xml" /etc/xdg/monitors.xml
+install -o root -g root -m 0644 "$layout" /etc/xdg/monitors.xml
 
 # GDM login screen (older GDM): reuse the user's monitor layout (Comet primary, laptop panel disabled).
 install -d -o gdm -g gdm /var/lib/gdm3/.config
-install -o gdm -g gdm -m 0644 "$home/.config/monitors.xml" /var/lib/gdm3/.config/monitors.xml
+install -o gdm -g gdm -m 0644 "$layout" /var/lib/gdm3/.config/monitors.xml
 
 # Keep the laptop awake with the lid closed (firmware/GDM then drive only the external display).
 install -d /etc/systemd/logind.conf.d
@@ -31,5 +38,6 @@ GRUB_GFXPAYLOAD_LINUX=keep
 GRUB_TERMINAL=console
 CONF
 update-grub
-grep -nE "^set (timeout|timeout_style|gfxmode)|terminal_output|gfxpayload" /boot/grub/grub.cfg | head -20 > /tmp/grub-check.txt; chmod 644 /tmp/grub-check.txt
+echo "GRUB settings now:"
+grep -nE "^set (timeout|timeout_style|gfxmode)|terminal_output|gfxpayload" /boot/grub/grub.cfg | head -20
 echo "done; reboot to apply (logind lid settings need a reboot or 'systemctl restart systemd-logind')"

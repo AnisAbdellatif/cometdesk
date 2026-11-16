@@ -923,11 +923,12 @@ dependencies = [
 
 [[package]]
 name = "cometdesk"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "futures-util",
  "hex",
+ "libc",
  "rcgen",
  "reqwest",
  "rustls",
@@ -944,7 +945,7 @@ dependencies = [
 
 [[package]]
 name = "cometdesk-agent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arboard",
  "cometdesk-clip",
@@ -956,7 +957,7 @@ dependencies = [
 
 [[package]]
 name = "cometdesk-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -977,7 +978,7 @@ dependencies = [
 
 [[package]]
 name = "cometdesk-clip"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "getrandom 0.4.3",
  "png",
@@ -991,7 +992,7 @@ dependencies = [
 
 [[package]]
 name = "cometdesk-gui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1026,7 +1027,7 @@ dependencies = [
 
 [[package]]
 name = "cometdesk-media"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1048,7 +1049,7 @@ dependencies = [
 
 [[package]]
 name = "cometdesk-view"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "cometdesk",

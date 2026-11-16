@@ -1,4 +1,4 @@
-# cometdesk-rs: guide for AI agents
+# cometdesk: guide for AI agents
 
 Native console for GL.iNet GLKVM devices (macOS first). Read `docs/ARCHITECTURE.md` for the
 data flow, `PLAN.md` for goals and decisions, `docs/protocol.md` for the device protocol.

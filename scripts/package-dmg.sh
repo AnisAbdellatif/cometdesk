@@ -37,6 +37,8 @@ cat >"$APP/Contents/Info.plist" <<PLIST
 	<key>CFBundleShortVersionString</key><string>$VERSION</string>
 	<key>CFBundleVersion</key><string>$VERSION</string>
 	<key>LSMinimumSystemVersion</key><string>12.0</string>
+	<!-- Files the app writes (received from the target) get com.apple.quarantine, so Gatekeeper checks them. -->
+	<key>LSFileQuarantineEnabled</key><true/>
 	<key>NSHighResolutionCapable</key><true/>
 	<key>NSLocalNetworkUsageDescription</key><string>Connects to your GL.iNet Comet KVM on the local network.</string>
 </dict></plist>

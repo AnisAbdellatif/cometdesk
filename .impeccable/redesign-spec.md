@@ -25,4 +25,4 @@ Radii: buttons/inputs 6, cards 10, dialogs 12, badges 6–8. Inputs: 36px high, 
 ## Conventions
 - All new reusable widgets go in `theme.rs` (e.g. `chevron`, `icon_button`, `segmented`, `switch`, `kbd`, `dropdown_button`, `card`, `caption`, `modal_frame`), used by devices.rs/console.rs/media.rs/browser.rs.
 - Fonts: install in `theme::apply`; keep a `bold` family (Inter SemiBold) for titles and buttons, `mono` for JetBrains Mono. `RichText::strong()` must still look right.
-- Verify visually: `.impeccable/tools/shot.sh <name>` launches the debug app against the dev Comet (needs `.env`, already present) and writes `/tmp/shots/<name>.png`. In debug builds `COMETDESK_DEBUG_UI=panel-target|panel-video|panel-settings|palette` opens that view at start (task 3 adds it). Compare with the PNGs in `.impeccable/design-ref/`.
+- Verify visually: `.impeccable/tools/shot.sh <name>` launches the debug app against the dev Comet (needs `.env`, already present) and writes `$TMPDIR/shots/<name>.png`. In debug builds `COMETDESK_DEBUG_UI=panel-target|panel-video|panel-settings|palette` opens that view at start (task 3 adds it). Compare with the PNGs in `.impeccable/design-ref/`.

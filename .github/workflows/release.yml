@@ -1,0 +1,50 @@
+name: Release
+
+# Push a tag vX.Y.Z (same as the workspace version) to build the dmg, publish it as a release
+# of this repo, and bump Casks/cometdesk.rb in AnisAbdellatif/homebrew-tap.
+# Secret TAP_TOKEN: fine-grained PAT for homebrew-tap only, Contents read and write.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/package-dmg.sh
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          DMG=dist/CometDesk-$VERSION-arm64.dmg
+          test -f "$DMG" || { echo "tag $GITHUB_REF_NAME does not match the cometdesk-gui version"; exit 1; }
+          gh release create "$GITHUB_REF_NAME" "$DMG" --title "CometDesk $VERSION" \
+            --notes "CometDesk $VERSION (arm64, ad-hoc signed). Install: brew install --cask anisabdellatif/tap/cometdesk"
+          echo "VERSION=$VERSION" >>"$GITHUB_ENV"
+          echo "SHA=$(shasum -a 256 "$DMG" | cut -d' ' -f1)" >>"$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          repository: AnisAbdellatif/homebrew-tap
+          token: ${{ secrets.TAP_TOKEN }}
+          path: tap
+      - name: Bump cask
+        working-directory: tap
+        run: |
+          sed -i '' -e "s/^  version \".*\"/  version \"$VERSION\"/" \
+            -e "s/^  sha256 \".*\"/  sha256 \"$SHA\"/" \
+            -e "s|^  url \".*\"|  url \"https://github.com/$GITHUB_REPOSITORY/releases/download/v#{version}/CometDesk-#{version}-arm64.dmg\"|" \
+            -e "s|^  homepage \".*\"|  homepage \"https://github.com/$GITHUB_REPOSITORY\"|" \
+            Casks/cometdesk.rb
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "cometdesk $VERSION"
+          git push

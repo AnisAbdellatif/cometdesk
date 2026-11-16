@@ -158,7 +158,7 @@ impl Connection {
             .tcp_nodelay(true)
             .http1_only()
             .no_proxy()
-            .user_agent(concat!("cometdesk-rs/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("cometdesk/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(30))
             .build()?;

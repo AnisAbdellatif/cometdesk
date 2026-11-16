@@ -25,3 +25,6 @@ graphify-out/20??-??-??/
 .vscode/
 .idea/
 *.swp
+
+# Python
+__pycache__/

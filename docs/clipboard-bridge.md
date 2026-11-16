@@ -39,7 +39,7 @@ target: cometdesk-agent ──TCP──▶ 192.168.5.1 (Comet usb0) ──NAT ou
   length-prefixed frames inside the Noise session.
 
 Costs and caveats:
-- Enabling it: write `/etc/kvmd/override.d/90-cometdesk-rs-rndis.yaml` with
+- Enabling it: write `/etc/kvmd/override.d/90-cometdesk-rndis.yaml` with
   `otg: {devices: {ethernet: {enabled: true, driver: rndis, start: true}}}` (and fixed
   `host_mac`/`kvm_mac` so the target keeps one interface identity), restart
   `/etc/init.d/S50kvmd-otg`, then `POST /api/rndis/start`. The USB device re-enumerates,
@@ -60,7 +60,7 @@ Costs and caveats:
 
 ### Applied on the reference Comet (2026-10-28)
 
-- Wrote `/etc/kvmd/override.d/90-cometdesk-rs-rndis.yaml` (ethernet `enabled: true`,
+- Wrote `/etc/kvmd/override.d/90-cometdesk-rndis.yaml` (ethernet `enabled: true`,
   `driver: rndis`, `host_mac 02:47:4b:56:4d:01`, `kvm_mac 02:47:4b:56:4d:02`), restarted
   `/etc/init.d/S50kvmd-otg`, ran `kvmd-rndis start`.
 - Result: the gadget config links `hid.usb0-2` and `rndis.usb0`, the UDC is bound,
@@ -88,7 +88,7 @@ Costs and caveats:
 - `kvmd-rndis start` is **not persistent**: after a Comet reboot the gadget function
   comes back (override file), but DHCP/NAT need `POST /api/rndis/start` (our app should
   call it on connect).
-- Undo: `rm /etc/kvmd/override.d/90-cometdesk-rs-rndis.yaml; kvmd-rndis stop;
+- Undo: `rm /etc/kvmd/override.d/90-cometdesk-rndis.yaml; kvmd-rndis stop;
   /etc/init.d/S50kvmd-otg restart`.
 
 ### Removing the limits: a relay on the Comet (`cometdesk-bridge`)
@@ -361,7 +361,7 @@ Options:
 
 | | How | Cost |
 |---|---|---|
-| **A. SSH config override** | On the Comet, write `/etc/kvmd/override.d/90-cometdesk-rs-serial.yaml` with `otg: {devices: {serial: {enabled: true, start: true}}}`, then restart `kvmd-otg` and `kvmd` | Needs SSH as root. The USB device re-enumerates (keyboard/mouse drop for a second). May not survive firmware upgrades: check. |
+| **A. SSH config override** | On the Comet, write `/etc/kvmd/override.d/90-cometdesk-serial.yaml` with `otg: {devices: {serial: {enabled: true, start: true}}}`, then restart `kvmd-otg` and `kvmd` | Needs SSH as root. The USB device re-enumerates (keyboard/mouse drop for a second). May not survive firmware upgrades: check. |
 | **B. Upstream request** | Ask GL.iNet (issue/PR on gl-inet/glkvm) to add `"enable_serial": ("otg/devices/serial/start", False, "acm.usb0")` to `_OTG_FUNC_MAP`, with `serial.enabled: true` by default | Clean, toggleable from our app via the API, but on their schedule |
 
 **Do not** use PiKVM's `ENABLE_OTG_SERIAL` boot option (`scripts/kvmd-bootconfig`). It

@@ -3,16 +3,22 @@
 # Served by cometdesk-bridge on the Comet's USB link; cometdesk-gui types the command for you
 # (no pipe: `|` needs AltGr on some layouts and may not arrive over HID):
 #
-#   curl -fsSo /tmp/cometdesk-install.sh http://192.168.5.1:47475/install.sh && sh /tmp/cometdesk-install.sh <code>
+#   curl -fsSo "$HOME/.cometdesk-install.sh" http://192.168.5.1:47475/install.sh && COMETDESK_CODE=<code> sh "$HOME/.cometdesk-install.sh"
+#
+# The code comes from COMETDESK_CODE (or, for older commands, the first argument): the
+# environment and stdin keep it out of the process list other users can read.
 #
 # No root needed. Installs to ~/.local/bin, autostarts with the desktop session (the
 # clipboard belongs to the session), logs to ~/.local/state/cometdesk-agent.log.
 set -eu
 RELAY=http://192.168.5.1:47475
-CODE=${1:-}
+CODE=${COMETDESK_CODE:-${1:-}}
+unset COMETDESK_CODE
+# The shell already has this file open: remove the copy the typed command downloaded.
+[ "$0" = "$HOME/.cometdesk-install.sh" ] && rm -f "$0"
 EXPECTED_SHA=${2:-}
 if [ -z "$CODE" ]; then
-	echo "usage: sh install.sh <pairing-code> [expected-sha256]" >&2
+	echo "usage: COMETDESK_CODE=<pairing-code> sh install.sh [<pairing-code>] [expected-sha256]" >&2
 	exit 2
 fi
 
@@ -85,7 +91,7 @@ pkill -x glkvm-agent 2>/dev/null || true
 rm -f "$BIN/glkvm-agent" "$(dirname "$AUTOSTART")/glkvm-agent.desktop"
 mv -f "$EXE.new" "$EXE"
 
-"$EXE" pair "$CODE" >/dev/null
+printf '%s\n' "$CODE" | "$EXE" pair - >/dev/null
 
 cat >"$AUTOSTART" <<EOF
 [Desktop Entry]

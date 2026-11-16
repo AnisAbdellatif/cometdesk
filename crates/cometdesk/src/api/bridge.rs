@@ -36,8 +36,8 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../../bridge/udhcpd.conf"),
     ),
     (
-        "90-cometdesk-rs-rndis.yaml",
-        include_str!("../../../../bridge/90-cometdesk-rs-rndis.yaml"),
+        "90-cometdesk-rndis.yaml",
+        include_str!("../../../../bridge/90-cometdesk-rndis.yaml"),
     ),
     (
         "manifest.yaml",
@@ -60,7 +60,19 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../../bridge/target/install.ps1"),
     ),
 ];
-const STAGE: &str = "/tmp/cometdesk-setup";
+
+/// A fresh folder for files root runs. `mktemp -d` makes it 0700 and new, so nothing another
+/// account on the device placed in /tmp can be picked up (fixed names there could be).
+async fn private_dir(sh: &mut crate::shell::RootShell) -> Result<String> {
+    let dir = sh
+        .ok("mktemp -d /tmp/cometdesk.XXXXXX")
+        .await?
+        .text
+        .trim()
+        .to_owned();
+    crate::shell::check_path(&dir)?;
+    Ok(dir)
+}
 
 /// Short hash of all device-side files this build installs. The device stores it, so any
 /// change to them (not only a relay version bump) shows up as [`Health::Outdated`].
@@ -214,20 +226,19 @@ pub async fn setup(session: &Session, progress: impl Fn(&str)) -> Result<SetupRe
     progress("Opening the device's terminal…");
     let mut sh = session.root_shell().await?;
     let result = async {
-        sh.ok(&format!("rm -rf {STAGE} && mkdir -p {STAGE}"))
-            .await?;
+        let stage = private_dir(&mut sh).await?;
         for (name, content) in FILES {
             progress(&format!("Copying {name}…"));
-            sh.upload(&format!("{STAGE}/{name}"), content.as_bytes(), "0644")
+            sh.upload(&format!("{stage}/{name}"), content.as_bytes(), "0644")
                 .await?;
         }
-        sh.upload(&format!("{STAGE}/bundle"), bundle_id().as_bytes(), "0644")
+        sh.upload(&format!("{stage}/bundle"), bundle_id().as_bytes(), "0644")
             .await?;
         progress("Installing…");
         let out = sh
             .run_timeout(
                 // `(exit $s)` hands setup.sh's status to the shell's end marker.
-                &format!("sh {STAGE}/setup.sh 2>&1; s=$?; rm -rf {STAGE}; (exit $s)"),
+                &format!("sh {stage}/setup.sh 2>&1; s=$?; rm -rf {stage}; (exit $s)"),
                 std::time::Duration::from_secs(120),
             )
             .await?;
@@ -264,11 +275,12 @@ pub async fn remove(session: &Session) -> Result<()> {
     let mut sh = session.root_shell().await?;
     let result = async {
         let (_, script) = FILES.iter().find(|(n, _)| *n == "remove.sh").unwrap();
-        sh.upload("/tmp/cometdesk-remove.sh", script.as_bytes(), "0644")
+        let stage = private_dir(&mut sh).await?;
+        sh.upload(&format!("{stage}/remove.sh"), script.as_bytes(), "0644")
             .await?;
         let out = sh
             .run_timeout(
-                "sh /tmp/cometdesk-remove.sh 2>&1; rm -f /tmp/cometdesk-remove.sh",
+                &format!("sh {stage}/remove.sh 2>&1; rm -rf {stage}"),
                 std::time::Duration::from_secs(60),
             )
             .await?;

@@ -1,15 +1,15 @@
 ---
 id: glkvm-rs-native-macos-console-for-gl-inet-comet-pl
-title: "glkvm-rs: native macOS console for GL.iNet Comet, plus target-side bridge"
+title: "cometdesk: native macOS console for GL.iNet Comet, plus target-side bridge"
 status: active
 created: 2026-10-29T19:14:46.482Z
-updated: 2026-10-30T00:02:35.214Z
+updated: 2026-11-16T17:15:21.259Z
 tags:
   - glkvm
   - strategy
 ---
 
-# glkvm-rs: native macOS console for GL.iNet Comet, plus target-side bridge
+# cometdesk: native macOS console for GL.iNet Comet, plus target-side bridge
 
 ## Goal
 

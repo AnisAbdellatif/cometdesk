@@ -1,11 +1,18 @@
 //! Cuts a part out of a PNG screenshot.
 
+const MAX_PIXELS: u64 = 8192 * 8192;
+
 /// `region` is `[left, top, right, bottom]` as fractions (0..=1) of the image. Returns the
 /// cropped size and its RGBA pixels.
 pub fn crop_png(png: &[u8], region: [f32; 4]) -> Result<(u32, u32, Vec<u8>), String> {
     let mut dec = png::Decoder::new(std::io::Cursor::new(png));
     dec.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = dec.read_info().map_err(|e| e.to_string())?;
+    // The size comes from the target: check it before allocating (8K screens fit).
+    let (iw, ih) = (reader.info().width as u64, reader.info().height as u64);
+    if iw * ih > MAX_PIXELS {
+        return Err(format!("screenshot too large ({iw}x{ih})"));
+    }
     let mut buf = vec![0; reader.output_buffer_size().ok_or("image too large")?];
     let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
     let (w, h) = (info.width as usize, info.height as usize);
@@ -46,5 +53,15 @@ mod tests {
         assert_eq!((w, h), (2, 1));
         assert_eq!(px, [11, 0, 0, 255, 12, 0, 0, 255]);
         assert!(crop_png(&png, [0.5, 0.5, 0.5, 1.0]).is_err());
+        let mut huge = png.clone();
+        huge[16..24].copy_from_slice(&[0, 1, 0, 0, 0, 1, 0, 0]); // IHDR 65536x65536
+        let crc = huge[12..29].iter().fold(!0u32, |c, &b| {
+            (0..8).fold(c ^ b as u32, |c, _| {
+                (c >> 1) ^ (0xEDB8_8320 & (c & 1).wrapping_neg())
+            })
+        });
+        huge[29..33].copy_from_slice(&(!crc).to_be_bytes());
+        let err = crop_png(&huge, [0.0, 0.0, 1.0, 1.0]).unwrap_err();
+        assert!(err.contains("too large"), "{err}");
     }
 }

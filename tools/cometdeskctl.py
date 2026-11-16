@@ -15,7 +15,7 @@
 Exit status is 1 when the app answers ok=false.
 Also usable as a module: `from cometdeskctl import Client; Client().call("status")`.
 """
-import json, os, socket, sys, time
+import json, os, socket, sys, tempfile, time
 
 
 def default_socket():
@@ -65,11 +65,13 @@ def launch(device=None, timeout=30):
     import subprocess
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     path = os.environ.get("COMETDESK_CONTROL", "")
-    path = path if path not in ("", "1") else "/tmp/cometdesk-control.sock"
+    # Per-user temp dir ($TMPDIR on macOS): in a shared /tmp another account could take the name.
+    tmp = tempfile.gettempdir()
+    path = path if path not in ("", "1") else os.path.join(tmp, "cometdesk-control.sock")
     if os.path.exists(path):
         os.unlink(path)
     env = {**os.environ, "COMETDESK_CONTROL": path}
-    log = open(os.environ.get("COMETDESK_LOG", "/tmp/cometdesk-gui.log"), "w")
+    log = open(os.environ.get("COMETDESK_LOG", os.path.join(tmp, "cometdesk-gui.log")), "w")
     subprocess.Popen([os.environ.get("COMETDESK_BIN", f"{root}/target/debug/cometdesk-gui")],
                      env=env, stdout=log, stderr=log, start_new_session=True)
     end = time.time() + timeout

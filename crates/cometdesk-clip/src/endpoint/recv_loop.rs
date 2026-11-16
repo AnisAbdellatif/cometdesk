@@ -132,6 +132,10 @@ impl Endpoint {
                 if size > MAX_FILE || (purpose == Purpose::Update && size > MAX_UPDATE) {
                     return Err(Error::Message("file too large".into()));
                 }
+                // Shared with outgoing transfers; a peer only ever needs one clipboard batch open.
+                if self.files.len() >= 4 * MAX_CLIP_FILES {
+                    return Err(Error::Message("too many files at once".into()));
+                }
                 self.files.insert(id, Sha256::new());
                 events.push(Event::FileOffer {
                     id,

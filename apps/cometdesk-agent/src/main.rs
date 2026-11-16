@@ -7,6 +7,7 @@
 //!
 //! ```text
 //! cometdesk-agent pair <code>     store the pairing code shown by cometdesk-gui
+//! cometdesk-agent pair -          same, reading the code from stdin (keeps it out of `ps`)
 //! cometdesk-agent notify <title> [body]   show a notification on the Mac (for scripts)
 //! cometdesk-agent [run] [--relay HOST:PORT] [--log FILE]
 //! cometdesk-agent unpair          forget the pairing
@@ -77,6 +78,13 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     match args.as_slice() {
+        ["pair", "-"] => {
+            let mut code = String::new();
+            match std::io::stdin().read_line(&mut code) {
+                Ok(_) => pair(code.trim()),
+                Err(e) => fail(&format!("cannot read the pairing code: {e}")),
+            }
+        }
         ["pair", code @ ..] if !code.is_empty() => pair(&code.join("")),
         ["unpair"] => match config::remove_secret() {
             Ok(()) => {
@@ -98,7 +106,7 @@ fn main() -> ExitCode {
             Some((relay, log)) => run(relay, log),
             None => {
                 eprintln!(
-                    "usage: cometdesk-agent pair <code> | cometdesk-agent [run] [--relay HOST:PORT] [--log FILE]\n       \
+                    "usage: cometdesk-agent pair <code|-> | cometdesk-agent [run] [--relay HOST:PORT] [--log FILE]\n       \
                      cometdesk-agent unpair | cometdesk-agent uninstall | cometdesk-agent notify <title> [body]"
                 );
                 ExitCode::from(2)

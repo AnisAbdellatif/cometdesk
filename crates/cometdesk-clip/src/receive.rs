@@ -9,7 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use crate::{MAX_CLIP_FILES_BYTES, Purpose};
+use crate::{MAX_CLIP_FILES, MAX_CLIP_FILES_BYTES, Purpose};
 
 /// Staged clipboard files older than this are removed the next time a receiver is created.
 /// Folders deeper than this are not copied.
@@ -43,8 +43,11 @@ impl Drop for Receiving {
 /// The files being received in one session; dropping it discards the unfinished ones.
 pub struct FileReceiver {
     open: HashMap<u32, Receiving>,
-    /// Finished clipboard files by transfer id, until [`FileReceiver::take_staged`].
-    staged: HashMap<u32, PathBuf>,
+    /// Finished clipboard files by transfer id (staged item, size), until
+    /// [`FileReceiver::take_staged`].
+    staged: HashMap<u32, (PathBuf, u64)>,
+    /// The items of the last batch handed out, removed when the next one replaces it.
+    taken: Vec<PathBuf>,
     /// Staging folders of the copied folders of this session, by their name.
     trees: HashMap<String, PathBuf>,
     staging: PathBuf,
@@ -63,6 +66,7 @@ impl FileReceiver {
         FileReceiver {
             open: HashMap::new(),
             staged: HashMap::new(),
+            taken: Vec::new(),
             trees: HashMap::new(),
             staging,
             nonce,
@@ -90,7 +94,15 @@ impl FileReceiver {
                 (dir, "cometdesk-agent".to_owned(), None)
             }
             Purpose::Clipboard => {
-                if size > MAX_CLIP_FILES_BYTES {
+                // The sender's batch limits, enforced here too: everything not yet handed out.
+                let pending = self
+                    .open
+                    .values()
+                    .filter(|r| r.purpose == Purpose::Clipboard);
+                let count = pending.clone().count() + self.staged.len();
+                let bytes = pending.map(|r| r.size).sum::<u64>()
+                    + self.staged.values().map(|(_, n)| n).sum::<u64>();
+                if count >= MAX_CLIP_FILES || bytes.saturating_add(size) > MAX_CLIP_FILES_BYTES {
                     return Err("too large to copy through the clipboard".into());
                 }
                 let mut parts = sanitize_path(name).ok_or("the file name is not usable")?;
@@ -192,7 +204,7 @@ impl FileReceiver {
         fs::rename(&r.part, &dest).map_err(|e| format!("cannot save the file: {e}"))?;
         r.done = true;
         if r.purpose == Purpose::Clipboard {
-            self.staged.insert(id, r.top.clone());
+            self.staged.insert(id, (r.top.clone(), r.size));
         }
         Ok(dest.display().to_string())
     }
@@ -209,12 +221,35 @@ impl FileReceiver {
     }
 
     /// The finished clipboard files for `ids`, in order; `None` if any is missing.
+    /// Files of the previous batch, and of earlier batches that never completed, are deleted:
+    /// only the newest batch is on the clipboard.
     pub fn take_staged(&mut self, ids: &[u32]) -> Option<Vec<PathBuf>> {
-        let paths: Option<Vec<PathBuf>> = ids.iter().map(|i| self.staged.remove(i)).collect();
+        let paths: Option<Vec<PathBuf>> = ids
+            .iter()
+            .map(|i| self.staged.remove(i).map(|(p, _)| p))
+            .collect();
         let mut paths = paths.filter(|p| !p.is_empty())?;
         // Every file of a copied folder stages to the same top.
         let mut seen = std::collections::HashSet::new();
         paths.retain(|p| seen.insert(p.clone()));
+        // Ids grow, so staged files older than this batch belong to one that was abandoned.
+        let first = ids.iter().min().copied().unwrap_or(0);
+        let mut old = std::mem::replace(&mut self.taken, paths.clone());
+        self.staged.retain(|id, (p, _)| {
+            let keep = *id > first;
+            if !keep {
+                old.push(p.clone());
+            }
+            keep
+        });
+        // A folder copied again reuses its staging: never delete what this batch hands out.
+        for p in old.iter().filter(|p| !seen.contains(*p)) {
+            let _ = if p.is_dir() {
+                fs::remove_dir_all(p)
+            } else {
+                fs::remove_file(p)
+            };
+        }
         Some(paths)
     }
 }
@@ -407,6 +442,30 @@ mod tests {
         assert_eq!(paths.len(), 2);
         assert!(paths[0].ends_with("pics") && paths[0].join("sub/b.txt").is_file());
         assert!(paths[1].ends_with("solo.txt") && paths[1].is_file());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clipboard_batches_are_bounded_and_replaced() {
+        let dir = std::env::temp_dir().join(format!("cometdesk-batch-{}", std::process::id()));
+        let mut rx = FileReceiver::new(dir.clone());
+        rx.offer(1, "big", MAX_CLIP_FILES_BYTES, Purpose::Clipboard)
+            .unwrap();
+        assert!(rx.offer(2, "more", 1, Purpose::Clipboard).is_err());
+        rx.cancel(1);
+        let stage = |rx: &mut FileReceiver, id| {
+            rx.offer(id, "a.txt", 1, Purpose::Clipboard).unwrap();
+            rx.data(id, b"x").unwrap();
+            rx.end(id, true).unwrap();
+        };
+        stage(&mut rx, 3); // never announced ready
+        stage(&mut rx, 4);
+        let first = rx.take_staged(&[4]).unwrap();
+        assert!(first[0].is_file());
+        stage(&mut rx, 5);
+        let second = rx.take_staged(&[5]).unwrap();
+        assert!(second[0].is_file() && !first[0].exists());
+        assert!(rx.staged.is_empty());
         fs::remove_dir_all(&dir).unwrap();
     }
 

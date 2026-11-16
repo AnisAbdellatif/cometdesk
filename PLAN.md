@@ -1,4 +1,4 @@
-# cometdesk-rs: native console for GL.iNet GLKVM devices
+# cometdesk: native console for GL.iNet GLKVM devices
 
 Goal: a native, hardware-accelerated **console** for GLKVM devices (video + keyboard/mouse
 + power) that beats the official web app on latency and power, built on a Rust SDK that
@@ -78,7 +78,7 @@ Cargo workspace, async on `tokio`, all TLS via `rustls`. Four crates; split furt
 when compile times or a second consumer demand it.
 
 ```
-cometdesk-rs/
+cometdesk/
   crates/
     cometdesk/          SDK: proto types (serde), REST client, /api/ws events + HID. Light deps.
     cometdesk-media/    Video/audio sources (Direct, Pion), decoders (VideoToolbox). Heavy deps.

@@ -1,12 +1,16 @@
 #!/bin/sh
 # cometdesk-bridge: USB link for the target (no NAT, no routing) + relay daemon.
-# The RNDIS gadget function itself comes from /etc/kvmd/override.d/90-cometdesk-rs-rndis.yaml.
+# The RNDIS gadget function itself comes from /etc/kvmd/override.d/90-cometdesk-rndis.yaml.
 
 DAEMON=/usr/local/lib/cometdesk-bridge/cometdesk_bridge.py
 PIDFILE=/run/cometdesk-bridge.pid
 DHCP_CONF=/etc/cometdesk-bridge/udhcpd.conf
 DHCP_PID=/run/cometdesk-bridge-udhcpd.pid
 CHAIN=cometdesk-bridge-in
+# Root-only runtime folder (lease file, client socket): /tmp and /run/kvmd are writable by
+# other accounts, which could plant links there for root to follow.
+RUNDIR=/run/cometdesk-bridge
+PORTS="47474 47475"
 
 # Determine unprivileged user if available (kvmd or nobody)
 BRIDGE_USER=""
@@ -48,6 +52,12 @@ setup_firewall() {
 	iptables -A $CHAIN -j DROP
 	iptables -C INPUT -i usb0 -j $CHAIN 2>/dev/null || iptables -I INPUT 1 -i usb0 -j $CHAIN
 	iptables -C FORWARD -i usb0 -j DROP 2>/dev/null || iptables -I FORWARD 1 -i usb0 -j DROP
+	# The listeners bind 192.168.5.1, which Linux also answers on other interfaces: the relay
+	# and downloads are for the USB link only.
+	for p in $PORTS; do
+		iptables -C INPUT ! -i usb0 -p tcp --dport "$p" -j DROP 2>/dev/null ||
+			iptables -I INPUT 1 ! -i usb0 -p tcp --dport "$p" -j DROP
+	done
 }
 
 link_up() {
@@ -64,7 +74,8 @@ link_up() {
 		return 1
 	fi
 
-	touch /tmp/cometdesk-bridge-udhcpd.leases
+	mkdir -p -m 755 $RUNDIR
+	touch $RUNDIR/udhcpd.leases
 	kill_udhcpd ours
 	/usr/sbin/udhcpd -f $DHCP_CONF >/dev/null 2>&1 &
 	echo $! > $DHCP_PID
@@ -76,6 +87,9 @@ link_down() {
 	rm -f $DHCP_PID
 	iptables -D INPUT -i usb0 -j $CHAIN 2>/dev/null
 	iptables -D FORWARD -i usb0 -j DROP 2>/dev/null
+	for p in $PORTS; do
+		iptables -D INPUT ! -i usb0 -p tcp --dport "$p" -j DROP 2>/dev/null
+	done
 	iptables -F $CHAIN 2>/dev/null
 	iptables -X $CHAIN 2>/dev/null
 }
@@ -109,7 +123,7 @@ stop() {
 	printf "Stopping cometdesk-bridge: "
 	start-stop-daemon --stop --quiet --pidfile $PIDFILE 2>/dev/null
 	pkill -f "python3 $DAEMON" 2>/dev/null
-	rm -f $PIDFILE /run/kvmd/cometdesk-bridge.sock
+	rm -f $PIDFILE $RUNDIR/bridge.sock /run/kvmd/cometdesk-bridge.sock
 	link_down
 	echo "OK"
 }

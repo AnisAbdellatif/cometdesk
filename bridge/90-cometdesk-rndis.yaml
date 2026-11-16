@@ -1,4 +1,4 @@
-# cometdesk-rs: USB network (RNDIS) for the clipboard bridge. Installed by bridge/setup.sh,
+# cometdesk: USB network (RNDIS) for the clipboard bridge. Installed by bridge/setup.sh,
 # removed by bridge/remove.sh.
 otg:
     devices:

@@ -240,7 +240,7 @@ fn find_end(out: &str, marker: &str) -> Option<(usize, i32, usize)> {
     })
 }
 
-fn check_path(path: &str) -> Result<()> {
+pub(crate) fn check_path(path: &str) -> Result<()> {
     if path.starts_with('/')
         && path
             .bytes()
