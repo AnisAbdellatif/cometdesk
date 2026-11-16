@@ -93,6 +93,11 @@ pub struct MockDevice {
 impl MockDevice {
     /// Binds `127.0.0.1:0` and serves until the runtime ends.
     pub async fn start(config: Config) -> MockDevice {
+        Self::start_on(config, "127.0.0.1:0").await
+    }
+
+    /// Like `start`, but binds `bind` (e.g. `127.0.0.1:8443`).
+    pub async fn start_on(config: Config, bind: &str) -> MockDevice {
         let state = Arc::new(State {
             config,
             acceptor: Mutex::new(acceptor()),
@@ -106,7 +111,7 @@ impl MockDevice {
             viewers: AtomicU32::new(0),
             push: broadcast::channel(64).0,
         });
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind(bind).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let st = state.clone();
         tokio::spawn(async move {
