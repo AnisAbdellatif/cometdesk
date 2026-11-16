@@ -4,7 +4,7 @@ members = ["crates/cometdesk", "crates/cometdesk-media", "crates/cometdesk-cli",
 
 [workspace.package]
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 rust-version = "1.88"
 
 [profile.release]

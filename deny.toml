@@ -1,5 +1,5 @@
 # cargo-deny: run `cargo deny check` (CI does).
-# The project is MIT OR Apache-2.0 and clean-room (PLAN.md §0): no GPL/AGPL/LGPL code may
+# The project is MIT and clean-room (PLAN.md §0): no GPL/AGPL/LGPL code may
 # enter the dependency tree.
 
 [graph]
