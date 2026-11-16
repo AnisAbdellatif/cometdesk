@@ -21,6 +21,5 @@ tracing = "0.1.44"
 url = "2.5.8"
 
 [dev-dependencies]
-rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
+cometdesk-mock = { version = "0.1.0", path = "../cometdesk-mock" }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "test-util", "net", "io-util"] }
-tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }

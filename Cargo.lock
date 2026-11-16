@@ -926,10 +926,10 @@ name = "cometdesk"
 version = "0.1.1"
 dependencies = [
  "bytes",
+ "cometdesk-mock",
  "futures-util",
  "hex",
  "libc",
- "rcgen",
  "reqwest",
  "rustls",
  "serde",
@@ -937,7 +937,6 @@ dependencies = [
  "sha2 0.11.1",
  "thiserror 2.0.21",
  "tokio",
- "tokio-rustls",
  "tokio-tungstenite",
  "tracing",
  "url",
@@ -965,6 +964,7 @@ dependencies = [
  "clap",
  "cometdesk",
  "cometdesk-media",
+ "cometdesk-mock",
  "cometdesk-view",
  "libc",
  "pollster",
@@ -1045,6 +1045,19 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
+]
+
+[[package]]
+name = "cometdesk-mock"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "rcgen",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "url",
 ]
 
 [[package]]

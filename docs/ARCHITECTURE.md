@@ -18,5 +18,6 @@ Crate dependencies (arrows = "depends on"):
   notifications, device info, updates.
 - `cometdesk-gui`: egui/winit app. `app` owns window and events; `devices` the connect screen;
   `console` one live session; `clipsync` the background task talking to the agent; `theme` widgets.
+- `cometdesk-mock`: dev-only fake GLKVM device (TLS, REST from recorded fixtures, `/api/ws`) used by SDK and CLI tests.
 
 Each module directory has a `README.md` listing its files.

@@ -32,4 +32,5 @@ data flow, `PLAN.md` for goals and decisions, `docs/protocol.md` for the device 
 | GUI: clipboard bridge to the agent | `apps/cometdesk-gui/src/clipsync/` |
 | GUI: widgets, colours, icons | `apps/cometdesk-gui/src/theme/` |
 | CLI | `crates/cometdesk-cli/` |
+| Test mock device (REST + /api/ws) | `crates/cometdesk-mock/` |
 | KVM-side bridge (RNDIS, Python) | `bridge/`, `docs/clipboard-bridge.md` |

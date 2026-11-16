@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/cometdesk", "crates/cometdesk-media", "crates/cometdesk-cli", "apps/cometdesk-gui", "crates/cometdesk-view", "crates/cometdesk-clip", "apps/cometdesk-agent"]
+members = ["crates/cometdesk", "crates/cometdesk-media", "crates/cometdesk-cli", "apps/cometdesk-gui", "crates/cometdesk-view", "crates/cometdesk-clip", "apps/cometdesk-agent", "crates/cometdesk-mock"]
 
 [workspace.package]
 edition = "2024"
