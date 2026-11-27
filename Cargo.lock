@@ -1414,7 +1414,8 @@ checksum = "9e9de72ce2ad1f90dc62fa25f0f430ef85eb4b0d8fa0be4f30373bc40a21d28e"
 
 [[package]]
 name = "desktop-kit"
-version = "0.1.1"
+version = "0.1.0"
+source = "git+https://github.com/AnisAbdellatif/desktop-kit?tag=v0.1.0#6a0ebf1418d160abc92cc770d0ddc2cd2f5bdd5d"
 dependencies = [
  "png",
  "windows",
