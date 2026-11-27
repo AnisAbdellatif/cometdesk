@@ -230,10 +230,14 @@ impl SensitiveChecker {
         use windows_sys::Win32::System::DataExchange::*;
         unsafe {
             Self {
-                fmt_ignore: RegisterClipboardFormatA(b"Clipboard Viewer Ignore\0".as_ptr()),
-                fmt_history: RegisterClipboardFormatA(b"CanIncludeInClipboardHistory\0".as_ptr()),
+                fmt_ignore: RegisterClipboardFormatA(c"Clipboard Viewer Ignore".as_ptr().cast()),
+                fmt_history: RegisterClipboardFormatA(
+                    c"CanIncludeInClipboardHistory".as_ptr().cast(),
+                ),
                 fmt_exclude: RegisterClipboardFormatA(
-                    b"ExcludeClipboardContentFromMonitorProcessing\0".as_ptr(),
+                    c"ExcludeClipboardContentFromMonitorProcessing"
+                        .as_ptr()
+                        .cast(),
                 ),
             }
         }
