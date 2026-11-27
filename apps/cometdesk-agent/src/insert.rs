@@ -16,7 +16,7 @@ use crate::clipboard::ClipCommand;
 
 pub fn insert(text: &str, paste: PastePref, clip: &mpsc::Sender<ClipCommand>) -> InsertReply {
     #[cfg(windows)]
-    if windows::send_unicode(text) {
+    if desktop_kit::input::type_text(text) {
         return InsertReply::Inserted;
     }
     let (done_tx, done_rx) = mpsc::channel();
@@ -53,59 +53,5 @@ fn paste_key(pref: PastePref) -> PasteKey {
                 PasteKey::CtrlV
             }
         }
-    }
-}
-
-#[cfg(windows)]
-mod windows {
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, SendInput,
-        VK_RETURN, VK_TAB,
-    };
-
-    fn key(vk: u16, scan: u16, flags: u32) -> INPUT {
-        INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: vk,
-                    wScan: scan,
-                    dwFlags: flags,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        }
-    }
-
-    /// Queues the whole text as Unicode key events in one call. False if Windows refused
-    /// some of them (UIPI blocks input to elevated windows).
-    pub fn send_unicode(text: &str) -> bool {
-        let mut inputs = Vec::with_capacity(text.len() * 2);
-        for ch in text.chars() {
-            match ch {
-                '\r' => {}
-                '\n' => inputs.extend([key(VK_RETURN, 0, 0), key(VK_RETURN, 0, KEYEVENTF_KEYUP)]),
-                '\t' => inputs.extend([key(VK_TAB, 0, 0), key(VK_TAB, 0, KEYEVENTF_KEYUP)]),
-                _ => {
-                    let mut units = [0u16; 2];
-                    for &u in ch.encode_utf16(&mut units).iter() {
-                        inputs.push(key(0, u, KEYEVENTF_UNICODE));
-                        inputs.push(key(0, u, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
-                    }
-                }
-            }
-        }
-        if inputs.is_empty() {
-            return true;
-        }
-        let sent = unsafe {
-            SendInput(
-                inputs.len() as u32,
-                inputs.as_ptr(),
-                std::mem::size_of::<INPUT>() as i32,
-            )
-        };
-        sent as usize == inputs.len()
     }
 }
