@@ -1,6 +1,6 @@
 //! Interactive form controls: segmented selectors, toggle switches, and numeric drag boxes.
 //!
-//! Entry points: `segmented`, `switch`, `labelled_switch`, `field_box`.
+//! Entry points: `segmented`, `switch`, `labelled_switch`, `field_box`, `slider`.
 
 use egui::{
     Align2, Color32, CornerRadius, FontFamily, FontId, Pos2, Rect, Response, RichText, Sense,
@@ -52,18 +52,70 @@ pub fn segmented(ui: &mut Ui, selected: &mut usize, labels: &[&str]) -> Response
                         TEXT,
                     );
                 } else {
+                    let hovered = resp.hovered()
+                        && ui
+                            .input(|i| i.pointer.hover_pos())
+                            .is_some_and(|p| seg_rect.contains(p));
                     ui.painter().text(
                         seg_rect.center(),
                         Align2::CENTER_CENTER,
                         *label,
                         FontId::new(12.0, FontFamily::Proportional),
-                        MUTED,
+                        if hovered { TEXT } else { MUTED },
                     );
                 }
             }
         }
     }
 
+    resp
+}
+
+/// A full-width horizontal slider: thin rounded track, accent fill, round knob. `active` false
+/// greys the fill (e.g. muted). Changes on click and drag; use `drag_stopped`/`clicked` to commit.
+pub fn slider(
+    ui: &mut Ui,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    active: bool,
+) -> Response {
+    let (lo, hi) = (*range.start(), *range.end());
+    let (rect, mut resp) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), 28.0),
+        Sense::click_and_drag(),
+    );
+    let track = rect.shrink2(Vec2::new(8.0, 0.0));
+    if (resp.dragged() || resp.clicked())
+        && let Some(pos) = resp.interact_pointer_pos()
+    {
+        let f = ((pos.x - track.min.x) / track.width()).clamp(0.0, 1.0);
+        let v = (lo + f * (hi - lo)).round();
+        if v != *value {
+            *value = v;
+            resp.mark_changed();
+        }
+    }
+    if ui.is_rect_visible(rect) {
+        let frac = ((*value - lo) / (hi - lo)).clamp(0.0, 1.0);
+        let y = rect.center().y;
+        let x = track.min.x + frac * track.width();
+        let bar = Rect::from_min_max(
+            Pos2::new(track.min.x, y - 2.0),
+            Pos2::new(track.max.x, y + 2.0),
+        );
+        ui.painter().rect_filled(bar, CornerRadius::same(2), BORDER);
+        let fill = if active { ACCENT } else { MUTED };
+        let filled = Rect::from_min_max(bar.min, Pos2::new(x, bar.max.y));
+        ui.painter()
+            .rect_filled(filled, CornerRadius::same(2), fill);
+        let hot = resp.hovered() || resp.dragged();
+        let r = if hot { 8.0 } else { 6.5 };
+        ui.painter()
+            .circle(Pos2::new(x, y), r, TEXT, Stroke::new(2.0, BG));
+    }
+    if resp.hovered() || resp.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
     resp
 }
 
@@ -75,13 +127,10 @@ pub fn switch(ui: &mut Ui, on: &mut bool) -> Response {
         resp.mark_changed();
     }
     if ui.is_rect_visible(rect) {
-        let bg_fill = if *on { ACCENT } else { BORDER };
-        let knob_fill = if *on { BG } else { MUTED };
-        let knob_x = if *on {
-            rect.max.x - 10.0
-        } else {
-            rect.min.x + 10.0
-        };
+        let t = ui.ctx().animate_bool_responsive(resp.id, *on);
+        let bg_fill = BORDER.lerp_to_gamma(ACCENT, t);
+        let knob_fill = MUTED.lerp_to_gamma(BG, t);
+        let knob_x = egui::lerp((rect.min.x + 10.0)..=(rect.max.x - 10.0), t);
         ui.painter()
             .rect_filled(rect, CornerRadius::same(10), bg_fill);
         ui.painter()

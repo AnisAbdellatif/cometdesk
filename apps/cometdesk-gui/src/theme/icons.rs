@@ -16,6 +16,8 @@ pub enum Icon {
     Search,
     Check,
     More,
+    Speaker,
+    Muted,
 }
 
 /// Draw a vector icon centered within a rectangle using 1.6px strokes.
@@ -100,6 +102,32 @@ pub fn draw_icon(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
                 vec![pt(-5.0, 0.0), pt(-1.5, 4.0), pt(5.5, -3.5)],
                 stroke,
             ));
+        }
+        Icon::Speaker | Icon::Muted => {
+            painter.add(egui::Shape::closed_line(
+                vec![
+                    pt(-6.0, -2.5),
+                    pt(-3.0, -2.5),
+                    pt(0.5, -5.5),
+                    pt(0.5, 5.5),
+                    pt(-3.0, 2.5),
+                    pt(-6.0, 2.5),
+                ],
+                stroke,
+            ));
+            if icon == Icon::Speaker {
+                painter.add(egui::Shape::line(
+                    vec![pt(3.0, -2.5), pt(4.5, 0.0), pt(3.0, 2.5)],
+                    stroke,
+                ));
+                painter.add(egui::Shape::line(
+                    vec![pt(4.5, -5.0), pt(7.0, 0.0), pt(4.5, 5.0)],
+                    stroke,
+                ));
+            } else {
+                painter.line_segment([pt(3.0, -3.0), pt(7.5, 3.0)], stroke);
+                painter.line_segment([pt(3.0, 3.0), pt(7.5, -3.0)], stroke);
+            }
         }
         Icon::More => {
             painter.circle_filled(pt(-4.5, 0.0), 1.5, color);

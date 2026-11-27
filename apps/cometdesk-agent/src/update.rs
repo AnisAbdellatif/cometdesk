@@ -147,10 +147,10 @@ fn verify_format(new_header: &[u8; 64], _new: &Path, exe: &Path) -> Result<(), S
                 f.read_exact(&mut machine).ok()?;
                 Some(machine)
             };
-            if let (Some(m_new), Some(m_exe)) = (get_pe_machine(_new), get_pe_machine(exe)) {
-                if m_new != m_exe {
-                    return Err("update candidate PE machine type does not match".into());
-                }
+            if let (Some(m_new), Some(m_exe)) = (get_pe_machine(_new), get_pe_machine(exe))
+                && m_new != m_exe
+            {
+                return Err("update candidate PE machine type does not match".into());
             }
         }
     }

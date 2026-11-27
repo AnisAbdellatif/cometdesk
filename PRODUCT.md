@@ -31,7 +31,7 @@ A native Rust/VideoToolbox client with zero-copy decode (IOSurface to Metal to w
 - Platform is recorded as `adaptive` by the user's choice; no per-OS design languages exist yet, so macOS is the only shipped surface.
 - Reactive repaint only; decode stops when minimized or occluded, stream drops after a 30 s grace period.
 - Input v1: map mode (physical key position), per-device target OS profile, absolute mouse, special-keys menu.
-- Licensing: MIT OR Apache-2.0, clean-room; GPL/AGPL sources are read for behavior only.
+- Licensing: MIT, clean-room; GPL/AGPL sources are read for behavior only.
 
 ## Evidence on Hand
 

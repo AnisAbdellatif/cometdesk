@@ -8,6 +8,7 @@ use cometdesk_media::audio::Player;
 use super::Console;
 use super::state::Audio;
 use crate::clipsync::Request;
+use crate::theme;
 
 impl Console {
     /// Audio comes from the source matching the device's video mode (Janus in `webrtc`, Pion
@@ -76,28 +77,44 @@ impl Console {
         let mut level = f32::from(shown);
         let mut muted = volume.muted;
         ui.horizontal(|ui| {
-            ui.label("Volume");
-            let slider = ui.add(egui::Slider::new(&mut level, 0.0..=100.0).suffix("%"));
-            if slider.changed() {
-                self.volume_edit = Some((level as u8, Instant::now()));
-            }
-            if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
-                self.ask_agent(
-                    Request::Volume {
-                        level: Some(level as u8),
-                        muted: None,
-                    },
-                    "Cannot set the volume",
-                    None,
-                );
-            }
-            if ui.checkbox(&mut muted, "Mute").changed() {
+            ui.label(theme::bold("Volume", 13.0));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let text = if muted {
+                    "Muted".to_owned()
+                } else {
+                    format!("{level:.0}%")
+                };
+                ui.label(theme::mono(text, 12.5).color(theme::MUTED));
+            });
+        });
+        ui.horizontal(|ui| {
+            let icon = if muted {
+                theme::Icon::Muted
+            } else {
+                theme::Icon::Speaker
+            };
+            if theme::icon_button(ui, icon, if muted { "Unmute" } else { "Mute" }).clicked() {
+                muted = !muted;
                 self.ask_agent(
                     Request::Volume {
                         level: None,
                         muted: Some(muted),
                     },
                     "Cannot change the mute",
+                    None,
+                );
+            }
+            let slider = theme::slider(ui, &mut level, 0.0..=100.0, !muted);
+            if slider.changed() {
+                self.volume_edit = Some((level as u8, Instant::now()));
+            }
+            if slider.drag_stopped() || slider.clicked() {
+                self.ask_agent(
+                    Request::Volume {
+                        level: Some(level as u8),
+                        muted: None,
+                    },
+                    "Cannot set the volume",
                     None,
                 );
             }

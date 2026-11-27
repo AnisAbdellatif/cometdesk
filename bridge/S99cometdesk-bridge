@@ -104,6 +104,14 @@ start() {
 		link_status=OK
 	else
 		link_status=DEGRADED
+		# At boot S99 scripts run in parallel and kvmd-otg may create usb0 a few seconds later:
+		# keep retrying the link (not just the listeners) for up to 2 minutes.
+		(
+			for _ in $(seq 60); do
+				sleep 2
+				[ -e /sys/class/net/usb0 ] && link_up >/dev/null 2>&1 && exit 0
+			done
+		) </dev/null >/dev/null 2>&1 &
 	fi
 	user_opt=""
 	[ -n "$BRIDGE_USER" ] && user_opt="--user $BRIDGE_USER"

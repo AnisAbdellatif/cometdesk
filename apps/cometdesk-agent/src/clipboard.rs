@@ -230,10 +230,14 @@ impl SensitiveChecker {
         use windows_sys::Win32::System::DataExchange::*;
         unsafe {
             Self {
-                fmt_ignore: RegisterClipboardFormatA(b"Clipboard Viewer Ignore\0".as_ptr()),
-                fmt_history: RegisterClipboardFormatA(b"CanIncludeInClipboardHistory\0".as_ptr()),
+                fmt_ignore: RegisterClipboardFormatA(c"Clipboard Viewer Ignore".as_ptr().cast()),
+                fmt_history: RegisterClipboardFormatA(
+                    c"CanIncludeInClipboardHistory".as_ptr().cast(),
+                ),
                 fmt_exclude: RegisterClipboardFormatA(
-                    b"ExcludeClipboardContentFromMonitorProcessing\0".as_ptr(),
+                    c"ExcludeClipboardContentFromMonitorProcessing"
+                        .as_ptr()
+                        .cast(),
                 ),
             }
         }
@@ -404,15 +408,9 @@ impl SensitiveChecker {
                         .get_property(false, self.window, sn.property, AtomEnum::ATOM, 0, 1024)
                         .map_err(x11rb::errors::ReplyError::from)
                         .and_then(|c| c.reply())
+                        && let Some(mut atoms) = prop.value32()
                     {
-                        if let Some(atoms) = prop.value32() {
-                            for atom in atoms {
-                                if atom == hint_atom {
-                                    sensitive = true;
-                                    break;
-                                }
-                            }
-                        }
+                        sensitive = atoms.any(|atom| atom == hint_atom);
                     }
                     let _ = conn.delete_property(self.window, sn.property);
                     let _ = conn.flush();

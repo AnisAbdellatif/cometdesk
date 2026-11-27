@@ -1,29 +1,18 @@
-//! Windows target probing: Win32 keyboard layouts, input desktop lock state, IME status,
-//! foreground process focus, battery (`GetSystemPowerStatus`), and system load.
+//! Windows target probing: IME status, battery (`GetSystemPowerStatus`) and system load here;
+//! keyboard layouts, lock state, monitors and the focused process come from `desktop-kit`.
 
 use super::*;
 use cometdesk_clip::{Battery, Load, SessionState};
-use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+use windows_sys::Win32::Foundation::FILETIME;
 use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
-use windows_sys::Win32::System::StationsAndDesktops::{CloseDesktop, OpenInputDesktop};
 use windows_sys::Win32::System::SystemInformation::{
     GetTickCount64, GlobalMemoryStatusEx, MEMORYSTATUSEX,
 };
-use windows_sys::Win32::System::Threading::{
-    GetSystemTimes, OpenProcess, QueryFullProcessImageNameW,
-};
-use windows_sys::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
-};
+use windows_sys::Win32::System::Threading::GetSystemTimes;
 use windows_sys::Win32::UI::Input::Ime::ImmGetDefaultIMEWnd;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardLayout, GetKeyboardLayoutList};
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowThreadProcessId, PostMessageW, SendMessageW,
-};
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SendMessageW};
 
-const DESKTOP_SWITCHDESKTOP: u32 = 0x0100;
-const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 const WM_IME_CONTROL: u32 = 0x0283;
 const IMC_GETOPENSTATUS: usize = 5;
 
@@ -31,53 +20,20 @@ pub fn invalidate() {}
 
 /// Asks the foreground window to switch, like the language bar does.
 pub fn set_layout(layout: &str) -> Result<(), String> {
-    let want = u16::from_str_radix(
-        layout.strip_prefix("win:").ok_or("not a Windows layout")?,
-        16,
-    )
-    .map_err(|e| e.to_string())?;
-    let mut list = vec![std::ptr::null_mut(); 32];
-    let n = unsafe { GetKeyboardLayoutList(list.len() as i32, list.as_mut_ptr()) }.max(0);
-    let hkl = list[..n as usize]
-        .iter()
-        .find(|&&h| h as usize & 0xffff == want as usize)
-        .ok_or("layout not installed")?;
-    const WM_INPUTLANGCHANGEREQUEST: u32 = 0x0050;
-    let ok = unsafe {
-        PostMessageW(
-            GetForegroundWindow(),
-            WM_INPUTLANGCHANGEREQUEST,
-            0,
-            *hkl as isize,
-        )
-    };
-    if ok != 0 {
-        Ok(())
-    } else {
-        Err("no window to switch".into())
-    }
+    desktop_kit::keyboard::set_layout(layout).map_err(|e| e.to_string())
 }
 
 pub fn read() -> Info {
     // Without this Windows reports scaled-down coordinates to us.
-    static DPI: std::sync::Once = std::sync::Once::new();
-    DPI.call_once(|| unsafe {
-        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    });
-    let langid = |hkl: usize| format!("win:{:04x}", hkl & 0xffff);
-    let foreground_thread =
-        unsafe { GetWindowThreadProcessId(GetForegroundWindow(), std::ptr::null_mut()) };
-    let mut list = vec![std::ptr::null_mut(); 32];
-    let n = unsafe { GetKeyboardLayoutList(list.len() as i32, list.as_mut_ptr()) }.max(0);
-    let mut layouts: Vec<String> = list[..n as usize]
-        .iter()
-        .map(|&h| langid(h as usize))
+    desktop_kit::display::set_dpi_aware();
+    let langid = |hkl: u32| format!("win:{:04x}", hkl & 0xffff);
+    let mut layouts: Vec<String> = desktop_kit::keyboard::layouts()
+        .into_iter()
+        .map(langid)
         .collect();
     layouts.dedup();
     Info {
-        keyboard: Some(langid(
-            unsafe { GetKeyboardLayout(foreground_thread) } as usize
-        )),
+        keyboard: Some(langid(desktop_kit::keyboard::foreground_hkl())),
         layouts,
         os_version: windows_version(),
         session: session(),
@@ -132,17 +88,12 @@ fn load() -> Load {
     }
 }
 
-/// The secure desktop (lock screen, UAC) is the input desktop, and we may not switch to
-/// it: opening it fails.
 fn session() -> SessionState {
-    unsafe {
-        let desk = OpenInputDesktop(0, 0, DESKTOP_SWITCHDESKTOP);
-        if desk.is_null() {
-            return SessionState::Locked;
-        }
-        CloseDesktop(desk);
+    match desktop_kit::session::state() {
+        desktop_kit::session::SessionState::Unknown => SessionState::Unknown,
+        desktop_kit::session::SessionState::Active => SessionState::Active,
+        desktop_kit::session::SessionState::Locked => SessionState::Locked,
     }
-    SessionState::Active
 }
 
 /// Whether the input method of the focused window is open (Japanese kana mode, …).
@@ -157,30 +108,11 @@ fn ime() -> Option<bool> {
 }
 
 pub fn focus() -> Option<Focus> {
-    unsafe {
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(GetForegroundWindow(), &mut pid);
-        if pid == 0 {
-            return None;
-        }
-        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if h.is_null() {
-            return None;
-        }
-        let mut buf = [0u16; 520];
-        let mut len = buf.len() as u32;
-        let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len) != 0;
-        CloseHandle(h);
-        if !ok {
-            return None;
-        }
-        let path = String::from_utf16_lossy(&buf[..len as usize]);
-        let app = path.rsplit('\\').next()?.to_owned();
-        Some(Focus {
-            terminal: is_terminal(&app),
-            app,
-        })
-    }
+    let app = desktop_kit::window::foreground()?.process;
+    (!app.is_empty()).then(|| Focus {
+        terminal: is_terminal(&app),
+        app,
+    })
 }
 
 fn battery() -> Option<Battery> {

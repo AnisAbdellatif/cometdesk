@@ -169,23 +169,23 @@ fn bind_windows(token_path: PathBuf, tries: usize) -> Result<InstanceGuard, Bind
         }
         if let Ok(content) = std::fs::read_to_string(&token_path) {
             let mut lines = content.lines();
-            if let (Some(port_str), Some(tok)) = (lines.next(), lines.next()) {
-                if let Ok(port) = port_str.trim().parse::<u16>() {
-                    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-                    if let Ok(mut stream) =
-                        std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(300))
-                    {
-                        let _ = stream.write_all(format!("ping\n{tok}\n").as_bytes());
-                        let mut resp = String::new();
-                        stream
-                            .set_read_timeout(Some(Duration::from_millis(300)))
-                            .ok();
-                        if stream.read_to_string(&mut resp).is_ok() && resp.trim() == "ok" {
-                            if i + 1 >= tries {
-                                return Err(BindError::AlreadyRunning);
-                            }
-                            continue;
+            if let (Some(port_str), Some(tok)) = (lines.next(), lines.next())
+                && let Ok(port) = port_str.trim().parse::<u16>()
+            {
+                let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+                if let Ok(mut stream) =
+                    std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(300))
+                {
+                    let _ = stream.write_all(format!("ping\n{tok}\n").as_bytes());
+                    let mut resp = String::new();
+                    stream
+                        .set_read_timeout(Some(Duration::from_millis(300)))
+                        .ok();
+                    if stream.read_to_string(&mut resp).is_ok() && resp.trim() == "ok" {
+                        if i + 1 >= tries {
+                            return Err(BindError::AlreadyRunning);
                         }
+                        continue;
                     }
                 }
             }
@@ -260,7 +260,7 @@ fn read_note_unix(conn: &UnixStream) -> Option<Note> {
 #[cfg(windows)]
 fn serve_windows(guard: InstanceGuard, tx: mpsc::Sender<Note>) {
     let (mut tokens, mut at) = (BURST, Instant::now());
-    let token = guard.token;
+    let token = guard.token.as_str();
     for conn in guard.listener.incoming().flatten() {
         conn.set_read_timeout(Some(IO_TIMEOUT)).ok();
         let refill = (at.elapsed().as_secs_f64() / REFILL.as_secs_f64()) as u32;
@@ -368,6 +368,7 @@ pub fn dropped(note: &Note) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::*;
 
     #[cfg(unix)]

@@ -22,3 +22,4 @@ winit = "0.30.13"
 
 [dev-dependencies]
 bytes = "1.12.1"
+cometdesk-mock = { version = "0.1.0", path = "../cometdesk-mock" }

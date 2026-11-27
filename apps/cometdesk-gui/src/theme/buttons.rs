@@ -42,7 +42,7 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, tooltip: &str) -> Response {
             StrokeKind::Inside,
         );
         let icon_color = match icon {
-            Icon::More => MUTED,
+            Icon::More if !resp.hovered() => MUTED,
             _ => TEXT,
         };
         draw_icon(ui.painter(), rect, icon, icon_color);

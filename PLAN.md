@@ -14,7 +14,7 @@ Reference device: GL-RM1 "Comet", firmware V1.10.1, kvmd 4.82, at `192.168.8.174
 
 | Decision | Choice | Why |
 |---|---|---|
-| License | **MIT OR Apache-2.0**, clean-room | Lets anyone embed the SDK. Possible because nothing below needs GPL code or data. |
+| License | **MIT**, clean-room | Lets anyone embed the SDK. Possible because nothing below needs GPL code or data. |
 | Clean-room rule | GPL/AGPL/unlicensed sources (glkvm firmware, PiKVM, Overlook, RustDesk, hwcodec) are **read for behavior only**. No code, no data files (incl. `keymap.csv`), no translated JS. | Implementing a network protocol from observed behavior is fine; copying is not. |
 | Key code table | Hand-written from the W3C UI Events `KeyboardEvent.code` spec and the USB HID Usage Tables | Public specs; maps 1:1 to `winit::keyboard::KeyCode`. |
 | Dependency licenses | `cargo-deny` in CI, deny GPL/AGPL/LGPL and unlicensed crates | Keeps the license decision enforceable. |

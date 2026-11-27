@@ -138,16 +138,18 @@ pub fn host_name() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn secret_round_trip_and_permissions() {
         let dir = std::env::temp_dir().join(format!("cometdesk-cfg-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let secret = Secret::generate();
 
         #[cfg(unix)]
         {
+            let secret = Secret::generate();
             use std::os::unix::fs::PermissionsExt;
             let secret_file = dir.join("pairing");
             cometdesk_clip::create_restricted_dir_all(&dir).unwrap();

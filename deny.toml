@@ -1,5 +1,5 @@
 # cargo-deny: run `cargo deny check` (CI does).
-# The project is MIT OR Apache-2.0 and clean-room (PLAN.md §0): no GPL/AGPL/LGPL code may
+# The project is MIT and clean-room (PLAN.md §0): no GPL/AGPL/LGPL code may
 # enter the dependency tree.
 
 [graph]
@@ -51,4 +51,4 @@ ignore = [
 unknown-registry = "deny"
 unknown-git = "deny"
 # egui is pinned to a main-branch commit until a release supports wgpu 30 (egui 0.38).
-allow-git = ["https://github.com/emilk/egui"]
+allow-git = ["https://github.com/emilk/egui", "https://github.com/AnisAbdellatif/desktop-kit"]

@@ -1,0 +1,1 @@
+- `cli.rs`: runs the `cometdesk-cli` binary against `cometdesk-mock` (login, pinning, ATX, MSD, type, record-fixtures).
