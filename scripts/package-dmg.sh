@@ -2,7 +2,7 @@
 # Packages the console as dist/CometDesk-<version>-<arch>.dmg: a CometDesk.app bundle (with the
 # agent programs from dist/agents in Resources, rebuilt by scripts/build-agents.sh)
 # ad-hoc signed, inside a disk image with an Applications shortcut.
-# Set CODESIGN_IDENTITY to a Developer ID to sign for distribution instead of ad-hoc.
+# Set CODESIGN_IDENTITY to a Developer ID to sign (and notarize, see below) for distribution instead of ad-hoc.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -51,8 +51,7 @@ if [ "$IDENTITY" = "-" ]; then
 else
 	# Distribution: hardened runtime + a secure timestamp, signing nested Mach-O code
 	# inside-out first and then the app bundle. No --deep (Apple deprecates it and it
-	# skips the per-item options). This makes the bundle notarization-ready; notarization
-	# itself (notarytool submit + stapler) must run elsewhere -- not done here.
+	# skips the per-item options). The dmg is notarized below.
 	# (No entitlements in the repo, so none are passed; add --entitlements here if that
 	# changes.)
 	find "$APP" -type f | while IFS= read -r f; do
@@ -65,4 +64,20 @@ fi
 ln -s /Applications "$STAGE/dmg-root/Applications"
 rm -f "$OUT"
 hdiutil create -quiet -volname "$NAME" -srcfolder "$STAGE/dmg-root" -format UDZO -ov "$OUT"
+
+# Developer ID build: sign the image, notarize it (App Store Connect API key in ASC_KEY_PATH,
+# ASC_KEY_ID, ASC_ISSUER_ID in CI, or a keychain profile made once with
+# `xcrun notarytool store-credentials <name>` and passed as NOTARY_PROFILE), staple the ticket.
+if [ "$IDENTITY" != "-" ]; then
+	codesign --force --timestamp --sign "$IDENTITY" "$OUT"
+	if [ -n "${ASC_KEY_PATH:-}" ]; then
+		xcrun notarytool submit "$OUT" --key "$ASC_KEY_PATH" --key-id "$ASC_KEY_ID" \
+			--issuer "$ASC_ISSUER_ID" --wait
+	elif [ -n "${NOTARY_PROFILE:-}" ]; then
+		xcrun notarytool submit "$OUT" --keychain-profile "$NOTARY_PROFILE" --wait
+	else
+		echo "signed but not notarized: set ASC_KEY_PATH or NOTARY_PROFILE" >&2
+	fi
+	[ -z "${ASC_KEY_PATH:-}${NOTARY_PROFILE:-}" ] || xcrun stapler staple "$OUT"
+fi
 echo "built $OUT"

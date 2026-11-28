@@ -19,7 +19,39 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
-      - run: scripts/package-dmg.sh
+      - name: Import the Developer ID certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE" ]; then echo "No APPLE_CERTIFICATE secret: building ad-hoc signed."; exit 0; fi
+          kc="$RUNNER_TEMP/signing.keychain-db"
+          kcpass="$(uuidgen)"
+          security create-keychain -p "$kcpass" "$kc"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$kcpass" "$kc"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$kc" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/cert.p12"
+          # The chain to Apple's root; codesign won't sign without it.
+          curl -fsSL https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer -o "$RUNNER_TEMP/g2.cer"
+          security import "$RUNNER_TEMP/g2.cer" -k "$kc"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$kcpass" "$kc" >/dev/null
+          security list-keychains -d user -s "$kc" login.keychain
+          identity="$(security find-identity -v -p codesigning "$kc" | sed -n 's/.*"\(Developer ID Application.*\)"/\1/p' | head -1)"
+          [ -n "$identity" ] || { echo "No Developer ID Application identity in APPLE_CERTIFICATE" >&2; exit 1; }
+          echo "CODESIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+      - name: Build, sign and notarize the dmg
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          if [ -n "$ASC_KEY_P8" ]; then
+            printf '%s\n' "$ASC_KEY_P8" > "$RUNNER_TEMP/asc_key.p8"
+            export ASC_KEY_PATH="$RUNNER_TEMP/asc_key.p8"
+          fi
+          scripts/package-dmg.sh
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -28,7 +60,7 @@ jobs:
           DMG=dist/CometDesk-$VERSION-arm64.dmg
           test -f "$DMG" || { echo "tag $GITHUB_REF_NAME does not match the cometdesk-gui version"; exit 1; }
           gh release create "$GITHUB_REF_NAME" "$DMG" --title "CometDesk $VERSION" \
-            --notes "CometDesk $VERSION (arm64, ad-hoc signed). Install: brew install --cask anisabdellatif/tap/cometdesk"
+            --notes "CometDesk $VERSION (arm64, $([ -n "${CODESIGN_IDENTITY:-}" ] && echo "Developer ID signed and notarized" || echo "ad-hoc signed")). Install: brew install --cask anisabdellatif/tap/cometdesk"
           echo "VERSION=$VERSION" >>"$GITHUB_ENV"
           echo "SHA=$(shasum -a 256 "$DMG" | cut -d' ' -f1)" >>"$GITHUB_ENV"
       - uses: actions/checkout@v4
